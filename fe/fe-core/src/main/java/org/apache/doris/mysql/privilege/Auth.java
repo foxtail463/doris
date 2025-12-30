@@ -91,77 +91,162 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
 
+/**
+ * Auth 类是 Doris 权限认证系统的核心类，负责管理用户、角色、权限等认证相关功能。
+ * 实现了 Writable 接口，支持序列化和持久化。
+ * 
+ * 主要功能包括：
+ * 1. 用户管理：创建、删除、修改用户
+ * 2. 角色管理：创建、删除、修改角色
+ * 3. 权限管理：授予、撤销各种级别的权限（全局、catalog、数据库、表、列等）
+ * 4. 密码管理：密码验证、密码策略管理
+ * 5. LDAP 认证：支持 LDAP 认证方式
+ * 6. 用户属性管理：管理用户的各种属性配置
+ */
 public class Auth implements Writable {
     private static final Logger LOG = LogManager.getLogger(Auth.class);
 
+    /** root 用户的角色是 operator，每个 Doris 系统只有一个 root 用户 */
     // root user's role is operator.
     // each Doris system has only one root user.
     public static final String ROOT_USER = "root";
+    /** admin 用户 */
     public static final String ADMIN_USER = "admin";
+    /** unknown 用户没有任何权限，仅用于兼容旧版本 */
     // unknown user does not have any privilege, this is just to be compatible with old version.
     public static final String UNKNOWN_USER = "unknown";
+    /** 默认 catalog 名称 */
     public static final String DEFAULT_CATALOG = InternalCatalog.INTERNAL_CATALOG_NAME;
 
-    // There is no concurrency control logic inside roleManager,userManager,userRoleManage and rpropertyMgr,
-    // and it is completely managed by Auth.
-    // Therefore, their methods cannot be directly called outside, and should be called indirectly through Auth.
+    /**
+     * 角色管理器、用户管理器、用户角色管理器和用户属性管理器内部没有并发控制逻辑，
+     * 完全由 Auth 类管理。
+     * 因此，它们的方法不能直接在外界调用，应该通过 Auth 间接调用。
+     * There is no concurrency control logic inside roleManager,userManager,userRoleManage and rpropertyMgr,
+     * and it is completely managed by Auth.
+     * Therefore, their methods cannot be directly called outside, and should be called indirectly through Auth.
+     */
+    /** 角色管理器，管理所有角色及其权限 */
     private RoleManager roleManager = new RoleManager();
+    /** 用户管理器，管理所有用户信息 */
     private UserManager userManager = new UserManager();
+    /** 用户角色管理器，管理用户与角色的关联关系 */
     private UserRoleManager userRoleManager = new UserRoleManager();
+    /** 用户属性管理器，管理用户的属性配置 */
     private UserPropertyMgr propertyMgr = new UserPropertyMgr();
 
+    /** LDAP 信息 */
     private LdapInfo ldapInfo = new LdapInfo();
 
+    /** LDAP 管理器，处理 LDAP 认证相关操作 */
     private LdapManager ldapManager = new LdapManager();
 
+    /** 密码策略管理器，管理密码策略和密码历史 */
     private PasswordPolicyManager passwdPolicyManager = new PasswordPolicyManager();
 
+    /** 读写锁，用于控制并发访问 */
     private ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
+    /** 获取读锁 */
     private void readLock() {
         lock.readLock().lock();
     }
 
+    /** 释放读锁 */
     private void readUnlock() {
         lock.readLock().unlock();
     }
 
+    /** 获取写锁 */
     private void writeLock() {
         lock.writeLock().lock();
     }
 
+    /** 释放写锁 */
     private void writeUnlock() {
         lock.writeLock().unlock();
     }
 
+    /**
+     * 权限级别枚举
+     * 定义了权限的不同级别：全局、catalog、数据库、表、资源、工作负载组、集群、阶段、存储库
+     */
     public enum PrivLevel {
-        GLOBAL, CATALOG, DATABASE, TABLE, RESOURCE, WORKLOAD_GROUP, CLUSTER, STAGE, STORAGE_VAULT
+        /** 全局级别权限 */
+        GLOBAL,
+        /** Catalog 级别权限 */
+        CATALOG,
+        /** 数据库级别权限 */
+        DATABASE,
+        /** 表级别权限 */
+        TABLE,
+        /** 资源级别权限 */
+        RESOURCE,
+        /** 工作负载组级别权限 */
+        WORKLOAD_GROUP,
+        /** 集群级别权限 */
+        CLUSTER,
+        /** 阶段级别权限 */
+        STAGE,
+        /** 存储库级别权限 */
+        STORAGE_VAULT
     }
 
+    /**
+     * 构造函数，初始化 Auth 对象
+     * 创建默认的 root 和 admin 用户
+     */
     public Auth() {
         initUser();
     }
 
+    /**
+     * 获取 LDAP 信息
+     * @return LDAP 信息对象
+     */
     public LdapInfo getLdapInfo() {
         return ldapInfo;
     }
 
+    /**
+     * 设置 LDAP 信息
+     * @param ldapInfo LDAP 信息对象
+     */
     public void setLdapInfo(LdapInfo ldapInfo) {
         this.ldapInfo = ldapInfo;
     }
 
+    /**
+     * 获取 LDAP 管理器
+     * @return LDAP 管理器对象
+     */
     public LdapManager getLdapManager() {
         return ldapManager;
     }
 
+    /**
+     * 获取密码策略管理器
+     * @return 密码策略管理器对象
+     */
     public PasswordPolicyManager getPasswdPolicyManager() {
         return passwdPolicyManager;
     }
 
+    /**
+     * 检查角色是否存在
+     * @param qualifiedRole 角色名称
+     * @return 如果角色存在返回 true，否则返回 false
+     */
     public boolean doesRoleExist(String qualifiedRole) {
         return roleManager.getRole(qualifiedRole) != null;
     }
 
+    /**
+     * 合并角色权限，不检查名称
+     * @param roles 角色名称列表
+     * @param savedRole 要保存的角色对象
+     * @throws DdlException DDL 异常
+     */
     public void mergeRolesNoCheckName(List<String> roles, Role savedRole) throws DdlException {
         readLock();
         try {
@@ -176,16 +261,32 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 根据角色名称获取角色对象
+     * @param roleName 角色名称
+     * @return 角色对象，如果不存在返回 null
+     */
     public Role getRoleByName(String roleName) {
         return roleManager.getRole(roleName);
     }
 
-    /*
+    /**
+     * 检查密码，如果匹配，将 userIdentity 保存到匹配的条目中。
+     * 后续的认证检查应该使用保存在 currentUser 中的 userIdentity。
      * check password, if matched, save the userIdentity in matched entry.
      * the following auth checking should use userIdentity saved in currentUser.
+     * 
+     * @param remoteUser 远程用户名
+     * @param remoteHost 远程主机地址
+     * @param remotePasswd 远程用户密码（加密后的字节数组）
+     * @param randomString 随机字符串
+     * @param currentUser 当前用户身份列表（输出参数）
+     * @throws AuthenticationException 认证异常
      */
     public void checkPassword(String remoteUser, String remoteHost, byte[] remotePasswd, byte[] randomString,
             List<UserIdentity> currentUser) throws AuthenticationException {
+        // 如果是 root 或 admin 用户，且配置了跳过本地认证检查，且来自本地地址，则直接通过
+        // in case user forget password.
         if ((ROOT_USER.equals(remoteUser) || ADMIN_USER.equals(remoteUser)) && Config.skip_localhost_auth_check
                 && "127.0.0.1".equals(remoteHost)) {
             // in case user forget password.
@@ -204,7 +305,16 @@ public class Auth implements Writable {
         }
     }
 
-    // For unit test only, wrapper of "void checkPlainPassword"
+    /**
+     * 仅用于单元测试，checkPlainPassword 的包装方法
+     * For unit test only, wrapper of "void checkPlainPassword"
+     * 
+     * @param remoteUser 远程用户名
+     * @param remoteHost 远程主机地址
+     * @param remotePasswd 远程用户密码（明文）
+     * @param currentUser 当前用户身份列表（输出参数）
+     * @return 如果密码正确返回 true，否则返回 false
+     */
     public boolean checkPlainPasswordForTest(String remoteUser, String remoteHost, String remotePasswd,
             List<UserIdentity> currentUser) {
         try {
@@ -215,6 +325,12 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 获取用户的所有角色
+     * @param user 用户身份
+     * @param showUserDefaultRole 是否显示用户默认角色
+     * @return 角色名称集合
+     */
     public Set<String> getRolesByUser(UserIdentity user, boolean showUserDefaultRole) {
         readLock();
         try {
@@ -224,8 +340,17 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 检查明文密码
+     * @param remoteUser 远程用户名
+     * @param remoteHost 远程主机地址
+     * @param remotePasswd 远程用户密码（明文）
+     * @param currentUser 当前用户身份列表（输出参数）
+     * @throws AuthenticationException 认证异常
+     */
     public void checkPlainPassword(String remoteUser, String remoteHost, String remotePasswd,
             List<UserIdentity> currentUser) throws AuthenticationException {
+        // 如果用户在 LDAP 服务中存在，则检查 LDAP 密码
         // Check the LDAP password when the user exists in the LDAP service.
         if (ldapManager.doesUserExist(remoteUser)) {
             if (!ldapManager.checkUserPasswd(remoteUser, remotePasswd, remoteHost, currentUser)) {
@@ -242,12 +367,19 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 获取用户的所有角色（包括 LDAP 角色）
+     * @param userIdentity 用户身份
+     * @return 角色对象集合
+     */
     public Set<Role> getRolesByUserWithLdap(UserIdentity userIdentity) {
         Set<Role> roles = Sets.newHashSet();
+        // 获取用户的基本角色
         Set<String> roleNames = userRoleManager.getRolesByUser(userIdentity);
         for (String roleName : roleNames) {
             roles.add(roleManager.getRole(roleName));
         }
+        // 如果启用了 LDAP 认证，获取 LDAP 角色
         if (isLdapAuthEnabled()) {
             Set<Role> ldapRoles = ldapManager.getUserRoles(userIdentity.getQualifiedUser());
             if (!CollectionUtils.isEmpty(ldapRoles)) {
@@ -257,28 +389,30 @@ public class Auth implements Writable {
         return roles;
     }
 
-    public Set<String> getRoleNamesByUserWithLdap(UserIdentity user, boolean showUserDefaultRole) {
-        Set<Role> rolesByUserWithLdap = getRolesByUserWithLdap(user);
-        Set<String> res = Sets.newHashSetWithExpectedSize(rolesByUserWithLdap.size());
-        for (Role role : rolesByUserWithLdap) {
-            String roleName = role.getRoleName();
-            if (showUserDefaultRole || !roleName.startsWith(RoleManager.DEFAULT_ROLE_PREFIX)) {
-                res.add(roleName);
-            }
-        }
-        return res;
-    }
-
+    /**
+     * 获取 LDAP 用户的用户身份（不检查密码）
+     * @param remoteUser 远程用户名
+     * @param remoteHost 远程主机地址
+     * @return 用户身份列表
+     */
     public List<UserIdentity> getUserIdentityForLdap(String remoteUser, String remoteHost) {
         return userManager.getUserIdentityUncheckPasswd(remoteUser, remoteHost);
     }
 
     // ==== Global ====
+    /**
+     * 检查全局权限
+     * @param currentUser 当前用户身份
+     * @param wanted 需要的权限谓词
+     * @return 如果有权限返回 true，否则返回 false
+     */
     protected boolean checkGlobalPriv(UserIdentity currentUser, PrivPredicate wanted) {
         readLock();
         try {
+            // 获取用户的所有角色（包括 LDAP 角色）
             Set<Role> roles = getRolesByUserWithLdap(currentUser);
             PrivBitSet savedPrivs = PrivBitSet.of();
+            // 遍历所有角色，检查是否有全局权限
             for (Role role : roles) {
                 if (role.checkGlobalPriv(wanted, savedPrivs)) {
                     return true;
@@ -291,7 +425,15 @@ public class Auth implements Writable {
     }
 
     // ==== Catalog ====
+    /**
+     * 检查 Catalog 权限
+     * @param currentUser 当前用户身份
+     * @param ctl catalog 名称
+     * @param wanted 需要的权限谓词
+     * @return 如果有权限返回 true，否则返回 false
+     */
     protected boolean checkCtlPriv(UserIdentity currentUser, String ctl, PrivPredicate wanted) {
+        // NODE 权限不应该在 catalog 级别检查
         if (wanted.getPrivs().containsNodePriv()) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("should not check NODE priv in catalog level. user: {}, catalog: {}",
@@ -315,7 +457,16 @@ public class Auth implements Writable {
     }
 
     // ==== Database ====
+    /**
+     * 检查数据库权限
+     * @param currentUser 当前用户身份
+     * @param ctl catalog 名称
+     * @param db 数据库名称
+     * @param wanted 需要的权限谓词
+     * @return 如果有权限返回 true，否则返回 false
+     */
     protected boolean checkDbPriv(UserIdentity currentUser, String ctl, String db, PrivPredicate wanted) {
+        // NODE 权限不应该在数据库级别检查
         if (wanted.getPrivs().containsNodePriv()) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("should not check NODE priv in Database level. user: {}, db: {}",
@@ -340,7 +491,17 @@ public class Auth implements Writable {
     }
 
     // ==== Table ====
+    /**
+     * 检查表权限
+     * @param currentUser 当前用户身份
+     * @param ctl catalog 名称
+     * @param db 数据库名称
+     * @param tbl 表名
+     * @param wanted 需要的权限谓词
+     * @return 如果有权限返回 true，否则返回 false
+     */
     protected boolean checkTblPriv(UserIdentity currentUser, String ctl, String db, String tbl, PrivPredicate wanted) {
+        // NODE 权限应该在全局级别检查，而不是表级别
         if (wanted.getPrivs().containsNodePriv()) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("should check NODE priv in GLOBAL level. user: {}, db: {}, tbl: {}", currentUser, db, tbl);
@@ -363,11 +524,24 @@ public class Auth implements Writable {
     }
 
     // ==== Column ====
-    // The reason why this method throws an exception instead of returning a boolean is to
-    // indicate which col does not have permission
+    /**
+     * 检查列权限
+     * 此方法抛出异常而不是返回布尔值的原因是指出哪个列没有权限
+     * The reason why this method throws an exception instead of returning a boolean is to
+     * indicate which col does not have permission
+     * 
+     * @param currentUser 当前用户身份
+     * @param ctl catalog 名称
+     * @param db 数据库名称
+     * @param tbl 表名
+     * @param cols 列名集合
+     * @param wanted 需要的权限谓词
+     * @throws AuthorizationException 授权异常
+     */
     protected void checkColsPriv(UserIdentity currentUser, String ctl, String db, String tbl, Set<String> cols,
             PrivPredicate wanted) throws AuthorizationException {
         Set<Role> roles = getRolesByUserWithLdap(currentUser);
+        // 检查每个列的权限
         for (String col : cols) {
             if (!checkColPriv(ctl, db, tbl, col, wanted, roles)) {
                 throw new AuthorizationException(String.format(
@@ -377,6 +551,16 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 检查单个列的权限
+     * @param ctl catalog 名称
+     * @param db 数据库名称
+     * @param tbl 表名
+     * @param col 列名
+     * @param wanted 需要的权限谓词
+     * @param roles 角色集合
+     * @return 如果有权限返回 true，否则返回 false
+     */
     private boolean checkColPriv(String ctl, String db, String tbl,
             String col, PrivPredicate wanted, Set<Role> roles) {
         PrivBitSet savedPrivs = PrivBitSet.of();
@@ -389,6 +573,13 @@ public class Auth implements Writable {
     }
 
     // ==== Resource ====
+    /**
+     * 检查资源权限
+     * @param currentUser 当前用户身份
+     * @param resourceName 资源名称
+     * @param wanted 需要的权限谓词
+     * @return 如果有权限返回 true，否则返回 false
+     */
     protected boolean checkResourcePriv(UserIdentity currentUser, String resourceName, PrivPredicate wanted) {
         readLock();
         try {
@@ -406,6 +597,13 @@ public class Auth implements Writable {
     }
 
     // ==== Storage Vault ====
+    /**
+     * 检查存储库权限
+     * @param currentUser 当前用户身份
+     * @param storageVaultName 存储库名称
+     * @param wanted 需要的权限谓词
+     * @return 如果有权限返回 true，否则返回 false
+     */
     protected boolean checkStorageVaultPriv(UserIdentity currentUser, String storageVaultName, PrivPredicate wanted) {
         readLock();
         try {
@@ -423,9 +621,18 @@ public class Auth implements Writable {
     }
 
     // ==== Workload Group ====
+    /**
+     * 检查工作负载组权限
+     * @param currentUser 当前用户身份
+     * @param workloadGroupName 工作负载组名称
+     * @param wanted 需要的权限谓词
+     * @return 如果有权限返回 true，否则返回 false
+     */
     protected boolean checkWorkloadGroupPriv(UserIdentity currentUser, String workloadGroupName, PrivPredicate wanted) {
         readLock();
         try {
+            // 目前流式加载不支持基于 IP 的认证，所以暂时不对默认组进行认证
+            // 需要后续移除
             // currently stream load not support ip based auth, so normal should not auth temporary
             // need remove later
             if (WorkloadGroupMgr.DEFAULT_GROUP_NAME.equals(workloadGroupName)) {
@@ -446,10 +653,19 @@ public class Auth implements Writable {
     }
 
     // ==== cloud ====
+    /**
+     * 检查云资源权限
+     * @param currentUser 当前用户身份
+     * @param cloudName 云名称
+     * @param wanted 需要的权限谓词
+     * @param type 资源类型
+     * @return 如果有权限返回 true，否则返回 false
+     */
     protected boolean checkCloudPriv(UserIdentity currentUser, String cloudName,
             PrivPredicate wanted, ResourceTypeEnum type) {
         readLock();
         try {
+            // 如果连接上下文设置了无认证，直接返回 true
             ConnectContext ctx = ConnectContext.get();
             if (ctx != null) {
                 if (ctx.getNoAuth()) {
@@ -469,17 +685,30 @@ public class Auth implements Writable {
         }
     }
 
-    // Check if LDAP authentication is enabled.
+    /**
+     * 检查是否启用了 LDAP 认证
+     * Check if LDAP authentication is enabled.
+     * @return 如果启用返回 true，否则返回 false
+     */
     private boolean isLdapAuthEnabled() {
         return AuthenticateType.getAuthTypeConfig() == AuthenticateType.LDAP;
     }
 
+    /**
+     * 创建用户
+     * @param info 创建用户信息
+     * @throws DdlException DDL 异常
+     */
     public void createUser(CreateUserInfo info) throws DdlException {
         createUserInternal(info.getUserIdent(), info.getRole(),
                 info.getPassword(), info.isIfNotExist(), info.getPasswordOptions(),
                 info.getComment(), info.getUserId(), false);
     }
 
+    /**
+     * 重放创建用户操作（用于日志回放）
+     * @param privInfo 权限信息
+     */
     public void replayCreateUser(PrivInfo privInfo) {
         try {
             createUserInternal(privInfo.getUserIdent(), privInfo.getRole(), privInfo.getPasswd(), false,
@@ -489,11 +718,24 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 创建用户的内部实现
+     * @param userIdent 用户身份
+     * @param roleName 角色名称
+     * @param password 密码（加密后的字节数组）
+     * @param ignoreIfExists 如果用户已存在是否忽略
+     * @param passwordOptions 密码选项
+     * @param comment 用户注释
+     * @param userId 用户 ID
+     * @param isReplay 是否为日志回放
+     * @throws DdlException DDL 异常
+     */
     private void createUserInternal(UserIdentity userIdent, String roleName, byte[] password,
             boolean ignoreIfExists, PasswordOptions passwordOptions, String comment, String userId, boolean isReplay)
             throws DdlException {
         writeLock();
         try {
+            // 检查角色是否存在
             // check if role exist
             Role role = null;
             if (roleName != null) {
@@ -503,6 +745,7 @@ public class Auth implements Writable {
                 }
             }
 
+            // 检查用户是否已存在
             // check if user already exist
             if (doesUserExist(userIdent)) {
                 if (ignoreIfExists) {
@@ -512,8 +755,10 @@ public class Auth implements Writable {
                 throw new DdlException("User " + userIdent + " already exist");
             }
 
+            // 创建用户
             // create user
             try {
+                // 这里不应该抛出 AnalysisException，所以转换它
                 // we should not throw AnalysisException at here,so transfer it
                 User user = userManager.createUser(userIdent, password, null, false, comment);
                 if (Strings.isNullOrEmpty(user.getUserId())) {
@@ -523,19 +768,24 @@ public class Auth implements Writable {
                 throw new DdlException("create user failed,", e);
             }
             if (password != null) {
+                // 保存密码到密码历史
                 // save password to password history
                 passwdPolicyManager.updatePassword(userIdent, password);
             }
+            // 创建默认角色
             // 4.create defaultRole
             Role defaultRole = roleManager.createDefaultRole(userIdent);
+            // 创建用户角色关联
             // 5.create user role
             userRoleManager.addUserRole(userIdent, defaultRole.getRoleName());
             if (role != null) {
                 userRoleManager.addUserRole(userIdent, roleName);
             }
+            // 其他用户属性
             // other user properties
             propertyMgr.addUserResource(userIdent.getQualifiedUser());
 
+            // 更新密码策略
             // 5. update password policy
             passwdPolicyManager.updatePolicy(userIdent, password, passwordOptions);
 
@@ -550,10 +800,20 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 删除用户
+     * @param userIdent 用户身份
+     * @param ignoreIfNonExists 如果用户不存在是否忽略
+     * @throws DdlException DDL 异常
+     */
     public void dropUser(UserIdentity userIdent, boolean ignoreIfNonExists)  throws DdlException {
         dropUserInternal(userIdent, ignoreIfNonExists, false);
     }
 
+    /**
+     * 重放删除用户操作（用于日志回放）
+     * @param userIdent 用户身份
+     */
     public void replayDropUser(UserIdentity userIdent) {
         try {
             dropUserInternal(userIdent, false, true);
@@ -632,16 +892,31 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 授予角色命令
+     * @param command 授予角色命令对象
+     * @throws DdlException DDL 异常
+     */
     public void grantRoleCommand(GrantRoleCommand command) throws DdlException {
         grantInternal(command.getUserIdentity(), command.getRoles(), false);
     }
 
+    /**
+     * 授予表权限命令
+     * @param command 授予表权限命令对象
+     * @throws DdlException DDL 异常
+     */
     public void grantTablePrivilegeCommand(GrantTablePrivilegeCommand command) throws DdlException {
         PrivBitSet privs = PrivBitSet.of(command.getPrivileges());
         grantInternal(command.getUserIdentity().orElse(null), command.getRole().orElse(null), command.getTablePattern(),
                     privs, command.getColPrivileges(), true /* err on non exist */, false /* not replay */);
     }
 
+    /**
+     * 授予资源权限命令
+     * @param command 授予资源权限命令对象
+     * @throws DdlException DDL 异常
+     */
     public void grantResourcePrivilegeCommand(GrantResourcePrivilegeCommand command) throws DdlException {
         if (command.getResourcePattern().isPresent()) {
             PrivBitSet privs = PrivBitSet.of(command.getPrivileges());
@@ -816,12 +1091,22 @@ public class Auth implements Writable {
     }
 
 
-    // return true if user ident exist
+    /**
+     * 检查用户是否存在
+     * return true if user ident exist
+     * @param userIdent 用户身份
+     * @return 如果用户存在返回 true，否则返回 false
+     */
     public boolean doesUserExist(UserIdentity userIdent) {
         return userManager.userIdentityExist(userIdent, false);
     }
 
-    // Check whether the user exists. If the user exists, return UserIdentity, otherwise return null.
+    /**
+     * 检查用户是否存在，如果存在则返回 UserIdentity，否则返回 null
+     * Check whether the user exists. If the user exists, return UserIdentity, otherwise return null.
+     * @param userIdent 用户身份
+     * @return 如果用户存在返回 UserIdentity，否则返回 null
+     */
     public UserIdentity getCurrentUserIdentity(UserIdentity userIdent) {
         readLock();
         try {
@@ -834,12 +1119,22 @@ public class Auth implements Writable {
         }
     }
 
-    // revoke role
+    /**
+     * 撤销角色
+     * revoke role
+     * @param command 撤销角色命令对象
+     * @throws DdlException DDL 异常
+     */
     public void revokeRole(RevokeRoleCommand command) throws DdlException {
         revokeInternal(command.getUserIdentity(), command.getRoles(), false);
     }
 
-    // revoke resource
+    /**
+     * 撤销资源权限命令
+     * revoke resource
+     * @param command 撤销资源权限命令对象
+     * @throws DdlException DDL 异常
+     */
     public void revokeResourcePrivilegeCommand(RevokeResourcePrivilegeCommand command) throws DdlException {
         if (command.getResourcePattern().isPresent()) {
             PrivBitSet privs = PrivBitSet.of(command.getPrivileges());
@@ -854,7 +1149,12 @@ public class Auth implements Writable {
         }
     }
 
-    // revoke table
+    /**
+     * 撤销表权限命令
+     * revoke table
+     * @param command 撤销表权限命令对象
+     * @throws DdlException DDL 异常
+     */
     public void revokeTablePrivilegeCommand(RevokeTablePrivilegeCommand command) throws DdlException {
         if (command.getTablePattern() != null) {
             PrivBitSet privs = PrivBitSet.of(command.getPrivileges());
@@ -972,11 +1272,21 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 设置用户密码
+     * @param userIdentity 用户身份
+     * @param password 密码（加密后的字节数组）
+     * @throws DdlException DDL 异常
+     */
     public void setPassword(UserIdentity userIdentity, byte[] password) throws DdlException {
         setPasswordInternal(userIdentity, password, null, true /* err on non exist */,
                 false /* set by resolver */, false);
     }
 
+    /**
+     * 重放设置密码操作（用于日志回放）
+     * @param info 权限信息
+     */
     public void replaySetPassword(PrivInfo info) {
         try {
             setPasswordInternal(info.getUserIdent(), info.getPasswd(), null, true /* err on non exist */,
@@ -1030,14 +1340,31 @@ public class Auth implements Writable {
         ldapManager.refresh(command.getIsAll(), command.getUser());
     }
 
+    /**
+     * 创建角色
+     * @param role 角色名称
+     * @param ignoreIfExists 如果角色已存在是否忽略
+     * @param comment 角色注释
+     * @throws DdlException DDL 异常
+     */
     public void createRole(String role, boolean ignoreIfExists, String comment) throws DdlException {
         createRoleInternal(role, ignoreIfExists, comment, false);
     }
 
+    /**
+     * 修改角色
+     * @param role 角色名称
+     * @param comment 角色注释
+     * @throws DdlException DDL 异常
+     */
     public void alterRole(String role, String comment) throws DdlException {
         alterRoleInternal(role, comment, false);
     }
 
+    /**
+     * 重放创建角色操作（用于日志回放）
+     * @param info 权限信息
+     */
     public void replayCreateRole(PrivInfo info) {
         try {
             createRoleInternal(info.getRole(), false, info.getComment(), true);
@@ -1046,6 +1373,10 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 重放修改角色操作（用于日志回放）
+     * @param info 权限信息
+     */
     public void replayAlterRole(PrivInfo info) {
         try {
             alterRoleInternal(info.getRole(), info.getComment(), true);
@@ -1088,10 +1419,20 @@ public class Auth implements Writable {
         LOG.info("finished to create role: {}, is replay: {}", role, isReplay);
     }
 
+    /**
+     * 删除角色
+     * @param role 角色名称
+     * @param ignoreIfNonExists 如果角色不存在是否忽略
+     * @throws DdlException DDL 异常
+     */
     public void dropRole(String role, boolean ignoreIfNonExists) throws DdlException {
         dropRoleInternal(role, ignoreIfNonExists, false);
     }
 
+    /**
+     * 重放删除角色操作（用于日志回放）
+     * @param info 权限信息
+     */
     public void replayDropRole(PrivInfo info) {
         try {
             dropRoleInternal(info.getRole(), false, true);
@@ -1345,8 +1686,8 @@ public class Auth implements Writable {
             // ============== Password ==============
             userAuthInfo.add(ldapUserInfo.isSetPasswd() ? "Yes" : "No");
             // ============== Roles ==============
-            userAuthInfo.add(Joiner.on(",").join(getRoleNamesByUserWithLdap(userIdent,
-                    ConnectContext.get().getSessionVariable().showUserDefaultRole)));
+            userAuthInfo.add(ldapUserInfo.getRoles().stream().map(role -> role.getRoleName())
+                    .collect(Collectors.joining(",")));
         } else {
             User user = userManager.getUserByUserIdentity(userIdent);
             if (user == null) {
@@ -1645,13 +1986,18 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 初始化用户，创建默认的 root 和 admin 用户
+     */
     private void initUser() {
         try {
+            // 创建 root 用户
             UserIdentity rootUser = new UserIdentity(ROOT_USER, "%");
             rootUser.setIsAnalyzed();
             createUserInternal(rootUser, Role.OPERATOR_ROLE, new byte[0],
                     false /* ignore if exists */, PasswordOptions.UNSET_OPTION,
                     "ROOT", ROOT_USER, true /* is replay */);
+            // 创建 admin 用户
             UserIdentity adminUser = new UserIdentity(ADMIN_USER, "%");
             adminUser.setIsAnalyzed();
             createUserInternal(adminUser, Role.ADMIN_ROLE, new byte[0],
@@ -1662,6 +2008,10 @@ public class Auth implements Writable {
         }
     }
 
+    /**
+     * 设置初始 root 用户密码
+     * @param initialRootPassword 初始 root 密码
+     */
     public void setInitialRootPassword(String initialRootPassword) {
         // Skip set root password if `initial_root_password` set to empty string
         if (StringUtils.isEmpty(initialRootPassword)) {
@@ -1934,6 +2284,14 @@ public class Auth implements Writable {
     }
 
     /**
+     * 修复权限 bug
+     * 这是一个 bug：如果在 v1.2 之前创建了一个普通用户并授予 ADMIN_PRIV/RESOURCE_PRIV/NODE_PRIV 权限，
+     * 然后升级到 v1.2，这些权限会被设置在 catalog 级别，但它们应该在全局级别。
+     * 此方法将修复此 bug。其逻辑与 userPrivTable.degradeToInternalCatalogPriv() 相同，
+     * 但 userPrivTable.degradeToInternalCatalogPriv() 只处理镜像中的信息，不处理编辑日志。
+     * 此 rectifyPrivs() 将在镜像和编辑日志回放后调用。
+     * 因此它将修复镜像和编辑日志中的 bug。
+     * 
      * This is a bug that if created a normal user and grant it with ADMIN_PRIV/RESOURCE_PRIV/NODE_PRIV
      * before v1.2, and then upgrade to v1.2, these privileges will be set in catalog level, but it should be
      * in global level.
@@ -1946,8 +2304,14 @@ public class Auth implements Writable {
         roleManager.rectifyPrivs();
     }
 
+    /**
+     * 序列化 Auth 对象到输出流
+     * @param out 数据输出流
+     * @throws IOException IO 异常
+     */
     @Override
     public void write(DataOutput out) throws IOException {
+        // 角色管理器必须首先写入，因为在任何用户之前角色应该存在
         // role manager must be first, because role should be exist before any user
         roleManager.write(out);
         userManager.write(out);
@@ -1957,6 +2321,11 @@ public class Auth implements Writable {
         passwdPolicyManager.write(out);
     }
 
+    /**
+     * 从输入流反序列化 Auth 对象
+     * @param in 数据输入流
+     * @throws IOException IO 异常
+     */
     public void readFields(DataInput in) throws IOException {
         roleManager = RoleManager.read(in);
         userManager = UserManager.read(in);
@@ -1964,6 +2333,7 @@ public class Auth implements Writable {
         propertyMgr = UserPropertyMgr.read(in);
         ldapInfo = LdapInfo.read(in);
 
+        // 如果用户列表为空，初始化 root 和 admin 用户
         if (userManager.getNameToUsers().isEmpty()) {
             // init root and admin user
             initUser();

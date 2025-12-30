@@ -228,13 +228,16 @@ Status StreamLoadPipe::_append(const ByteBufferPtr& buf, size_t proto_byte_size)
 
 // called when producer finished
 Status StreamLoadPipe::finish() {
+    // 生产者完成数据写入时的处理
     if (_write_buf != nullptr) {
+        // 如果还有未写入的缓冲区，先刷新到队列
         _write_buf->flip();
         RETURN_IF_ERROR(_append(_write_buf));
         _write_buf.reset();
     }
     {
         std::lock_guard<std::mutex> l(_lock);
+        // 标记管道已完成，通知所有等待的消费者
         _finished = true;
     }
     _get_cond.notify_all();
@@ -245,9 +248,11 @@ Status StreamLoadPipe::finish() {
 void StreamLoadPipe::cancel(const std::string& reason) {
     {
         std::lock_guard<std::mutex> l(_lock);
+        // 标记管道已取消，设置取消原因
         _cancelled = true;
         _cancelled_reason = reason;
     }
+    // 通知所有等待的生产者和消费者线程
     _get_cond.notify_all();
     _put_cond.notify_all();
 }

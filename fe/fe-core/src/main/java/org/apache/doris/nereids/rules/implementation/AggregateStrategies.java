@@ -78,6 +78,7 @@ import javax.annotation.Nullable;
 public class AggregateStrategies implements ImplementationRuleFactory {
     @Override
     public List<Rule> buildRules() {
+        // 聚合相关实现规则集合，外层会再套一层 FilteredRules，对应不同的节点类型快速筛选可用规则。
         return ImmutableList.of(
             RuleType.COUNT_ON_INDEX_WITHOUT_PROJECT.build(
                 logicalAggregate(

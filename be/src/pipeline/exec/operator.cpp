@@ -369,8 +369,21 @@ Status OperatorXBase::do_projections(RuntimeState* state, vectorized::Block* ori
     return Status::OK();
 }
 
+/**
+ * @brief 获取经过投影处理的数据块
+ *
+ * 该函数是pipeline执行过程中的核心函数，负责从操作符获取数据块并应用投影操作。
+ * 如果配置了输出行描述符，则会先获取原始数据块，然后执行投影转换。
+ * 同时负责更新性能计数器和调试支持。
+ *
+ * @param state 运行时状态，包含执行上下文和本地状态信息
+ * @param block 输出参数，用于存储处理后的数据块
+ * @param eos 输出参数，指示是否达到数据流的末尾
+ * @return Status 执行状态，成功返回OK，失败返回错误状态
+ */
 Status OperatorXBase::get_block_after_projects(RuntimeState* state, vectorized::Block* block,
                                                bool* eos) {
+    // 调试代码：模拟特定操作符返回空块，用于测试pipeline的容错性
     DBUG_EXECUTE_IF("Pipeline::return_empty_block", {
         if (this->_op_name == "AGGREGATION_OPERATOR" || this->_op_name == "HASH_JOIN_OPERATOR" ||
             this->_op_name == "PARTITIONED_AGGREGATION_OPERATOR" ||
@@ -382,8 +395,11 @@ Status OperatorXBase::get_block_after_projects(RuntimeState* state, vectorized::
         }
     });
 
+    // 初始化执行状态和获取本地状态
     Status status;
     auto* local_state = state->get_local_state(operator_id());
+
+    // 使用Defer延迟执行计数器更新，确保在函数返回前更新性能统计
     Defer defer([&]() {
         if (status.ok()) {
             if (auto rows = block->rows()) {
@@ -392,16 +408,23 @@ Status OperatorXBase::get_block_after_projects(RuntimeState* state, vectorized::
             }
         }
     });
+    // 如果配置了输出行描述符，需要先获取原始数据块然后执行投影转换
     if (_output_row_descriptor) {
+        // 清理原始数据块，确保没有残留数据
         local_state->clear_origin_block();
+        // 获取未经投影处理的原始数据块
         status = get_block(state, &local_state->_origin_block, eos);
         if (UNLIKELY(!status.ok())) {
             return status;
         }
+        // 执行投影操作，将原始数据块转换为符合输出描述符格式的块
         status = do_projections(state, &local_state->_origin_block, block);
         return status;
     }
+
+    // 如果没有配置输出行描述符，直接获取数据块
     status = get_block(state, block, eos);
+    // 验证数据块的类型和列结构是否正确
     RETURN_IF_ERROR(block->check_type_and_column());
     return status;
 }
@@ -731,12 +754,25 @@ Status AsyncWriterSink<Writer, Parent>::init(RuntimeState* state, LocalSinkState
 template <typename Writer, typename Parent>
     requires(std::is_base_of_v<vectorized::AsyncResultWriter, Writer>)
 Status AsyncWriterSink<Writer, Parent>::open(RuntimeState* state) {
+    // open 阶段的职责：
+    // 1) 完成 DataSinkOperator 的通用 open（例如依赖/计时器等基础设施准备）；
+    // 2) 将父算子（Parent）构建的输出表达式上下文 clone 到本 sink 的本地副本；
+    // 3) 启动异步 writer（通常会在后台线程/任务中处理 block、flush/commit 等流程）。
     RETURN_IF_ERROR(Base::open(state));
+    // AsyncWriterSink 会持有一份“本地”的 _output_vexpr_ctxs：
+    // - 父算子里保存的是模板参数 Parent 的成员 `_output_vexpr_ctxs`
+    // - 这里需要 clone，避免多个并发实例/线程共享同一个 VExprContext 带来的并发与生命周期问题
     _output_vexpr_ctxs.resize(_parent->cast<Parent>()._output_vexpr_ctxs.size());
     for (size_t i = 0; i < _output_vexpr_ctxs.size(); i++) {
+        // 将父算子中的第 i 个输出表达式 ctx clone 到本地：
+        // - clone 过程中会绑定到当前 RuntimeState（如函数上下文、profile 等）
+        // - clone 后的 ctx 由本 sink 持有并负责后续使用/释放
         RETURN_IF_ERROR(
                 _parent->cast<Parent>()._output_vexpr_ctxs[i]->clone(state, _output_vexpr_ctxs[i]));
     }
+    // 真正启动异步写入器：
+    // - 之后 sink() 只负责把 block 交给 writer（写入线程/队列）
+    // - writer 内部负责 flush、分发、commit/rollback 等较重的工作
     RETURN_IF_ERROR(_writer->start_writer(state, operator_profile()));
     return Status::OK();
 }

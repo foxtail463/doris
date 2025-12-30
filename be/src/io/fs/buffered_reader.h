@@ -70,28 +70,43 @@ struct PrefetchRange {
         return {start_offset, other.end_offset};
     }
 
-    //Ranges needs to be sorted.
+    /**
+     * 合并相邻的连续范围，优化小IO请求
+     * 将多个小的连续读取请求合并成较大的读取请求，减少网络开销
+     * 
+     * @param seq_ranges 需要合并的范围列表（必须已排序）
+     * @param max_merge_distance_bytes 最大合并距离，超过此距离的范围不会合并
+     * @param once_max_read_bytes 单次读取的最大字节数，防止合并后读取过大
+     * @return 合并后的范围列表
+     */
     static std::vector<PrefetchRange> merge_adjacent_seq_ranges(
             const std::vector<PrefetchRange>& seq_ranges, int64_t max_merge_distance_bytes,
             int64_t once_max_read_bytes) {
+        // 空范围直接返回
         if (seq_ranges.empty()) {
             return {};
         }
-        // Merge overlapping ranges
+        
+        // 合并重叠和相邻的范围
         std::vector<PrefetchRange> result;
-        PrefetchRange last = seq_ranges.front();
+        PrefetchRange last = seq_ranges.front();  // 当前合并的最后一个范围
+        
         for (size_t i = 1; i < seq_ranges.size(); ++i) {
-            PrefetchRange current = seq_ranges[i];
-            PrefetchRange merged = last.seq_span(current);
+            PrefetchRange current = seq_ranges[i];  // 当前要处理的范围
+            PrefetchRange merged = last.seq_span(current);  // 尝试合并两个范围
+            
+            // 检查是否可以合并：
+            // 1. 合并后的范围大小不超过单次读取限制
+            // 2. 两个范围之间的距离不超过最大合并距离
             if (merged.end_offset <= once_max_read_bytes + merged.start_offset &&
                 last.end_offset + max_merge_distance_bytes >= current.start_offset) {
-                last = merged;
+                last = merged;  // 可以合并，更新当前范围
             } else {
-                result.push_back(last);
-                last = current;
+                result.push_back(last);  // 无法合并，将当前范围加入结果
+                last = current;  // 开始新的合并范围
             }
         }
-        result.push_back(last);
+        result.push_back(last);  // 添加最后一个范围
         return result;
     }
 };
@@ -125,23 +140,53 @@ private:
 };
 
 /**
- * The reader provides a solution to read one range at a time. You can customize RangeFinder to meet your scenario.
- * For me, since there will be tiny stripes when reading orc files, in order to reduce the requests to hdfs,
- * I first merge the access to the orc files to be read (of course there is a problem of read amplification,
- * but in my scenario, compared with reading hdfs multiple times, it is faster to read more data on hdfs at one time),
- * and then because the actual reading of orc files is in order from front to back, I provide LinearProbeRangeFinder.
+ * 范围缓存文件读取器
+ * 
+ * 该类提供了一个按范围（range）读取文件的解决方案，通过合并多个小范围的读取请求，
+ * 减少对底层存储系统（如 HDFS/S3）的 I/O 次数，提高读取性能。
+ * 
+ * 设计背景：
+ * - 在读取 ORC 文件时，如果文件包含多个 tiny stripe（小条带），每个 stripe 都很小
+ * - 如果逐个读取这些小 stripe，会产生大量的小 I/O 请求，导致性能下降
+ * - 解决方案：将多个相邻的小 stripe 合并成更大的预取区间，一次性读取更多数据
+ * 
+ * 工作原理：
+ * 1. 通过 RangeFinder 查找目标偏移量对应的预取区间
+ * 2. 如果该区间已在缓存中，直接从缓存返回数据
+ * 3. 如果不在缓存中，从底层读取器读取整个区间到缓存，然后返回请求的数据
+ * 4. 后续对同一区间的读取请求可以直接从缓存返回，无需再次访问底层存储
+ * 
+ * 优化效果：
+ * - 减少 I/O 次数：多个小请求合并为少量大请求
+ * - 提高缓存命中率：更大的区间更容易被复用
+ * - 降低延迟：减少网络往返次数
+ * 
+ * 注意事项：
+ * - 存在读放大（read amplification）问题：可能读取比实际需要更多的数据
+ * - 但在 tiny stripe 场景下，相比多次小 I/O，一次性读取更多数据通常更快
+ * - 由于 ORC 文件的读取模式是从前到后顺序的，因此使用 LinearProbeRangeFinder 进行优化
  */
 class RangeCacheFileReader : public io::FileReader {
+    /**
+     * 范围缓存读取器的统计信息
+     * 用于监控缓存效果和性能指标
+     */
     struct RangeCacheReaderStatistics {
-        int64_t request_io = 0;
-        int64_t request_bytes = 0;
-        int64_t request_time = 0;
-        int64_t read_to_cache_time = 0;
-        int64_t cache_refresh_count = 0;
-        int64_t read_to_cache_bytes = 0;
+        int64_t request_io = 0;              // ORC 库调用读取接口的次数
+        int64_t request_bytes = 0;           // ORC 库实际需要读取的字节数
+        int64_t request_time = 0;            // ORC 库调用读取接口的总耗时
+        int64_t read_to_cache_time = 0;      // 从底层读取器读取数据到缓存的耗时
+        int64_t cache_refresh_count = 0;     // 缓存刷新的次数（合并的 I/O 次数）
+        int64_t read_to_cache_bytes = 0;     // 合并后实际读取到缓存的字节数
     };
 
 public:
+    /**
+     * 构造函数
+     * @param profile 运行时性能分析器，用于记录统计信息
+     * @param inner_reader 底层文件读取器（如 S3FileReader、HdfsFileReader）
+     * @param range_finder 范围查找器，用于根据偏移量查找对应的预取区间
+     */
     RangeCacheFileReader(RuntimeProfile* profile, io::FileReaderSPtr inner_reader,
                          std::shared_ptr<RangeFinder> range_finder);
 
@@ -161,41 +206,77 @@ public:
     bool closed() const override { return _closed; }
 
 protected:
+    /**
+     * 从指定偏移量读取数据的实现
+     * 
+     * 读取流程：
+     * 1. 通过 RangeFinder 查找目标偏移量对应的预取区间
+     * 2. 如果当前缓存不包含该区间，从底层读取器读取整个区间到缓存
+     * 3. 从缓存中复制请求的数据到结果缓冲区
+     * 
+     * @param offset 文件中的起始偏移量
+     * @param result 读取结果的缓冲区
+     * @param bytes_read 实际读取的字节数（输出参数）
+     * @param io_ctx I/O 上下文
+     * @return 操作状态
+     */
     Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                         const IOContext* io_ctx) override;
 
     void _collect_profile_before_close() override;
 
 private:
-    RuntimeProfile* _profile = nullptr;
-    io::FileReaderSPtr _inner_reader;
-    std::shared_ptr<RangeFinder> _range_finder;
+    RuntimeProfile* _profile = nullptr;                    // 运行时性能分析器
+    io::FileReaderSPtr _inner_reader;                      // 底层文件读取器（实际执行 I/O）
+    std::shared_ptr<RangeFinder> _range_finder;             // 范围查找器（查找预取区间）
 
-    OwnedSlice _cache;
-    int64_t _current_start_offset = -1;
+    OwnedSlice _cache;                                      // 缓存缓冲区（存储当前预取区间的数据）
+    int64_t _current_start_offset = -1;                    // 当前缓存区间的起始偏移量（-1 表示缓存未初始化）
 
-    size_t _size;
-    bool _closed = false;
+    size_t _size;                                           // 文件大小
+    bool _closed = false;                                   // 是否已关闭
 
-    RuntimeProfile::Counter* _request_io = nullptr;
-    RuntimeProfile::Counter* _request_bytes = nullptr;
-    RuntimeProfile::Counter* _request_time = nullptr;
-    RuntimeProfile::Counter* _read_to_cache_time = nullptr;
-    RuntimeProfile::Counter* _cache_refresh_count = nullptr;
-    RuntimeProfile::Counter* _read_to_cache_bytes = nullptr;
-    RangeCacheReaderStatistics _cache_statistics;
+    // 性能统计计数器（用于 RuntimeProfile）
+    RuntimeProfile::Counter* _request_io = nullptr;        // ORC 库调用读取接口的次数
+    RuntimeProfile::Counter* _request_bytes = nullptr;      // ORC 库实际需要读取的字节数
+    RuntimeProfile::Counter* _request_time = nullptr;       // ORC 库调用读取接口的总耗时
+    RuntimeProfile::Counter* _read_to_cache_time = nullptr; // 从底层读取器读取数据到缓存的耗时
+    RuntimeProfile::Counter* _cache_refresh_count = nullptr; // 缓存刷新的次数（合并的 I/O 次数）
+    RuntimeProfile::Counter* _read_to_cache_bytes = nullptr; // 合并后实际读取到缓存的字节数
+    RangeCacheReaderStatistics _cache_statistics;          // 统计信息结构体
+
     /**
-     * `RangeCacheFileReader`:
-     *   1. `CacheRefreshCount`: how many IOs are merged
-     *   2. `ReadToCacheBytes`: how much data is actually read after merging
-     *   3. `ReadToCacheTime`: how long it takes to read data after merging
-     *   4. `RequestBytes`: how many bytes does the apache-orc library actually need to read the orc file
-     *   5. `RequestIO`: how many times the apache-orc library calls this read interface
-     *   6. `RequestTime`: how long it takes the apache-orc library to call this read interface
+     * 统计指标说明：
+     * 
+     * 1. `CacheRefreshCount`（缓存刷新次数）：
+     *    - 表示有多少次 I/O 请求被合并了
+     *    - 例如：10 个小请求合并成 2 个大请求，CacheRefreshCount = 2
+     * 
+     * 2. `ReadToCacheBytes`（读取到缓存的字节数）：
+     *    - 表示合并后实际从底层读取器读取到缓存的字节数
+     *    - 可能大于 RequestBytes（因为读取了整个区间，而不仅仅是请求的部分）
+     * 
+     * 3. `ReadToCacheTime`（读取到缓存的耗时）：
+     *    - 表示从底层读取器读取数据到缓存的总耗时
+     *    - 这是实际的 I/O 时间，不包括从缓存复制数据的时间
+     * 
+     * 4. `RequestBytes`（请求字节数）：
+     *    - 表示 ORC 库实际需要读取的字节数（不包括读放大）
+     *    - 这是 ORC 库真正需要的数据量
+     * 
+     * 5. `RequestIO`（请求 I/O 次数）：
+     *    - 表示 ORC 库调用读取接口的总次数
+     *    - 如果缓存命中，可能不会触发底层 I/O
+     * 
+     * 6. `RequestTime`（请求总耗时）：
+     *    - 表示 ORC 库调用读取接口的总耗时
+     *    - 包括缓存命中的快速返回和缓存未命中的 I/O 时间
      *
-     *   It should be noted that `RangeCacheFileReader` is a wrapper of the reader that actually reads data,such as
-     *   the hdfs reader, so strictly speaking, `CacheRefreshCount` is not equal to how many IOs are initiated to hdfs,
-     *  because each time the hdfs reader is requested, the hdfs reader may not be able to read all the data at once.
+     * 注意事项：
+     * - `RangeCacheFileReader` 是底层读取器（如 HDFS 读取器）的包装器
+     * - 严格来说，`CacheRefreshCount` 不等于实际发起到 HDFS 的 I/O 次数
+     * - 因为每次请求 HDFS 读取器时，HDFS 读取器可能无法一次性读取所有数据
+     * - 可能需要多次网络往返才能完成一次 `read_to_cache` 操作
      */
 };
 

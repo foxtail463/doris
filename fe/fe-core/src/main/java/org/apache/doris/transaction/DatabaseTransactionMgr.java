@@ -310,38 +310,66 @@ public class DatabaseTransactionMgr {
     }
 
 
+    /**
+     * 开始一个新的事务
+     * 该方法会进行一系列检查，包括：主节点检查、数据库检查、物化视图检查、配额检查、标签检查等
+     * 然后创建事务状态并分配事务 ID
+     * 
+     * @param tableIdList 事务涉及的表 ID 列表
+     * @param label 事务标签，用于标识同一个 load 作业
+     * @param requestId 请求 ID，用于识别重复请求
+     * @param coordinator 事务协调者信息
+     * @param sourceType 负载作业来源类型（如 INSERT_STREAMING、BROKER_LOAD 等）
+     * @param listenerId 监听器 ID
+     * @param timeoutSecond 事务超时时间（秒）
+     * @return 新创建的事务 ID
+     * @throws DuplicatedRequestException 重复请求异常（重试请求时返回已有事务 ID）
+     * @throws LabelAlreadyUsedException 标签已被使用异常
+     * @throws BeginTransactionException 开始事务异常
+     * @throws AnalysisException 分析异常
+     * @throws QuotaExceedException 配额超限异常
+     * @throws MetaNotFoundException 元数据未找到异常
+     */
     public long beginTransaction(List<Long> tableIdList, String label, TUniqueId requestId,
             TransactionState.TxnCoordinator coordinator, TransactionState.LoadJobSourceType sourceType,
             long listenerId, long timeoutSecond)
             throws DuplicatedRequestException, LabelAlreadyUsedException, BeginTransactionException,
             AnalysisException, QuotaExceedException, MetaNotFoundException {
 
+        // 检查当前 FE 节点是否是主节点（非主节点不能开始事务）
         if (!Env.getCurrentEnv().isMaster() && !FeConstants.runningUnitTest) {
             throw new BeginTransactionException("FE is not master");
         }
 
+        // 获取数据库对象，如果不存在则抛出异常
         Database db = env.getInternalCatalog().getDbOrMetaException(dbId);
+        // 如果不是内部请求，检查数据库访问权限
         if (!coordinator.isFromInternal) {
             InternalDatabaseUtil.checkDatabase(db.getFullName(), ConnectContext.get());
         }
+        // 检查是否可以修改物化视图数据
         MTMVUtil.checkModifyMTMVData(db, tableIdList, ConnectContext.get());
+        // 检查数据库数据配额是否超限
         checkDatabaseDataQuota();
+        // 参数校验：确保协调者和标签不为空
         Preconditions.checkNotNull(coordinator);
         Preconditions.checkNotNull(label);
+        // 验证标签格式是否正确
         FeNameFormat.checkLabel(label);
 
         long tid = 0L;
+        // 获取写锁，保护事务创建过程的原子性
         writeLock();
         try {
             /*
-             * Check if label already used, by following steps
-             * 1. get all existing transactions
-             * 2. if there is a PREPARE transaction, check if this is a retry request. If yes, return the
-             *    existing txn id.
-             * 3. if there is a non-aborted transaction, throw label already used exception.
+             * 检查标签是否已被使用，按以下步骤进行：
+             * 1. 获取所有使用该标签的现有事务
+             * 2. 如果存在 PREPARE 状态的事务，检查是否是重试请求。如果是，返回现有事务 ID
+             * 3. 如果存在非 ABORTED 状态的事务，抛出标签已被使用异常
              */
             Set<Long> existingTxnIds = unprotectedGetTxnIdsByLabel(label);
             if (existingTxnIds != null && !existingTxnIds.isEmpty()) {
+                // 收集所有非 ABORTED 状态的事务
                 List<TransactionState> notAbortedTxns = Lists.newArrayList();
                 for (long txnId : existingTxnIds) {
                     TransactionState txn = unprotectedGetTransactionState(txnId);
@@ -350,48 +378,69 @@ public class DatabaseTransactionMgr {
                         notAbortedTxns.add(txn);
                     }
                 }
-                // there should be at most 1 txn in PREPARE/PRECOMMITTED/COMMITTED/VISIBLE status
+                // 应该最多只有 1 个处于 PREPARE/PRECOMMITTED/COMMITTED/VISIBLE 状态的事务
                 Preconditions.checkState(notAbortedTxns.size() <= 1, notAbortedTxns);
                 if (!notAbortedTxns.isEmpty()) {
                     TransactionState notAbortedTxn = notAbortedTxns.get(0);
+                    // 如果是重试请求（相同的 requestId 且事务状态为 PREPARE 或 PRECOMMITTED），返回已有事务 ID
                     if (requestId != null && (notAbortedTxn.getTransactionStatus() == TransactionStatus.PREPARE
                             || notAbortedTxn.getTransactionStatus() == TransactionStatus.PRECOMMITTED)
                             && notAbortedTxn.getRequestId() != null && notAbortedTxn.getRequestId().equals(requestId)) {
-                        // this may be a retry request for same job, just return existing txn id.
+                        // 这可能是同一个作业的重试请求，直接返回现有事务 ID
                         throw new DuplicatedRequestException(DebugUtil.printId(requestId),
                                 notAbortedTxn.getTransactionId(), "");
                     }
+                    // 否则，标签已被使用，抛出异常
                     throw new LabelAlreadyUsedException(notAbortedTxn);
                 }
             }
 
+            // 检查运行中的事务数量是否超过限制
             checkRunningTxnExceedLimit(tableIdList);
 
+            // 生成新的事务 ID
             tid = idGenerator.getNextTransactionId();
+            // 创建事务状态对象
             TransactionState transactionState = new TransactionState(dbId, tableIdList,
                     tid, label, requestId, sourceType, coordinator, listenerId, timeoutSecond * 1000);
+            // 设置事务准备时间
             transactionState.setPrepareTime(System.currentTimeMillis());
+            // 将事务状态保存到内存中（不写 edit log）
             unprotectUpsertTransactionState(transactionState, false);
 
+            // 如果指标系统已初始化，增加事务开始计数器
             if (MetricRepo.isInit) {
                 MetricRepo.COUNTER_TXN_BEGIN.increase(1L);
             }
         } finally {
+            // 释放写锁
             writeUnlock();
         }
+        // 记录事务开始日志
         LOG.info("begin transaction: txn id {} with label {} from coordinator {}, listener id: {}",
                     tid, label, coordinator, listenerId);
         return tid;
     }
 
+    /**
+     * 检查数据库数据配额是否超限
+     * 使用缓存的配额值进行检查，如果缓存未初始化（-1），则从数据库获取实时值
+     * 
+     * @throws MetaNotFoundException 数据库元数据未找到异常
+     * @throws QuotaExceedException 配额超限异常
+     */
     private void checkDatabaseDataQuota() throws MetaNotFoundException, QuotaExceedException {
+        // 获取数据库对象
         Database db = env.getInternalCatalog().getDbOrMetaException(dbId);
 
+        // 如果缓存的配额值未初始化，从数据库获取实时使用的配额值
         if (usedQuotaDataBytes == -1) {
             usedQuotaDataBytes = db.getUsedDataQuota();
         }
 
+        // 获取数据库配置的数据配额上限
         long dataQuotaBytes = db.getDataQuota();
+        // 如果已使用的配额大于等于配额上限，抛出配额超限异常
         if (usedQuotaDataBytes >= dataQuotaBytes) {
             throw new QuotaExceedException(db.getFullName(), dataQuotaBytes);
         }
@@ -401,25 +450,39 @@ public class DatabaseTransactionMgr {
         this.usedQuotaDataBytes = usedQuotaDataBytes;
     }
 
+    /**
+     * 2PC 模式下的预提交阶段（Pre-Commit）
+     *
+     * 该方法对应 Doris 事务的「两阶段提交」中的第一阶段，主要完成：
+     * 1. 校验当前事务状态是否合法（不能是 ABORTED / VISIBLE / COMMITTED）
+     * 2. 收集并检查所有 tablet 的提交结果，统计失败副本和参与的 BE
+     * 3. 在持有写锁的前提下，将事务状态推进到 PRECOMMITTED，并记录相关元信息
+     *
+     * 注意：
+     * - 调用方已经持有 DB 锁，这里不再获取 DB 锁；
+     * - PRECOMMITTED 状态表示所有参与者（BE）上的写入阶段已经结束，准备进入真正的 commit。
+     */
     public void preCommitTransaction2PC(List<Table> tableList, long transactionId,
             List<TabletCommitInfo> tabletCommitInfos, TxnCommitAttachment txnCommitAttachment)
             throws UserException {
-        // check status
-        // the caller method already own db lock, we do not obtain db lock here
+        // 调用方已经持有 db 锁，这里只负责事务级别的状态检查与推进
         Database db = env.getInternalCatalog().getDbOrMetaException(dbId);
         TransactionState transactionState;
+        // 首先在读锁下读取当前事务状态，避免与其他线程并发修改冲突
         readLock();
         try {
             transactionState = unprotectedGetTransactionState(transactionId);
         } finally {
             readUnlock();
         }
+        // 事务不存在，或者已经被标记为 ABORTED，说明本次提交无效，直接抛出异常
         if (transactionState == null
                 || transactionState.getTransactionStatus() == TransactionStatus.ABORTED) {
             throw new TransactionCommitFailedException(
                     transactionState == null ? "transaction not found" : transactionState.getReason());
         }
 
+        // 事务已经是 VISIBLE，说明之前已经完整提交并发布版本，再次 preCommit 视为逻辑错误
         if (transactionState.getTransactionStatus() == TransactionStatus.VISIBLE) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("transaction is already visible: {}", transactionId);
@@ -427,6 +490,7 @@ public class DatabaseTransactionMgr {
             throw new TransactionCommitFailedException("transaction is already visible");
         }
 
+        // 事务已经是 COMMITTED，说明 2PC 已经完成第二阶段的 commit，本次调用属于重复提交
         if (transactionState.getTransactionStatus() == TransactionStatus.COMMITTED) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("transaction is already committed: {}", transactionId);
@@ -434,6 +498,7 @@ public class DatabaseTransactionMgr {
             throw new TransactionCommitFailedException("transaction is already committed");
         }
 
+        // 如果事务已经处于 PRECOMMITTED，则说明之前已经完成过预提交，直接返回即可（幂等处理）
         if (transactionState.getTransactionStatus() == TransactionStatus.PRECOMMITTED) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("transaction is already pre-committed: {}", transactionId);
@@ -441,13 +506,18 @@ public class DatabaseTransactionMgr {
             return;
         }
 
+        // 用于收集本次提交过程中失败的副本 ID 集合
         Set<Long> errorReplicaIds = Sets.newHashSet();
+        // 用于记录本次事务涉及到的所有 BE 节点 ID（后续统计、诊断使用）
         Set<Long> totalInvolvedBackends = Sets.newHashSet();
+        // 记录 table -> partition 的映射关系，方便后续事务状态推进和 publish 版本
         Map<Long, Set<Long>> tableToPartition = new HashMap<>();
 
+        // 检查所有 Tablet 的提交结果，填充 errorReplicaIds / tableToPartition / totalInvolvedBackends 等信息
         checkCommitStatus(tableList, transactionState, tabletCommitInfos, txnCommitAttachment, errorReplicaIds,
                           tableToPartition, totalInvolvedBackends);
 
+        // 在写锁保护下推进事务状态到 PRECOMMITTED，并持久化相关元数据
         writeLock();
         try {
             unprotectedPreCommitTransaction2PC(transactionState, errorReplicaIds, tableToPartition,
@@ -1502,21 +1572,34 @@ public class DatabaseTransactionMgr {
         }
     }
 
+    /**
+     * 2PC 预提交阶段的内部实现（不加锁版本）
+     *
+     * 上层已经在持有写锁的前提下调用该方法，这里只负责：
+     * 1. 校验当前事务是否仍处于 PREPARE 状态（防止状态被并发修改）
+     * 2. 将事务状态推进到 PRECOMMITTED，并记录预提交时间
+     * 3. 记录本次事务中失败的副本信息（errorReplicaIds）
+     * 4. 基于 tableToPartition 生成 TableCommitInfo / PartitionCommitInfo 并挂到 TransactionState 上
+     * 5. 持久化 TransactionState，记录参与本事务的所有 BE（totalInvolvedBackends）
+     */
     protected void unprotectedPreCommitTransaction2PC(TransactionState transactionState, Set<Long> errorReplicaIds,
                                                 Map<Long, Set<Long>> tableToPartition, Set<Long> totalInvolvedBackends,
                                                 Database db) {
-        // transaction state is modified during check if the transaction could committed
+        // 在 checkCommitStatus 过程中事务状态可能已经被修改，这里再确认一次必须仍为 PREPARE 才能进入预提交
         if (transactionState.getTransactionStatus() != TransactionStatus.PREPARE) {
             return;
         }
-        // update transaction state version
+        // 设置预提交时间，并将事务状态从 PREPARE 推进到 PRECOMMITTED
         transactionState.setPreCommitTime(System.currentTimeMillis());
         transactionState.setTransactionStatus(TransactionStatus.PRECOMMITTED);
+        // 记录本次事务中写入失败的副本集合，用于后续修复 / 诊断
         transactionState.setErrorReplicas(errorReplicaIds);
+        // 遍历本次事务涉及的所有表及其分区，为每个表构建 TableCommitInfo
         for (long tableId : tableToPartition.keySet()) {
             OlapTable table = (OlapTable) db.getTableNullable(tableId);
             TableCommitInfo tableCommitInfo = new TableCommitInfo(tableId);
             PartitionInfo tblPartitionInfo = table.getPartitionInfo();
+            // 为该表下所有参与本事务的分区构建 PartitionCommitInfo，并挂到对应的 TableCommitInfo 上
             for (long partitionId : tableToPartition.get(tableId)) {
                 String partitionRange = tblPartitionInfo.getPartitionRangeString(partitionId);
                 PartitionCommitInfo partitionCommitInfo = new PartitionCommitInfo(
@@ -1526,8 +1609,9 @@ public class DatabaseTransactionMgr {
             }
             transactionState.putIdToTableCommitInfo(tableId, tableCommitInfo);
         }
-        // persist transactionState
+        // 将更新后的事务状态写入 EditLog（持久化），第二个参数为 false 表示只 upsert，不做额外校验
         unprotectUpsertTransactionState(transactionState, false);
+        // 记录本次事务中涉及到的所有 BE 节点，用于后续 PublishVersion / 诊断
         transactionState.setInvolvedBackends(totalInvolvedBackends);
     }
 

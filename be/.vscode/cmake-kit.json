@@ -1,0 +1,13 @@
+[
+    {
+        "name": "Clang from ldb-toolchain-0.27",
+        "compilers": {
+            "C": "/home/yangtao555/local/ldb-toolchain-0.27/bin/clang",
+            "CXX": "/home/yangtao555/local/ldb-toolchain-0.27/bin/clang++"
+        },
+        "environmentVariables": {
+            "PATH": "/home/yangtao555/local/ldb-toolchain-0.27/bin:${env:PATH}"
+        }
+    }
+]
+

@@ -138,20 +138,46 @@ public class PartitionPruner extends DefaultExpressionRewriter<Void> {
     }
 
     /**
-     * prune partition with `idToPartitions` as parameter.
+     * 分区裁剪的公共入口方法
+     * 
+     * 该方法负责根据分区谓词条件裁剪不必要的分区，是分区裁剪功能的核心入口。
+     * 主要功能包括：
+     * 1. 性能监控：记录分区裁剪的执行时间
+     * 2. 异常处理：确保性能统计的准确性
+     * 3. 内部调用：调用实际的分区裁剪逻辑
+     * 4. 统计收集：将执行时间添加到性能统计中
+     * 
+     * 分区裁剪的作用：
+     * - 减少扫描的分区数量，提高查询性能
+     * - 根据WHERE条件过滤掉不相关的分区
+     * - 支持多种分区类型（RANGE、LIST、HASH等）
+     * - 优化查询执行计划
+     * 
+     * @param partitionSlots 分区列槽位列表，用于确定分区列
+     * @param partitionPredicate 分区谓词表达式，用于过滤分区
+     * @param idToPartitions 分区ID到分区项的映射，包含所有分区信息
+     * @param cascadesContext 级联上下文，提供优化上下文信息
+     * @param partitionTableType 分区表类型，确定分区裁剪策略
+     * @param sortedPartitionRanges 排序后的分区范围，用于优化裁剪算法
+     * @return 裁剪后需要扫描的分区ID列表
      */
     public static <K extends Comparable<K>> Pair<List<K>, Optional<Expression>> prune(List<Slot> partitionSlots,
             Expression partitionPredicate,
             Map<K, PartitionItem> idToPartitions, CascadesContext cascadesContext,
             PartitionTableType partitionTableType, Optional<SortedPartitionRanges<K>> sortedPartitionRanges) {
+        // 记录开始时间：用于性能监控和统计
         long startAt = System.currentTimeMillis();
+        
         try {
+            // 调用内部裁剪方法：执行实际的分区裁剪逻辑
             return pruneInternal(partitionSlots, partitionPredicate, idToPartitions, cascadesContext,
                     partitionTableType,
                     sortedPartitionRanges);
         } finally {
+            // 性能统计：无论是否发生异常，都要记录执行时间
             SummaryProfile profile = SummaryProfile.getSummaryProfile(cascadesContext.getConnectContext());
             if (profile != null) {
+                // 添加Nereids分区裁剪时间到性能统计中
                 profile.addNereidsPartitiionPruneTime(System.currentTimeMillis() - startAt);
             }
         }
@@ -162,6 +188,10 @@ public class PartitionPruner extends DefaultExpressionRewriter<Void> {
             Expression partitionPredicate,
             Map<K, PartitionItem> idToPartitions, CascadesContext cascadesContext,
             PartitionTableType partitionTableType, Optional<SortedPartitionRanges<K>> sortedPartitionRanges) {
+        
+        // 1. 谓词提取：从原始谓词中提取分区相关的谓词
+        // 示例：原始查询 "SELECT * FROM table WHERE date_col >= '2023-01-01' AND date_col < '2023-02-01' AND name = 'Alice'"
+        // 提取结果：只保留分区列相关谓词 "date_col >= '2023-01-01' AND date_col < '2023-02-01'"
         partitionPredicate = PartitionPruneExpressionExtractor.extract(
                 partitionPredicate, ImmutableSet.copyOf(partitionSlots), cascadesContext);
         Expression originalPartitionPredicate = partitionPredicate;
@@ -170,8 +200,12 @@ public class PartitionPruner extends DefaultExpressionRewriter<Void> {
                 "partitionPruningExpandThreshold",
                 10, sessionVariable -> sessionVariable.partitionPruningExpandThreshold);
 
+        // 4. OR到IN转换：将OR条件转换为IN条件以优化裁剪
+        // 示例：将 "date_col = '2023-01-01' OR date_col = '2023-01-02'" 转换为 "date_col IN ('2023-01-01', '2023-01-02')"
         partitionPredicate = OrToIn.EXTRACT_MODE_INSTANCE.rewriteTree(
                 partitionPredicate, new ExpressionRewriteContext(cascadesContext));
+        
+        // 5. 常量谓词处理：处理常量谓词的特殊情况
         if (BooleanLiteral.TRUE.equals(partitionPredicate)) {
             // The partition column predicate is always true and can be deleted, the partition cannot be pruned
             return Pair.of(Utils.fastToImmutableList(idToPartitions.keySet()), Optional.of(originalPartitionPredicate));
@@ -180,9 +214,13 @@ public class PartitionPruner extends DefaultExpressionRewriter<Void> {
             return Pair.of(ImmutableList.of(), Optional.empty());
         }
 
+        // 6. 二分查找策略：当有排序分区范围时，使用二分查找提高效率
         if (sortedPartitionRanges.isPresent()) {
+            // 将谓词转换为范围集合：用于二分查找
+            // 示例：将 "date_col >= '2023-01-01' AND date_col < '2023-02-01'" 转换为 RangeSet([2023-01-01, 2023-02-01))
             RangeSet<MultiColumnBound> predicateRanges = partitionPredicate.accept(
                     new PartitionPredicateToRange(partitionSlots), null);
+            
             if (predicateRanges != null) {
                 Pair<List<K>, Boolean> res = binarySearchFiltering(
                         sortedPartitionRanges.get(), partitionSlots, partitionPredicate, cascadesContext,
@@ -296,12 +334,25 @@ public class PartitionPruner extends DefaultExpressionRewriter<Void> {
     private static <K extends Comparable<K>> Pair<List<K>, Boolean> sequentialFiltering(
             Map<K, PartitionItem> idToPartitions, List<Slot> partitionSlots,
             Expression partitionPredicate, CascadesContext cascadesContext, int expandThreshold) {
+        
+        // 1. 创建分区评估器列表：为每个分区创建评估器，用于判断分区是否匹配谓词
+        // 示例：假设有3个分区 p1, p2, p3，创建3个评估器 evaluator1, evaluator2, evaluator3
         List<OnePartitionEvaluator<?>> evaluators = Lists.newArrayListWithCapacity(idToPartitions.size());
+        
+        // 2. 遍历所有分区：为每个分区创建对应的评估器
         for (Entry<K, PartitionItem> kv : idToPartitions.entrySet()) {
+            // 为每个分区创建评估器：评估器包含分区信息和谓词匹配逻辑
+            // 示例：p1 -> evaluator1, p2 -> evaluator2, p3 -> evaluator3
             evaluators.add(toPartitionEvaluator(
                     kv.getKey(), kv.getValue(), partitionSlots, cascadesContext, expandThreshold));
         }
+        
+        // 3. 构建分区裁剪器：使用评估器列表和谓词构建裁剪器
+        // 示例：PartitionPruner([evaluator1, evaluator2, evaluator3], "date_col >= '2023-01-01'")
         PartitionPruner partitionPruner = new PartitionPruner(evaluators, partitionPredicate);
+        
+        // 4. 执行分区裁剪：调用裁剪器进行实际的分区裁剪
+        // 示例：检查每个分区是否匹配谓词，返回匹配的分区列表
         //TODO: we keep default partition because it's too hard to prune it, we return false in canPrune().
         return partitionPruner.prune();
     }

@@ -53,16 +53,51 @@ public:
         return Status::OK();
     }
 
+    /**
+     * 准备阶段：初始化操作符的执行环境
+     * 在查询执行前调用，负责表达式准备和资源分配
+     * 
+     * @param state 运行时状态对象，包含查询执行的上下文信息
+     * @return 准备结果状态，成功返回OK，失败返回错误状态
+     */
     Status prepare(RuntimeState* state) override {
+        // 调用基类的准备方法，完成基础初始化工作
         RETURN_IF_ERROR(Base::prepare(state));
+        
+        // 准备输出表达式：将Thrift格式的表达式转换为可执行的表达式上下文
+        // _output_vexpr_ctxs 包含了数据转换和过滤的表达式
+        // 这些表达式用于在数据写入前进行必要的转换操作
         RETURN_IF_ERROR(vectorized::VExpr::prepare(_output_vexpr_ctxs, state, _row_desc));
+        
+        // 打开表达式：激活表达式上下文，使其可以开始执行
+        // 这一步通常在prepare之后、open之前调用
         return vectorized::VExpr::open(_output_vexpr_ctxs, state);
     }
 
+    /**
+     * 数据接收：处理来自上游操作符的数据块
+     * 这是Pipeline执行引擎中数据流动的核心方法，负责接收、处理和转发数据
+     * 
+     * @param state 运行时状态对象，包含查询执行的上下文信息
+     * @param in_block 输入数据块指针，包含要处理的数据行
+     * @param eos 是否到达数据流末尾的标志（End Of Stream）
+     * @return 处理结果状态，成功返回OK，失败返回错误状态
+     */
     Status sink(RuntimeState* state, vectorized::Block* in_block, bool eos) override {
+        // 获取当前线程的本地状态对象
+        // 每个线程都有独立的本地状态，避免并发访问冲突
         auto& local_state = get_local_state(state);
+        
+        // 性能监控：记录执行时间
+        // SCOPED_TIMER 是一个RAII工具，自动记录从构造到析构的时间间隔
         SCOPED_TIMER(local_state.exec_time_counter());
+        
+        // 统计计数器更新：记录输入的行数
+        // 用于性能分析和监控，了解数据处理的吞吐量
         COUNTER_UPDATE(local_state.rows_input_counter(), (int64_t)in_block->rows());
+        
+        // 调用本地状态的sink方法，执行实际的数据处理逻辑
+        // 将数据块传递给本地状态，由具体的实现类处理数据写入
         return local_state.sink(state, in_block, eos);
     }
 

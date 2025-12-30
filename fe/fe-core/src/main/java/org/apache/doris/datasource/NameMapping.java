@@ -27,10 +27,15 @@ import java.util.Objects;
  */
 @Getter
 public class NameMapping {
+    /** 控制器（Catalog）ID，用于区分不同外部目录。 */
     private final long ctlId;
+    /** Doris 内部的数据库名称。 */
     private final String localDbName;
+    /** Doris 内部的表名称。 */
     private final String localTblName;
+    /** 外部数据源的数据库名称。 */
     private final String remoteDbName;
+    /** 外部数据源的表名称。 */
     private final String remoteTblName;
 
     public NameMapping(long ctlId, String localDbName, String localTblName, String remoteDbName, String remoteTblName) {

@@ -472,12 +472,28 @@ public class Tablet extends MetaObject {
         return id == tablet.id;
     }
 
-    // ATTN: Replica::getDataSize may zero in cloud and non-cloud
-    // due to dataSize not write to image
+    /**
+     * 获取 Tablet 的数据大小
+     * 
+     * 注意：在云模式和非云模式下，Replica::getDataSize 可能为 0，
+     * 这是因为 dataSize 没有写入到 image 文件中
+     * 
+     * @param singleReplica 是否按单副本计算
+     *                      true: 返回所有正常副本数据大小的平均值（用于计算单副本大小）
+     *                      false: 返回所有正常副本数据大小的总和（用于计算总副本大小）
+     * @param filterSizeZero 是否过滤掉数据大小为 0 的副本
+     *                       true: 只统计数据大小大于 0 的副本
+     *                       false: 统计所有正常状态的副本，包括数据大小为 0 的副本
+     * @return Tablet 的数据大小（字节）
+     */
     public long getDataSize(boolean singleReplica, boolean filterSizeZero) {
+        // 过滤出状态为 NORMAL 的副本，并根据 filterSizeZero 参数决定是否过滤数据大小为 0 的副本
         LongStream s = replicas.stream().filter(r -> r.getState() == ReplicaState.NORMAL)
                 .filter(r -> !filterSizeZero || r.getDataSize() > 0)
                 .mapToLong(Replica::getDataSize);
+        // 根据 singleReplica 参数决定返回平均值还是总和
+        // 如果 singleReplica 为 true，返回平均值（用于计算单副本大小，避免重复计算）
+        // 如果 singleReplica 为 false，返回总和（用于计算总副本大小）
         return singleReplica ? Double.valueOf(s.average().orElse(0)).longValue() : s.sum();
     }
 

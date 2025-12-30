@@ -17,6 +17,8 @@
 
 package org.apache.doris.nereids.util;
 
+import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.FunctionSignature;
 import org.apache.doris.common.Pair;
 import org.apache.doris.nereids.annotation.Developing;
 import org.apache.doris.nereids.exceptions.AnalysisException;
@@ -41,7 +43,9 @@ import org.apache.doris.nereids.trees.expressions.Mod;
 import org.apache.doris.nereids.trees.expressions.Multiply;
 import org.apache.doris.nereids.trees.expressions.SubqueryExpr;
 import org.apache.doris.nereids.trees.expressions.Subtract;
+import org.apache.doris.nereids.trees.expressions.TimestampArithmetic;
 import org.apache.doris.nereids.trees.expressions.functions.BoundFunction;
+import org.apache.doris.nereids.trees.expressions.functions.FunctionBuilder;
 import org.apache.doris.nereids.trees.expressions.functions.executable.DateTimeExtractAndTransform;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Array;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.CreateMap;
@@ -696,17 +700,28 @@ public class TypeCoercionUtils {
     }
 
     /**
-     * process BoundFunction type coercion
+     * 处理已绑定函数的类型自动转换
+     * 
+     * 该函数是 Nereids 类型系统的核心组件，负责对已经绑定的函数表达式进行类型自动转换，
+     * 确保函数参数类型与期望的输入类型匹配，实现从"语法正确"到"类型正确"的转换。
+     * 
+     * @param boundFunction 已绑定的函数表达式（如 Sum、Count 等）
+     * @return 经过类型转换后的表达式，参数类型已与函数期望类型匹配
      */
     public static Expression processBoundFunction(BoundFunction boundFunction) {
-        // check
+        // 第一步：在类型转换前进行合法性检查
+        // 包括参数数量、类型兼容性、函数特定约束等检查
         boundFunction.checkLegalityBeforeTypeCoercion();
 
+        // 第二步：特殊函数处理
+        // CreateMap 函数需要特殊的类型转换逻辑，走专用处理路径
         if (boundFunction instanceof CreateMap) {
             return processCreateMap((CreateMap) boundFunction);
         }
 
-        // type coercion
+        // 第三步：通用类型自动转换
+        // 根据函数期望的输入类型，对实际参数进行隐式类型转换
+        // 例如：sum(TINYINT) -> sum(DOUBLE)，因为 Sum 期望 DOUBLE 类型
         return implicitCastInputTypes(boundFunction, boundFunction.expectedInputTypes());
     }
 
@@ -935,6 +950,32 @@ public class TypeCoercionUtils {
 
         // add, subtract and multiply do not need to cast children for fixed point type
         return castChildren(binaryArithmetic, left, right, commonType.promotion());
+    }
+
+    /**
+     * process timestamp arithmetic type coercion.
+     */
+    public static Expression processTimestampArithmetic(TimestampArithmetic timestampArithmetic) {
+        timestampArithmetic.checkLegalityBeforeTypeCoercion();
+
+        String name = timestampArithmetic.getFuncName().toLowerCase();
+        List<Expression> children = timestampArithmetic.children();
+        Expression left = timestampArithmetic.left();
+        Expression right = timestampArithmetic.right();
+
+        // get right signature by normal function resolution
+        FunctionBuilder functionBuilder = Env.getCurrentEnv().getFunctionRegistry().findFunctionBuilder(name,
+                children);
+        Pair<? extends Expression, ? extends BoundFunction> targetExpressionPair = functionBuilder.build(name,
+                children);
+        FunctionSignature signature = targetExpressionPair.second.getSignature();
+        DataType leftType = signature.getArgType(0);
+        DataType rightType = signature.getArgType(1);
+
+        left = castIfNotSameType(left, leftType);
+        right = castIfNotSameType(right, rightType);
+
+        return timestampArithmetic.withChildren(left, right);
     }
 
     /**
@@ -1283,64 +1324,112 @@ public class TypeCoercionUtils {
     }
 
     /**
-     * process comparison predicate type coercion.
+     * 处理比较谓词的类型强制转换
+     * 
+     * 该方法负责处理比较操作符（如 =, >, <, >=, <=, !=）两边表达式的类型兼容性问题。
+     * 核心逻辑：找到两个表达式的公共类型（common type），然后进行类型转换。
+     * 
+     * 处理流程：
+     * 1. 合法性检查：检查比较操作是否符合基本规则
+     * 2. 类型判断：如果左右类型相同，检查是否支持比较操作
+     * 3. 字符字面量处理：处理字符串字面量的特殊情况
+     * 4. 查找公共类型：根据新旧类型转换行为选择不同的查找策略
+     * 5. 精度降级：对Decimal和日期类型进行精度调整
+     * 6. 类型转换：将左右表达式转换为公共类型
+     * 7. 重建谓词：如果有转换，创建新的谓词对象
+     * 
+     * 示例：
+     * - INT = BIGINT -> INT转换为BIGINT，最终为 BIGINT = BIGINT
+     * - VARCHAR = INT -> 根据配置可能转换为 VARCHAR = VARCHAR 或 INT = INT
+     * - DATE = DATETIME -> DATETIME = DATETIME
+     * 
+     * @param comparisonPredicate 需要处理的比较谓词
+     * @return 类型转换后的比较谓词（如果不需要转换则返回原谓词）
+     * @throws AnalysisException 如果类型不支持比较或无法找到公共类型
      */
     public static Expression processComparisonPredicate(ComparisonPredicate comparisonPredicate) {
+        // 步骤1：合法性检查
+        // 检查比较操作是否符合基本规则（例如：不能比较两个不同类型的数组）
         comparisonPredicate.checkLegalityBeforeTypeCoercion();
 
         Expression left = comparisonPredicate.left();
         Expression right = comparisonPredicate.right();
 
-        // TODO: remove this restriction after supporting varbinary comparison in BE
-        if (left.getDataType().isVarBinaryType() || right.getDataType().isVarBinaryType()) {
-            throw new AnalysisException("data type varbinary "
-                    + " could not used in ComparisonPredicate now " + comparisonPredicate.toSql());
-        }
-
-        // same type
+        // 步骤2：类型相同的情况处理
+        // 如果左右表达式类型完全相同，只需要检查是否支持比较操作
         if (left.getDataType().equals(right.getDataType())) {
+            // 检查该类型是否支持比较操作
+            // 例如：某些复杂类型（如MAP、STRUCT）可能不支持直接比较
             if (!supportCompare(left.getDataType(), false)) {
                 throw new AnalysisException("data type " + left.getDataType()
                         + " could not used in ComparisonPredicate " + comparisonPredicate.toSql());
             }
+            // 类型相同且支持比较，无需转换，直接返回
             return comparisonPredicate;
         }
 
+        // 步骤3：处理字符字面量的特殊情况
+        // 例如："123" 可能应该转换为 INT 进行比较，而不是转换 INT 为 VARCHAR
+        // 这个方法会尝试将字符串字面量转换为合适的数值类型
         comparisonPredicate = TypeCoercionUtils.processCharacterLiteralInBinaryOperator(comparisonPredicate);
         left = comparisonPredicate.left();
         right = comparisonPredicate.right();
 
+        // 步骤4：查找公共类型
+        // 公共类型：能够安全地表示两个表达式的值，且可以进行比较的类型
         Optional<DataType> commonType;
         if (GlobalVariable.enableNewTypeCoercionBehavior) {
+            // 新类型转换行为：使用更灵活的类型转换策略
+            // 参数说明：overflowToDouble=false（溢出不转换为double），stringIsHighPriority=false（字符串不优先）
             commonType = findWiderTypeForTwo(left.getDataType(), right.getDataType(), false, false);
         } else {
+            // 旧类型转换行为：使用传统的比较专用类型查找策略
+            // 旧策略在某些边界情况下可能有不同的转换结果
             commonType = findWiderTypeForTwoForComparison(left.getDataType(), right.getDataType(), false);
         }
 
+        // 步骤5：对公共类型进行精度降级调整
+        // 为什么需要降级？
+        // - Decimal类型可能有不同的精度和标度，需要选择最合适的精度
+        // - 日期类型（DATE、DATETIME）需要选择更精确的类型
+        // 示例：DECIMAL(10,2) 和 DECIMAL(15,3) -> 可能降级为 DECIMAL(15,3)
         if (commonType.isPresent()) {
+            // 以左边为基准进行降级调整
             commonType = Optional.of(downgradeDecimalAndDateLikeType(
                     commonType.get(),
                     left,
                     right));
+            // 以右边为基准进行降级调整（双向检查，确保最优）
             commonType = Optional.of(downgradeDecimalAndDateLikeType(
                     commonType.get(),
                     right,
                     left));
         }
 
+        // 步骤6：执行类型转换
         if (commonType.isPresent()) {
+            // 检查公共类型是否支持比较操作
             if (!supportCompare(commonType.get(), false)) {
                 throw new AnalysisException("data type " + commonType.get()
                         + " could not used in ComparisonPredicate " + comparisonPredicate.toSql());
             }
+            // 将左右表达式转换为公共类型
+            // castIfNotSameType：如果类型已经是公共类型，则不进行转换（避免不必要的CAST）
             left = castIfNotSameType(left, commonType.get());
             right = castIfNotSameType(right, commonType.get());
         } else {
+            // 无法找到公共类型，说明这两个类型不支持比较
+            // 例如：尝试比较 ARRAY 和 INT
             throw new AnalysisException("unsupported comparison predicate " + comparisonPredicate.toSql());
         }
+        
+        // 步骤7：重建谓词
+        // 如果有任何转换发生，创建新的谓词对象（因为Plan节点是不可变的）
         if (left != comparisonPredicate.left() || right != comparisonPredicate.right()) {
+            // 至少有一个表达式被转换，创建新的比较谓词
             return comparisonPredicate.withChildren(left, right);
         } else {
+            // 没有转换发生，返回原谓词（性能优化：避免不必要的对象创建）
             return comparisonPredicate;
         }
     }

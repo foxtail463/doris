@@ -92,32 +92,180 @@ protected:
 public:
     virtual ~SpillRunnable() = default;
 
+    /**
+     * 执行 Spill 操作
+     * 
+     * 【功能说明】
+     * 这是 SpillRunnable 的核心方法，负责执行 Spill 操作的完整生命周期。
+     * 该方法会被提交到后台线程池执行，不阻塞主流程。
+     * 
+     * 【执行流程】
+     * 
+     * 1. **计时统计**：
+     *    - 开始 SpillTotalTime 计时（总时间）
+     *    - 开始 SpillWriteTime/SpillReadTime 计时（具体操作时间）
+     * 
+     * 2. **任务开始**：
+     *    - 调用 `_on_task_started()` 通知任务开始
+     *    - 更新统计计数器（等待队列计数、执行中计数等）
+     * 
+     * 3. **资源清理准备**：
+     *    - 使用 Defer 确保函数返回时清理 `_spill_exec_func` 和 `_spill_fin_cb`
+     *    - 通过 swap 将函数对象置空，释放捕获的资源（避免循环引用）
+     * 
+     * 4. **取消检查**：
+     *    - 如果查询已取消，直接返回取消原因
+     * 
+     * 5. **执行 Spill**：
+     *    - 调用 `_spill_exec_func()` 执行实际的 Spill 操作
+     *    - 如果执行失败，立即返回错误
+     * 
+     * 6. **任务完成**：
+     *    - 调用 `_on_task_finished()` 通知任务完成
+     *    - 如果提供了 `_spill_fin_cb`，执行完成回调
+     * 
+     * 【关键设计】
+     * 
+     * 1. **资源管理**：
+     *    - 使用 Defer 确保资源清理（无论正常返回还是异常返回）
+     *    - 通过 swap 将函数对象置空，避免循环引用导致的内存泄漏
+     * 
+     * 2. **统计跟踪**：
+     *    - SpillTotalTime：Spill 操作的总时间（包括等待和执行）
+     *    - SpillWriteTime/SpillReadTime：实际 Spill 操作的时间
+     *    - SpillWriteTaskWaitInQueueCount：等待队列中的任务数
+     *    - SpillWriteTaskCount：正在执行的任务数
+     * 
+     * 3. **取消支持**：
+     *    - 在执行前检查查询是否已取消
+     *    - 如果已取消，立即返回，不执行 Spill 操作
+     * 
+     * 4. **回调机制**：
+     *    - `_spill_exec_func`：执行实际的 Spill 操作（必须）
+     *    - `_spill_fin_cb`：Spill 完成后的回调（可选）
+     *    - 完成回调可以用于：
+     *      * 标记 SpillStream 为 EOF
+     *      * 通知依赖的算子可以开始读取
+     *      * 更新共享状态
+     * 
+     * 【使用示例】
+     * 
+     * 示例 1：基本使用
+     * ```cpp
+     * SpillSinkRunnable runnable(
+     *     state, spill_context, operator_profile(),
+     *     [this, state]() {
+     *         // Spill 执行函数：将数据写入磁盘
+     *         for (auto& block : blocks_to_spill) {
+     *             RETURN_IF_ERROR(spill_stream->spill_block(state, block, false));
+     *         }
+     *         return Status::OK();
+     *     },
+     *     [this, state]() {
+     *         // 完成回调：标记 EOF，通知 Probe 算子
+     *         RETURN_IF_ERROR(spill_stream->spill_eof());
+     *         _dependency->set_ready_to_read();
+     *         return Status::OK();
+     *     }
+     * );
+     * 
+     * // 提交到后台线程池执行
+     * RETURN_IF_ERROR(runnable.run());
+     * ```
+     * 
+     * 示例 2：执行流程
+     * ```
+     * run() 开始
+     *   ├─→ 开始计时（SpillTotalTime、SpillWriteTime）
+     *   ├─→ _on_task_started()
+     *   │     ├─→ 记录日志
+     *   │     └─→ 更新计数器（等待队列 -1，执行中 +1）
+     *   ├─→ 设置 Defer（资源清理）
+     *   ├─→ 检查取消状态
+     *   ├─→ 执行 _spill_exec_func()
+     *   │     └─→ 实际的 Spill 操作（写入/读取磁盘）
+     *   ├─→ _on_task_finished()
+     *   │     └─→ 通知 SpillContext 任务完成
+     *   ├─→ 执行 _spill_fin_cb()（如果提供）
+     *   │     └─→ 完成回调（标记 EOF、通知依赖等）
+     *   └─→ Defer 执行（清理资源）
+     * ```
+     * 
+     * 【注意事项】
+     * 1. 该方法通常在后台线程中执行，不阻塞主流程
+     * 2. 使用 Defer 确保资源清理，避免内存泄漏
+     * 3. 如果查询已取消，会立即返回，不执行 Spill 操作
+     * 4. `_spill_exec_func` 和 `_spill_fin_cb` 会在执行后被置空（通过 swap）
+     * 5. 如果 `_spill_exec_func` 执行失败，不会执行 `_spill_fin_cb`
+     * 
+     * @return Status 执行结果
+     */
     [[nodiscard]] Status run() {
+        // ===== 阶段 1：开始计时统计 =====
+        // SpillTotalTime：Spill 操作的总时间（包括等待和执行）
         SCOPED_TIMER(_spill_total_timer);
 
+        // ===== 阶段 2：获取并开始具体操作的计时器 =====
+        // 对于写操作：SpillWriteTime
+        // 对于读操作：SpillReadTime
         auto* spill_timer = _get_spill_timer();
         DCHECK(spill_timer != nullptr);
         SCOPED_TIMER(spill_timer);
 
+        // ===== 阶段 3：通知任务开始 =====
+        // _on_task_started() 会：
+        // - 记录调试日志
+        // - 更新统计计数器（等待队列计数 -1，执行中计数 +1）
         _on_task_started();
 
+        // ===== 阶段 4：设置资源清理（Defer） =====
+        // 使用 Defer 确保在函数返回时（无论正常返回还是异常返回）清理资源
+        // 通过 swap 将函数对象置空，释放捕获的资源（避免循环引用导致的内存泄漏）
         Defer defer([&] {
             {
+                // 清理 _spill_exec_func
+                // swap 会将函数对象的内容交换到临时变量 tmp 中
+                // tmp 在作用域结束时自动析构，释放捕获的资源
                 std::function<Status()> tmp;
                 std::swap(tmp, _spill_exec_func);
             }
             {
+                // 清理 _spill_fin_cb
                 std::function<Status()> tmp;
                 std::swap(tmp, _spill_fin_cb);
             }
         });
 
+        // ===== 阶段 5：检查查询是否已取消 =====
+        // 如果查询已取消，立即返回取消原因，不执行 Spill 操作
+        // 这样可以避免在查询已取消时继续执行无意义的 Spill 操作
         if (_state->is_cancelled()) {
             return _state->cancel_reason();
         }
 
+        // ===== 阶段 6：执行 Spill 操作 =====
+        // 调用 _spill_exec_func() 执行实际的 Spill 操作
+        // 这个函数通常包含：
+        // - 遍历数据块
+        // - 将数据写入磁盘（SpillSinkRunnable）
+        // - 从磁盘读取数据（SpillRecoverRunnable）
+        // 如果执行失败，立即返回错误
         RETURN_IF_ERROR(_spill_exec_func());
+        
+        // ===== 阶段 7：通知任务完成 =====
+        // _on_task_finished() 会：
+        // - 通知 SpillContext 任务完成（如果提供了 spill_context）
+        // - SpillContext 会减少 running_tasks_count
+        // - 如果所有任务都完成，会调用 all_tasks_finished_callback
         _on_task_finished();
+        
+        // ===== 阶段 8：执行完成回调（如果提供） =====
+        // 如果提供了 _spill_fin_cb，执行完成回调
+        // 完成回调通常用于：
+        // - 标记 SpillStream 为 EOF
+        // - 通知依赖的算子可以开始读取
+        // - 更新共享状态
+        // 注意：只有在 _spill_exec_func 成功执行后才会执行完成回调
         if (_spill_fin_cb) {
             return _spill_fin_cb();
         }

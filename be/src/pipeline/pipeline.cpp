@@ -74,11 +74,18 @@ bool Pipeline::need_to_local_exchange(const DataDistribution target_data_distrib
 }
 
 Status Pipeline::add_operator(OperatorPtr& op, const int parallelism) {
+    // 如果该算子是串行算子（不能多并发执行），且当前传入了并发度，
+    // 则用这个并发度来更新 pipeline 的 task 数量（num_tasks）
     if (parallelism > 0 && op->is_serial_operator()) {
         set_num_tasks(parallelism);
     }
+    // 将 pipeline 的并发度写回给算子本身，让算子知道自己会被多少个 task 实例化
     op->set_parallel_tasks(num_tasks());
+    // 先按顺序把算子追加到 operator 列表尾部
     _operators.emplace_back(op);
+    // 如果这个算子是一个 Source 类型（is_source == true），
+    // 说明本条 pipeline 的“起点”应该是它：此时将整个 operator 列表反转，
+    // 让这个 Source 出现在 _operators.front() 位置，方便后续统一从 front 开始作为 pipeline `_source`。
     if (op->is_source()) {
         std::reverse(_operators.begin(), _operators.end());
     }

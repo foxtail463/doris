@@ -425,46 +425,79 @@ public class PartitionRange {
         return updateList;
     }
 
+    /**
+     * 重写谓词以利用分区缓存
+     * 
+     * 该函数根据分区范围信息重写查询谓词，将原始谓词转换为可以利用分区缓存的形式。
+     * 通过将谓词中的字面量值调整为分区边界值，可以最大化缓存命中率。
+     * 
+     * 重写策略：
+     * 1. 只处理 AND 连接的复合谓词
+     * 2. 将范围谓词调整为分区边界值
+     * 3. 保持 IN 谓词不变（直接利用缓存）
+     * 
+     * 示例转换：
+     * 原始谓词：date_col >= '2023-01-15' AND date_col < '2023-01-20'
+     * 分区范围：['2023-01-01', '2023-01-31'] (对应分区 p1)
+     * 重写后：date_col >= '2023-01-01' AND date_col < '2023-02-01'
+     * 
+     * @param predicate 要重写的复合谓词
+     * @param rangeList 分区范围列表，包含分区的边界信息
+     * @return 是否成功重写谓词
+     */
     public boolean rewritePredicate(CompoundPredicate predicate, List<PartitionSingle> rangeList) {
+        // 1. 检查谓词操作符：只处理 AND 连接的谓词
         if (predicate.getOp() != CompoundPredicate.Operator.AND) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("predicate op {}", predicate.getOp().toString());
             }
             return false;
         }
+        
+        // 2. 遍历谓词中的每个子表达式
         for (Expr expr : predicate.getChildren()) {
             if (expr instanceof BinaryPredicate) {
+                // 处理二元谓词（>, <, >=, <=, =, !=）
                 BinaryPredicate binPredicate = (BinaryPredicate) expr;
                 BinaryPredicate.Operator op = binPredicate.getOp();
+                
+                // 2.1 检查谓词格式：必须是二元谓词
                 if (binPredicate.getChildren().size() != 2) {
                     LOG.info("binary predicate children size {}", binPredicate.getChildren().size());
                     continue;
                 }
+                
+                // 2.2 跳过不等谓词：!= 操作符不支持缓存优化
                 if (op == BinaryPredicate.Operator.NE) {
                     LOG.info("binary predicate op {}", op.toString());
                     continue;
                 }
+                
+                // 2.3 根据操作符类型调整分区边界值
                 PartitionKeyType key = new PartitionKeyType();
                 switch (op) {
-                    case LE: //<=
+                    case LE: // <= 操作符：使用分区上边界
                         key.clone(rangeList.get(1).getCacheKey());
                         break;
-                    case LT: //<
+                    case LT: // < 操作符：使用分区上边界减1
                         key.clone(rangeList.get(1).getCacheKey());
                         key.add(1);
                         break;
-                    case GE: //>=
+                    case GE: // >= 操作符：使用分区下边界
                         key.clone(rangeList.get(0).getCacheKey());
                         break;
-                    case GT: //>
+                    case GT: // > 操作符：使用分区下边界加1
                         key.clone(rangeList.get(0).getCacheKey());
                         key.add(-1);
                         break;
                     default:
                         break;
                 }
+                
+                // 2.4 创建新的字面量表达式
                 LiteralExpr newLiteral;
                 if (key.keyType == KeyType.DATE) {
+                    // 日期类型：创建日期字面量
                     try {
                         newLiteral = new DateLiteral(key.toString(), Type.DATE);
                     } catch (Exception e) {
@@ -472,24 +505,32 @@ public class PartitionRange {
                         continue;
                     }
                 } else if (key.keyType == KeyType.LONG) {
+                    // 长整型：创建整数字面量
                     newLiteral = new IntLiteral(key.realValue());
                 } else {
+                    // 不支持的类型：跳过
                     LOG.warn("Partition cache not support type {}", key.keyType);
                     continue;
                 }
 
+                // 2.5 替换谓词中的字面量值
                 if (binPredicate.getChild(1) instanceof LiteralExpr) {
+                    // 右操作数是字面量：替换右操作数
                     binPredicate.removeNode(1);
                     binPredicate.addChild(newLiteral);
                 } else if (binPredicate.getChild(0) instanceof LiteralExpr) {
+                    // 左操作数是字面量：替换左操作数
                     binPredicate.removeNode(0);
                     binPredicate.setChild(0, newLiteral);
                 } else {
+                    // 没有字面量操作数：跳过
                     continue;
                 }
             } else if (expr instanceof InPredicate) {
+                // 处理 IN 谓词：检查是否可以直接利用缓存
                 InPredicate inPredicate = (InPredicate) expr;
                 if (!inPredicate.isLiteralChildren() || inPredicate.isNotIn()) {
+                    // 不是字面量 IN 谓词或是否定 IN 谓词：跳过
                     continue;
                 }
             }

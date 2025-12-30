@@ -48,23 +48,44 @@ Status RowsetFactory::create_rowset(const TabletSchemaSPtr& schema, const std::s
     return Status::Error<ROWSET_TYPE_NOT_FOUND>("invalid rowset_type"); // should never happen
 }
 
+/**
+ * 创建行集写入器的工厂方法
+ * 根据行集类型和写入模式创建相应的行集写入器
+ * @param engine 存储引擎引用，用于行集写入器的初始化
+ * @param context 行集写入上下文，包含行集类型、schema等信息
+ * @param is_vertical 是否为垂直写入模式（列式写入）
+ * @return 成功返回行集写入器指针，失败返回错误状态
+ */
 Result<std::unique_ptr<RowsetWriter>> RowsetFactory::create_rowset_writer(
         StorageEngine& engine, const RowsetWriterContext& context, bool is_vertical) {
+    
+    // 检查行集类型：ALPHA_ROWSET已被废弃，不再支持
     if (context.rowset_type == ALPHA_ROWSET) {
         return ResultError(Status::Error<ROWSET_INVALID>("invalid rowset_type"));
     }
 
+    // 处理BETA_ROWSET类型：这是当前支持的主要行集类型
     if (context.rowset_type == BETA_ROWSET) {
         std::unique_ptr<RowsetWriter> writer;
+        
         if (is_vertical) {
+            // 垂直写入模式：创建垂直Beta行集写入器
+            // 垂直写入器按列组织数据，适合列式存储和查询优化
             writer = std::make_unique<VerticalBetaRowsetWriter<BetaRowsetWriter>>(engine);
         } else {
+            // 水平写入模式：创建标准Beta行集写入器
+            // 水平写入器按行组织数据，适合传统的行式存储
             writer = std::make_unique<BetaRowsetWriter>(engine);
         }
+        
+        // 初始化行集写入器，传入上下文信息
         RETURN_IF_ERROR_RESULT(writer->init(context));
+        
+        // 返回初始化成功的写入器
         return writer;
     }
 
+    // 不支持的行集类型，返回错误
     return ResultError(Status::Error<ROWSET_TYPE_NOT_FOUND>("invalid rowset_type"));
 }
 

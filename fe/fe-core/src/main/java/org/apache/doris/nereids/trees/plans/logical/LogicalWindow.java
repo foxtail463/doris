@@ -192,6 +192,20 @@ public class LogicalWindow<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
     }
 
     /**
+     * 获取可以下推到 PartitionTopN 的窗口函数候选和对应的分区限制值。
+     * 该方法用于判断窗口函数是否可以转换为 PartitionTopN 优化，并返回选定的窗口函数和分区限制。
+     *
+     * @param filter
+     *              对于分区 TopN 过滤场景（如 WHERE row_number <= 100），表示过滤条件；
+     *              对于分区限制场景（如通过 TopN 算子下推），该参数为 null。
+     * @param partitionLimit
+     *              对于分区 TopN 过滤场景，表示过滤边界值，例如 row_number <= 100 中的 100；
+     *              对于分区限制场景，表示限制值。
+     * @return
+     *              如果返回 null，表示无效的情况或优化选项被禁用；
+     *              否则返回选定的窗口函数和对应的分区限制值。
+     *              特殊返回值：limit 值为 -1 表示该情况可以优化为空关系（空结果集）。
+     * 
      * Get push down window function candidate and corresponding partition limit.
      *
      * @param filter
@@ -207,10 +221,14 @@ public class LogicalWindow<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
      *              A special limit -1 means the case can be optimized as empty relation.
      */
     public Pair<WindowExpression, Long> getPushDownWindowFuncAndLimit(LogicalFilter<?> filter, long partitionLimit) {
+        // 检查会话变量是否启用了 PartitionTopN 优化，如果未启用则直接返回 null
         if (!ConnectContext.get().getSessionVariable().isEnablePartitionTopN()) {
             return null;
         }
-        // We have already done such optimization rule, so just ignore it.
+        
+        // 检查是否已经进行过此优化：如果窗口算子的子节点已经是 LogicalPartitionTopN，
+        // 或者在子节点和 LogicalPartitionTopN 之间存在 LogicalFilter，
+        // 则说明已经优化过了，避免重复优化
         if (child(0) instanceof LogicalPartitionTopN
                 || (child(0) instanceof LogicalFilter
                 && child(0).child(0) != null
@@ -218,35 +236,40 @@ public class LogicalWindow<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
             return null;
         }
 
-        // Check the window function. There are some restrictions for window function:
-        // 1. The window function should be one of the 'row_number()', 'rank()', 'dense_rank()'.
-        // 2. The window frame should be 'UNBOUNDED' to 'CURRENT'.
-        // 3. The 'PARTITION' key and 'ORDER' key can not be empty at the same time.
-        // 4. order of window expressions should be compatible.
+        // 检查窗口函数的限制条件。窗口函数必须满足以下条件才能进行 PartitionTopN 优化：
+        // 1. 窗口函数必须是 'row_number()'、'rank()' 或 'dense_rank()' 之一
+        // 2. 窗口帧必须是 'UNBOUNDED PRECEDING' 到 'CURRENT ROW'
+        // 3. 'PARTITION' 键和 'ORDER' 键不能同时为空
+        // 4. 所有窗口表达式的排序键必须兼容（相同或为空）
         WindowExpression chosenWindowFunc = null;
         long chosenPartitionLimit = Long.MAX_VALUE;
         long chosenRowNumberPartitionLimit = Long.MAX_VALUE;
         boolean hasRowNumber = false;
+        
+        // 遍历所有窗口表达式，找到满足条件的窗口函数
         for (NamedExpression windowExpr : windowExpressions) {
+            // 验证窗口表达式的结构：必须存在且只有一个子节点，且该子节点是 WindowExpression
             if (windowExpr == null || windowExpr.children().size() != 1
                     || !(windowExpr.child(0) instanceof WindowExpression)) {
                 return null;
             }
             WindowExpression windowFunc = (WindowExpression) windowExpr.child(0);
 
-            // Check the window function name.
+            // 检查窗口函数名称：只支持 ROW_NUMBER、RANK 和 DENSE_RANK 三种函数
             if (!(windowFunc.getFunction() instanceof RowNumber
                     || windowFunc.getFunction() instanceof Rank
                     || windowFunc.getFunction() instanceof DenseRank)) {
                 return null;
             }
 
-            // Check the partition key and order key.
+            // 检查分区键和排序键：两者不能同时为空
+            // 如果都为空，无法进行分区级别的 TopN 优化
             if (windowFunc.getPartitionKeys().isEmpty() && windowFunc.getOrderKeys().isEmpty()) {
                 return null;
             }
 
-            // Check the window type and window frame.
+            // 检查窗口类型和窗口帧：窗口帧必须是 'UNBOUNDED PRECEDING' 到 'CURRENT ROW'
+            // 这是 PartitionTopN 优化的前提条件，其他窗口帧类型不支持此优化
             Optional<WindowFrame> windowFrame = windowFunc.getWindowFrame();
             if (windowFrame.isPresent()) {
                 WindowFrame frame = windowFrame.get();
@@ -255,32 +278,42 @@ public class LogicalWindow<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
                     return null;
                 }
             } else {
+                // 如果没有窗口帧定义，也不支持此优化
                 return null;
             }
 
-            // Check filter conditions.
+            // 处理过滤条件（filter 不为 null 的情况）
             if (filter != null) {
-                // We currently only support simple conditions of the form 'column </ <=/ = constant'.
-                // We will extract some related conjuncts and do some check.
+                // 目前只支持简单条件：'窗口函数列 </ <=/ = 常量'
+                // 例如：row_number <= 100, rank < 50 等
                 boolean hasPartitionLimit = false;
                 long curPartitionLimit = Long.MAX_VALUE;
                 Set<Expression> conjuncts = filter.getConjuncts();
+                // 提取与当前窗口表达式相关的过滤条件（通过 ExprId 关联）
                 Set<Expression> relatedConjuncts = extractRelatedConjuncts(conjuncts, windowExpr.getExprId());
+                
+                // 遍历所有相关的过滤条件，提取 limit 值
                 for (Expression conjunct : relatedConjuncts) {
-                    // Pre-checking has been done in former extraction
+                    // 前置检查已在提取阶段完成
                     BinaryOperator op = (BinaryOperator) conjunct;
                     Expression rightChild = op.children().get(1);
                     long limitVal = ((IntegerLikeLiteral) rightChild).getLongValue();
-                    // Adjust the value for 'limitVal' based on the comparison operators.
+                    
+                    // 根据比较操作符调整 limit 值
+                    // 例如：row_number < 100 应该转换为 limit 99（因为 < 不包含边界值）
                     if (conjunct instanceof LessThan) {
                         limitVal--;
                     }
+                    
+                    // 如果调整后的 limit 值小于 0，表示结果为空关系，可以直接优化
                     if (limitVal < 0) {
-                        // Set return limit value as -1 for indicating a empty relation opt case
+                        // 设置返回 limit 值为 -1，表示可以优化为空关系
                         chosenPartitionLimit = -1;
                         chosenRowNumberPartitionLimit = -1;
                         break;
                     }
+                    
+                    // 如果有多个过滤条件，取最小的 limit 值（最严格的限制）
                     if (hasPartitionLimit) {
                         curPartitionLimit = Math.min(curPartitionLimit, limitVal);
                     } else {
@@ -288,51 +321,62 @@ public class LogicalWindow<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
                         hasPartitionLimit = true;
                     }
                 }
+                
+                // 如果检测到空关系情况，直接选择当前窗口函数并退出循环
                 if (chosenPartitionLimit == -1) {
                     chosenWindowFunc = windowFunc;
                     break;
                 } else if (windowFunc.getFunction() instanceof RowNumber) {
-                    // choose row_number first any way
-                    // if multiple exists, choose the one with minimal limit value
+                    // 优先选择 row_number 函数（性能最好）
+                    // 如果存在多个 row_number，选择 limit 值最小的那个
                     if (curPartitionLimit < chosenRowNumberPartitionLimit) {
                         chosenRowNumberPartitionLimit = curPartitionLimit;
                         chosenWindowFunc = windowFunc;
                         hasRowNumber = true;
                     }
                 } else if (!hasRowNumber) {
-                    // if no row_number, choose the one with minimal limit value
+                    // 如果没有 row_number 函数，选择 limit 值最小的窗口函数
                     if (curPartitionLimit < chosenPartitionLimit) {
                         chosenPartitionLimit = curPartitionLimit;
                         chosenWindowFunc = windowFunc;
                     }
                 }
             } else {
-                // limit
+                // filter 为 null 的情况：直接使用传入的 partitionLimit
+                // 这种情况通常是从 TopN 算子下推 limit 值
                 chosenWindowFunc = windowFunc;
                 chosenPartitionLimit = partitionLimit;
+                // 如果当前是 row_number 函数，优先选择它并退出循环
                 if (windowFunc.getFunction() instanceof RowNumber) {
                     break;
                 }
             }
         }
 
+        // 如果未找到合适的窗口函数，或 limit 值无效（仍为初始值 Long.MAX_VALUE），返回 null
         if (chosenWindowFunc == null || (chosenPartitionLimit == Long.MAX_VALUE
                 && chosenRowNumberPartitionLimit == Long.MAX_VALUE)) {
             return null;
         } else {
-            // 4. check all windowExpression's order key is empty or is the same as chosenWindowFunc's order key
+            // 最后一步：验证所有窗口表达式的排序键是否兼容
+            // 要求：所有窗口表达式的 ORDER BY 键要么为空，要么与选定的窗口函数的 ORDER BY 键相同
+            // 这是为了确保可以安全地应用 PartitionTopN 优化
             for (NamedExpression windowExpr : windowExpressions) {
                 if (windowExpr != null && windowExpr instanceof Alias
                         && windowExpr.child(0) instanceof WindowExpression) {
                     WindowExpression windowFunc = (WindowExpression) windowExpr.child(0);
+                    // 如果当前窗口函数的排序键为空，或与选定窗口函数的排序键相同，则兼容
                     if (windowFunc.getOrderKeys().isEmpty()
                             || windowFunc.getOrderKeys().equals(chosenWindowFunc.getOrderKeys())) {
                         continue;
                     } else {
+                        // 如果存在不兼容的排序键，无法进行优化
                         return null;
                     }
                 }
             }
+            // 返回选定的窗口函数和对应的分区限制值
+            // 优先返回 row_number 的限制值（如果存在），否则返回其他窗口函数的限制值
             return Pair.of(chosenWindowFunc, hasRowNumber ? chosenRowNumberPartitionLimit : chosenPartitionLimit);
         }
     }

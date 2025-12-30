@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+e#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,7 +16,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-export DORIS_TOOLCHAIN=gcc
-export BUILD_TYPE=release
+export BUILD_TYPE=debug
 export DISABLE_BUILD_UI=ON
 export DISABLE_BUILD_AZURE=ON

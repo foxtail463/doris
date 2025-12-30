@@ -122,6 +122,29 @@ public:
         return name_to_index_map;
     }
 
+    /**
+     * 根据位置索引获取 Block 中的列
+     * 
+     * 此函数通过列在 Block 中的位置索引（position）获取对应的列（ColumnWithTypeAndName），
+     * 并返回该列的可变引用。位置索引从 0 开始，表示列在 Block 中的顺序。
+     * 
+     * 使用场景：
+     * - 在向量化执行中，函数调用时需要根据参数列索引获取输入列
+     * - 表达式执行时需要获取结果列以便写入数据
+     * - 查询执行计划中通过列索引访问列数据
+     * 
+     * 注意事项：
+     * - 位置索引必须在有效范围内（0 <= position < data.size()），否则在 DEBUG 模式下会触发断言
+     * - 返回的是列的引用，可以直接修改列的内容
+     * - 如果在调用此函数后调用了 insert、erase 等修改 Block 结构的函数，返回的引用可能会失效
+     *   （因为这些函数可能改变列的存储位置或导致内存重新分配）
+     * 
+     * @param position 列的位置索引（从 0 开始）
+     * @return 对应位置列的引用（ColumnWithTypeAndName&），包含列数据、类型和名称信息
+     * 
+     * @see get_by_name() 通过名称获取列
+     * @see safe_get_by_position() 带边界检查的安全版本
+     */
     /// References are invalidated after calling functions above.
     ColumnWithTypeAndName& get_by_position(size_t position) {
         DCHECK(data.size() > position)
@@ -505,23 +528,58 @@ public:
         return Status::OK();
     }
 
+    /**
+     * 合并另一个 Block 的数据到当前 MutableBlock
+     * 
+     * 【功能说明】
+     * 将源 Block 的所有行数据追加到当前 MutableBlock 的末尾。
+     * 支持两种情况：
+     * 1. 当前 Block 为空：直接复制源 Block 的结构和数据
+     * 2. 当前 Block 不为空：检查列数和类型匹配，然后追加数据
+     * 
+     * 【类型处理】
+     * - 如果目标列是 Nullable 类型，源列是非 Nullable 类型，会自动转换为 Nullable
+     * - 如果类型完全匹配，直接追加
+     * - 不支持动态 Block（Dynamic Block）的合并
+     * 
+     * 【参数说明】
+     * @param block 源 Block（使用完美转发，支持左值和右值引用）
+     * @return Status::OK() 如果成功，否则返回错误状态
+     * 
+     * 【使用场景】
+     * - Hash Join：合并多个 Build 数据块
+     * - 数据恢复：将从磁盘恢复的数据块合并到内存中的 Block
+     * - 数据聚合：合并多个分区的数据
+     */
     template <typename T>
     [[nodiscard]] Status merge_impl(T&& block) {
-        // merge is not supported in dynamic block
+        // 情况 1：当前 Block 为空（动态 Block 不支持合并）
+        // 如果当前 Block 的列和数据类型都为空，说明是首次合并
+        // 此时直接复制源 Block 的结构和数据
         if (_columns.empty() && _data_types.empty()) {
+            // 复制数据类型和列名
             _data_types = block.get_data_types();
             _names = block.get_names();
+            // 调整列数
             _columns.resize(block.columns());
+            
+            // 遍历每一列，复制列数据
             for (size_t i = 0; i < block.columns(); ++i) {
                 if (block.get_by_position(i).column) {
+                    // 如果源列存在，转换为完整列（非常量列）并移动数据
+                    // convert_to_full_column_if_const：如果是常量列，转换为完整列
+                    // mutate()：获取可变的列引用
                     _columns[i] = (*std::move(block.get_by_position(i)
                                                       .column->convert_to_full_column_if_const()))
                                           .mutate();
                 } else {
+                    // 如果源列为空，创建空列
                     _columns[i] = _data_types[i]->create_column();
                 }
             }
         } else {
+            // 情况 2：当前 Block 不为空，需要追加数据
+            // 检查列数是否匹配
             if (_columns.size() != block.columns()) {
                 return Status::Error<ErrorCode::INTERNAL_ERROR>(
                         "Merge block not match, self column count: {}, [columns: {}, types: {}], "
@@ -530,19 +588,34 @@ public:
                         _columns.size(), dump_names(), dump_types(), block.columns(),
                         block.dump_names(), block.dump_types());
             }
+            
+            // 遍历每一列，追加数据
             for (int i = 0; i < _columns.size(); ++i) {
+                // 检查类型是否匹配
                 if (!_data_types[i]->equals(*block.get_by_position(i).type)) {
+                    // 类型不匹配，但可能是 Nullable 类型转换的情况
+                    // 目标列必须是 Nullable 类型
                     DCHECK(_data_types[i]->is_nullable())
                             << " target type: " << _data_types[i]->get_name()
                             << " src type: " << block.get_by_position(i).type->get_name();
+                    // 目标列的嵌套类型必须与源列类型匹配
                     DCHECK(((DataTypeNullable*)_data_types[i].get())
                                    ->get_nested_type()
                                    ->equals(*block.get_by_position(i).type));
+                    // 源列必须是非 Nullable 类型
                     DCHECK(!block.get_by_position(i).type->is_nullable());
+                    
+                    // 将源列转换为 Nullable 类型，然后追加数据
+                    // make_nullable：将非 Nullable 列包装为 Nullable 列
+                    // convert_to_full_column_if_const：转换为完整列
+                    // insert_range_from：从索引 0 开始，追加 block.rows() 行数据
                     _columns[i]->insert_range_from(*make_nullable(block.get_by_position(i).column)
                                                             ->convert_to_full_column_if_const(),
                                                    0, block.rows());
                 } else {
+                    // 类型完全匹配，直接追加数据
+                    // convert_to_full_column_if_const：转换为完整列（如果是常量列）
+                    // insert_range_from：从索引 0 开始，追加 block.rows() 行数据
                     _columns[i]->insert_range_from(
                             *block.get_by_position(i)
                                      .column->convert_to_full_column_if_const()

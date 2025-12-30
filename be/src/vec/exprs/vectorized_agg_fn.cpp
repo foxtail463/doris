@@ -141,6 +141,7 @@ Status AggFnEvaluator::prepare(RuntimeState* state, const RowDescriptor& desc,
         child_expr_name.emplace_back(_input_exprs_ctx->root()->expr_name());
     }
 
+    // 收集参与计算的列名（常量列跳过）
     std::vector<std::string> column_names;
     for (const auto& expr_ctx : _input_exprs_ctxs) {
         const auto& root = expr_ctx->root();
@@ -153,6 +154,7 @@ Status AggFnEvaluator::prepare(RuntimeState* state, const RowDescriptor& desc,
             _real_argument_types.empty() ? tmp_argument_types : _real_argument_types;
 
     if (_fn.binary_type == TFunctionBinaryType::JAVA_UDF) {
+        // 仅当开启 Java 支持时创建 Java UDAF，并执行 UDAF 合法性检查
         if (config::enable_java_support) {
             _function = AggregateJavaUdaf::create(_fn, argument_types, _data_type);
             RETURN_IF_ERROR(static_cast<AggregateJavaUdaf*>(_function.get())->check_udaf(_fn));
@@ -162,8 +164,10 @@ Status AggFnEvaluator::prepare(RuntimeState* state, const RowDescriptor& desc,
                     "true and restart be.");
         }
     } else if (_fn.binary_type == TFunctionBinaryType::RPC) {
+        // 创建 RPC UDAF
         _function = AggregateRpcUdaf::create(_fn, argument_types, _data_type);
     } else if (_fn.binary_type == TFunctionBinaryType::AGG_STATE) {
+        // AGG_STATE：仅接受一个非 Nullable 的 TYPE_AGG_STATE 参数
         if (argument_types.size() != 1) {
             return Status::InternalError("Agg state Function must input 1 argument but get {}",
                                          argument_types.size());
@@ -180,6 +184,7 @@ Status AggFnEvaluator::prepare(RuntimeState* state, const RowDescriptor& desc,
         std::string type_function_name =
                 assert_cast<const DataTypeAggState*>(argument_types[0].get())->get_function_name();
         if (type_function_name + AGG_UNION_SUFFIX == _fn.name.function_name) {
+            // union：返回类型必须为非 Nullable 的 AGG_STATE
             if (_data_type->is_nullable()) {
                 return Status::InternalError(
                         "Union function return type must be not nullable, real={}",
@@ -192,6 +197,7 @@ Status AggFnEvaluator::prepare(RuntimeState* state, const RowDescriptor& desc,
             }
             _function = get_agg_state_function<AggregateStateUnion>(argument_types, _data_type);
         } else if (type_function_name + AGG_MERGE_SUFFIX == _fn.name.function_name) {
+            // merge：期望返回类型需与内部聚合函数的返回类型一致
             auto type = assert_cast<const DataTypeAggState*>(argument_types[0].get())
                                 ->get_nested_function()
                                 ->get_return_type();
@@ -206,10 +212,11 @@ Status AggFnEvaluator::prepare(RuntimeState* state, const RowDescriptor& desc,
                                          _fn.name.function_name);
         }
     } else {
+        // 内置聚合函数（含 foreach 系列）
         const bool is_foreach =
                 AggregateFunctionSimpleFactory::is_foreach(_fn.name.function_name) ||
                 AggregateFunctionSimpleFactory::is_foreachv2(_fn.name.function_name);
-        // Here, only foreachv1 needs special treatment, and v2 can follow the normal code logic.
+        // 仅 foreach v1 需要特殊处理返回可空性；v2 走常规逻辑
         if (AggregateFunctionSimpleFactory::is_foreach(_fn.name.function_name)) {
             _function = AggregateFunctionSimpleFactory::instance().get(
                     _fn.name.function_name, argument_types, _data_type,
@@ -227,10 +234,12 @@ Status AggFnEvaluator::prepare(RuntimeState* state, const RowDescriptor& desc,
                      .column_names = std::move(column_names)});
         }
     }
+    // 若无法创建对应函数实现，返回未实现错误
     if (_function == nullptr) {
         return Status::InternalError("Agg Function {} is not implemented", _fn.signature);
     }
 
+    // 若存在 ORDER BY（_sort_description 非空），将基础聚合函数包装为带排序能力的版本
     if (!_sort_description.empty()) {
         _function = transform_to_sort_agg_function(_function, _argument_types_with_sort,
                                                    _sort_description, state);
@@ -249,6 +258,7 @@ Status AggFnEvaluator::prepare(RuntimeState* state, const RowDescriptor& desc,
                     _function->verify_result_type(_without_key, argument_types, _data_type));
         }
     }
+    // 记录表达式名，便于日志与调试
     _expr_name = fmt::format("{}({})", _fn.name.function_name, child_expr_name);
     return Status::OK();
 }

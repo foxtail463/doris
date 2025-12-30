@@ -930,16 +930,49 @@ Status BaseTablet::fetch_value_by_rowids(RowsetSharedPtr input_rowset, uint32_t 
     return Status::OK();
 }
 
+/**
+ * BaseTablet::get_delete_sign_column_data：从 Block 中获取删除标记列的数据指针
+ * 
+ * 功能说明：
+ * 删除标记列（DELETE_SIGN）是 Doris 中的隐藏列，用于标记行是否被删除。
+ * - 列名：__DORIS_DELETE_SIGN__
+ * - 类型：TinyInt（Int8，即 signed char）
+ * - 取值：0 表示未删除，非 0（通常是 1）表示已删除
+ * 
+ * 使用场景：
+ * 在部分更新、合并等操作中，需要检查哪些行被标记为删除，以便正确处理这些行。
+ * 
+ * @param block 输入的 Block，可能包含删除标记列
+ * @param rows_at_least 要求删除标记列至少包含的行数（用于边界检查）
+ * @return 如果找到删除标记列且行数满足要求，返回该列的数据指针（signed char*）；
+ *         否则返回 nullptr
+ * 
+ * 注意：
+ * - 返回的指针指向的是 Int8 类型的数据数组，每个元素对应一行
+ * - 调用者需要确保 Block 在指针使用期间保持有效
+ * - 如果 Block 中没有删除标记列，或行数不足，返回 nullptr
+ */
 const signed char* BaseTablet::get_delete_sign_column_data(const vectorized::Block& block,
                                                            size_t rows_at_least) {
+    // 1. 查找删除标记列在 Block 中的位置
+    // DELETE_SIGN 是常量字符串 "__DORIS_DELETE_SIGN__"
     if (int pos = block.get_position_by_name(DELETE_SIGN); pos != -1) {
+        // 2. 获取删除标记列对象
         const vectorized::ColumnWithTypeAndName& delete_sign_column = block.get_by_position(pos);
+        
+        // 3. 将列转换为 Int8 类型（删除标记列必须是 Int8 类型）
         const auto& delete_sign_col =
                 assert_cast<const vectorized::ColumnInt8&>(*(delete_sign_column.column));
+        
+        // 4. 检查列的行数是否满足要求
+        // rows_at_least 用于确保有足够的数据，避免越界访问
         if (delete_sign_col.size() >= rows_at_least) {
+            // 5. 返回列的数据指针
+            // get_data() 返回 ColumnInt8 的内部数据数组，data() 获取原始指针
             return delete_sign_col.get_data().data();
         }
     }
+    // 6. 未找到删除标记列或行数不足，返回 nullptr
     return nullptr;
 };
 

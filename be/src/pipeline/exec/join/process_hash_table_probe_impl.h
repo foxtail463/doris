@@ -206,6 +206,61 @@ typename HashTableType::State ProcessHashTableProbe<JoinOpType>::_init_probe_sid
     return typename HashTableType::State(_parent->_probe_columns);
 }
 
+/**
+ * 执行 Hash Join 的核心方法
+ * 
+ * 【功能说明】
+ * 这是 Hash Join Probe 阶段的核心方法，负责：
+ * 1. 初始化 Probe 侧数据（计算 Hash 值、准备查找）
+ * 2. 在 Hash 表中批量查找匹配的行
+ * 3. 构建输出列（Build 侧和 Probe 侧）
+ * 4. 处理 Mark Join 或其他 Join 条件
+ * 
+ * 【工作流程】
+ * 1. 初始化 Probe 侧：计算 Probe 数据的 Hash 值，准备在 Hash 表中查找
+ * 2. 查找匹配行：
+ *    - NULL Aware Join：特殊处理 NULL 值匹配
+ *    - 普通 Join：批量查找匹配的行
+ * 3. 构建输出列：根据匹配结果，构建 Build 侧和 Probe 侧的输出列
+ * 4. 处理特殊条件：Mark Join 或其他 Join 条件
+ * 
+ * 【关键设计】
+ * - 批量处理：一次处理多行 Probe 数据，提高性能
+ * - 状态保持：probe_index 和 build_index 记录当前处理位置，支持分批次处理
+ * - 模板特化：根据 JoinOpType 和 HashTableType 生成不同的实现
+ * 
+ * 【示例】
+ * 假设 INNER JOIN，Probe 表有 1000 行，Build 表有 500 行：
+ * 
+ * 1. 初始化 Probe 侧：
+ *    - 计算前 100 行 Probe 数据的 Hash 值
+ *    - 准备在 Hash 表中查找
+ * 
+ * 2. 查找匹配行：
+ *    - 对每行 Probe 数据，在 Hash 表中查找匹配的 Build 数据
+ *    - 【重要】一个 Probe 行可以匹配多个 Build 行（一对多关系）
+ *    - 例如：INNER JOIN，Probe 表有键值 "A"，Build 表有 3 行键值都是 "A"
+ *      * Probe 行 0（键值 "A"）匹配 Build 行 5、10、15（都是键值 "A"）
+ *      * 结果：输出 3 行结果
+ *      * _probe_indexs = [0, 0, 0]（3 个元素都是 0，表示都来自 Probe 行 0）
+ *      * _build_indexs = [5, 10, 15]（匹配的 Build 行索引）
+ *    - 结果存储在 _probe_indexs 和 _build_indexs 中
+ * 
+ * 3. 构建输出列：
+ *    - Build 侧：从 Build 表中提取匹配行的列
+ *    - Probe 侧：从 Probe 表中提取匹配行的列
+ * 
+ * 4. 输出结果：
+ *    - 将结果写入 output_block
+ * 
+ * @param hash_table_ctx Hash 表上下文（包含 Hash 表实例和键值）
+ * @param null_map NULL Map（标记哪些 Probe 行的键是 NULL）
+ * @param mutable_block 可变的输出块（用于构建输出列）
+ * @param output_block 输出块（存储最终的 Join 结果）
+ * @param probe_rows Probe 数据的行数
+ * @param is_mark_join 是否是 Mark Join
+ * @return Status
+ */
 template <int JoinOpType>
 template <typename HashTableType>
 Status ProcessHashTableProbe<JoinOpType>::process(HashTableType& hash_table_ctx,
@@ -213,37 +268,68 @@ Status ProcessHashTableProbe<JoinOpType>::process(HashTableType& hash_table_ctx,
                                                   vectorized::MutableBlock& mutable_block,
                                                   vectorized::Block* output_block,
                                                   uint32_t probe_rows, bool is_mark_join) {
+    // ===== 阶段 1：基本检查 =====
+    // 如果 Build 侧有列需要输出，但 Build Block 为空，返回错误
     if (_right_col_len && !_build_block) {
         return Status::InternalError("build block is nullptr");
     }
 
+    // 获取当前处理的 Probe 和 Build 索引
+    // probe_index：当前处理的 Probe 行索引
+    // build_index：当前处理的 Build 行索引（用于处理一对多匹配）
     auto& probe_index = _parent->_probe_index;
     auto& build_index = _parent->_build_index;
+    
+    // ===== 阶段 2：初始化 Probe 侧 =====
+    // 计算 Probe 数据的 Hash 值，准备在 Hash 表中查找
+    // 这包括：
+    // 1. 序列化 Probe 键（如果是复杂类型）
+    // 2. 计算 Hash 值
+    // 3. 准备查找状态
     {
         SCOPED_TIMER(_init_probe_side_timer);
         _init_probe_side<HashTableType>(hash_table_ctx, probe_rows, null_map);
     }
 
+    // 获取可变列的引用（用于构建输出列）
     auto& mcol = mutable_block.mutable_columns();
 
+    // ===== 阶段 3：在 Hash 表中查找匹配的行 =====
+    // current_offset：当前批次匹配的行数
     uint32_t current_offset = 0;
+    
+    // ===== 情况 A：NULL Aware Join + 其他 Join 条件 =====
+    // NULL Aware Join 需要特殊处理 NULL 值的匹配
+    // 如果 Probe 键是 NULL，需要与 Build 表的所有行匹配
     if ((JoinOpType == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN ||
          JoinOpType == TJoinOp::NULL_AWARE_LEFT_SEMI_JOIN) &&
         _have_other_join_conjunct) {
         SCOPED_TIMER(_search_hashtable_timer);
 
-        /// If `_build_index_for_null_probe_key` is not zero, it means we are in progress of handling probe null key.
+        // ===== 子情况 A1：正在处理 NULL Probe 键 =====
+        // _build_index_for_null_probe_key != 0 表示正在处理一个 NULL Probe 键
+        // 因为 NULL 键需要匹配 Build 表的所有行，可能需要分多批次处理
         if (_build_index_for_null_probe_key) {
+            // 检查 NULL Map 是否有效
             if (!null_map || !null_map[probe_index]) {
                 return Status::InternalError(
                         "null_map is nullptr or null_map[probe_index] is false");
             }
+            // 继续处理 NULL Probe 键（可能 Build 表很大，需要分批处理）
             current_offset = _process_probe_null_key(probe_index);
+            // 如果处理完成，移动到下一个 Probe 行
             if (!_build_index_for_null_probe_key) {
                 probe_index++;
                 build_index = 0;
             }
         } else {
+            // ===== 子情况 A2：正常查找（可能遇到 NULL 键） =====
+            // 调用 NULL Aware 查找方法
+            // 返回值：
+            // - new_probe_idx：新的 Probe 索引（可能已处理多行）
+            // - new_build_idx：新的 Build 索引（用于一对多匹配）
+            // - new_current_offset：当前批次匹配的行数
+            // - picking_null_keys：是否正在处理 NULL 键
             auto [new_probe_idx, new_build_idx, new_current_offset, picking_null_keys] =
                     hash_table_ctx.hash_table->find_null_aware_with_other_conjuncts(
                             hash_table_ctx.keys, hash_table_ctx.bucket_nums.data(), probe_index,
@@ -255,10 +341,14 @@ Status ProcessHashTableProbe<JoinOpType>::process(HashTableType& hash_table_ctx,
             current_offset = new_current_offset;
             _picking_null_keys = picking_null_keys;
 
+            // ===== 如果遇到 NULL Probe 键，开始处理 =====
+            // NULL Aware Join 的特殊规则：NULL 键匹配 Build 表的所有行
             if (probe_index < probe_rows && null_map && null_map[probe_index]) {
                 _build_index_for_null_probe_key = 1;
+                // 如果当前批次没有匹配，立即开始处理 NULL 键
                 if (current_offset == 0) {
                     current_offset = _process_probe_null_key(probe_index);
+                    // 如果处理完成，移动到下一个 Probe 行
                     if (!_build_index_for_null_probe_key) {
                         probe_index++;
                         build_index = 0;
@@ -267,7 +357,28 @@ Status ProcessHashTableProbe<JoinOpType>::process(HashTableType& hash_table_ctx,
             }
         }
     } else {
+        // ===== 情况 B：普通 Hash Join（批量查找） =====
+        // 这是最常见的路径，使用批量查找方法
         SCOPED_TIMER(_search_hashtable_timer);
+        
+        // 调用批量查找方法
+        // 返回值：
+        // - new_probe_idx：新的 Probe 索引（可能已处理多行）
+        // - new_build_idx：新的 Build 索引（用于一对多匹配）
+        // - new_current_offset：当前批次匹配的行数
+        // 
+        // 参数说明：
+        // - hash_table_ctx.keys：Probe 键值数组
+        // - hash_table_ctx.bucket_nums.data()：Hash 桶编号数组
+        // - probe_index：当前 Probe 行索引
+        // - build_index：当前 Build 行索引（用于一对多匹配）
+        // - probe_rows：Probe 数据的行数
+        // - _probe_indexs：输出参数，存储匹配的 Probe 行索引
+        // - _probe_visited：Probe 行是否已访问（用于某些 Join 类型）
+        // - _build_indexs：输出参数，存储匹配的 Build 行索引
+        // - null_map：NULL Map
+        // - _have_other_join_conjunct：是否有其他 Join 条件
+        // - is_mark_join：是否是 Mark Join
         auto [new_probe_idx, new_build_idx, new_current_offset] =
                 hash_table_ctx.hash_table->template find_batch<JoinOpType>(
                         hash_table_ctx.keys, hash_table_ctx.bucket_nums.data(), probe_index,
@@ -280,28 +391,51 @@ Status ProcessHashTableProbe<JoinOpType>::process(HashTableType& hash_table_ctx,
         current_offset = new_current_offset;
     }
 
-    // input row_indexs's size may bigger than current_offset coz _init_probe_side
+    // ===== 阶段 4：调整索引数组大小 =====
+    // _init_probe_side 可能分配了更大的空间（batch_size + 1）
+    // 现在根据实际匹配的行数调整大小
     _probe_indexs.resize(current_offset);
     _build_indexs.resize(current_offset);
 
+    // ===== 阶段 5：构建输出列 =====
+    // 根据匹配结果（_probe_indexs 和 _build_indexs），构建输出列
+    
+    // 构建 Build 侧的输出列
+    // 从 Build 表中提取匹配行的列数据
     build_side_output_column(mcol, is_mark_join);
 
+    // 构建 Probe 侧的输出列
+    // 条件：
+    // 1. 有其他 Join 条件：需要 Probe 侧数据
+    // 2. 有 Mark Join 条件：需要 Probe 侧数据
+    // 3. 不是 RIGHT_SEMI_JOIN 或 RIGHT_ANTI_JOIN：这些 Join 类型不需要 Probe 侧数据
     if (_have_other_join_conjunct || !_parent->_mark_join_conjuncts.empty() ||
         (JoinOpType != TJoinOp::RIGHT_SEMI_JOIN && JoinOpType != TJoinOp::RIGHT_ANTI_JOIN)) {
         probe_side_output_column(mcol);
     }
 
+    // ===== 阶段 6：输出结果 =====
+    // 将可变块转换为普通块，并交换到输出块
     output_block->swap(mutable_block.to_block());
+    // 验证输出行数是否正确
     DCHECK_EQ(current_offset, output_block->rows());
+    // 更新中间结果行数统计
     COUNTER_UPDATE(_parent->_intermediate_rows_counter, current_offset);
 
+    // ===== 阶段 7：处理特殊 Join 条件 =====
+    
+    // ===== 情况 A：Mark Join =====
+    // Mark Join：只返回是否匹配，不返回匹配的数据
     if (is_mark_join) {
+        // 判断是否忽略 NULL Map
+        // 对于 NULL Aware Join，如果 Build 表为空，返回 false 而不是 NULL
         bool ignore_null_map =
                 (JoinOpType == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN ||
                  JoinOpType == TJoinOp::NULL_AWARE_LEFT_SEMI_JOIN) &&
                 hash_table_ctx.hash_table
                         ->empty_build_side(); // empty build side will return false to instead null
 
+        // RIGHT_SEMI_JOIN 和 RIGHT_ANTI_JOIN 需要存储 Mark Join 标志
         if constexpr (JoinOpType == TJoinOp::RIGHT_SEMI_JOIN ||
                       JoinOpType == TJoinOp::RIGHT_ANTI_JOIN) {
             if (mark_join_flags.empty()) {
@@ -309,11 +443,19 @@ Status ProcessHashTableProbe<JoinOpType>::process(HashTableType& hash_table_ctx,
             }
         }
 
+        // 处理 Mark Join 条件
         return do_mark_join_conjuncts(output_block, ignore_null_map ? nullptr : null_map);
-    } else if (_have_other_join_conjunct) {
+    } 
+    // ===== 情况 B：有其他 Join 条件 =====
+    // 其他 Join 条件：如 WHERE 子句中的条件
+    else if (_have_other_join_conjunct) {
+        // 处理其他 Join 条件
+        // get_visited()：获取 Build 表的访问标志（用于某些 Join 类型）
         return do_other_join_conjuncts(output_block, hash_table_ctx.hash_table->get_visited());
     }
 
+    // ===== 情况 C：没有特殊条件 =====
+    // 直接返回结果
     return Status::OK();
 }
 

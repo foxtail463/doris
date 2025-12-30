@@ -370,25 +370,27 @@ public class MTMV extends OlapTable {
     }
 
     /**
-     * Called when in query, Should use one connection context in query
+     * 查询时获取或生成 MTMV 的缓存。
+     * 
+     * 维护两份缓存：
+     * 1. cacheWithoutGuard: 当前 SessionVariable 与 MV 创建时一致，计划中无 guard 表达式
+     * 2. cacheWithGuard: 当前 SessionVariable 与 MV 创建时不一致，计划中包含 guard 表达式
+     * 
+     * 这样设计的原因：
+     * - SessionVariable 一致时：可以重写
+     * - SessionVariable 不一致时：
+     *   - 有 guard 表达式：不能重写（guard 表达式会阻止）
+     *   - 无 guard 表达式：可以重写
      */
     public MTMVCache getOrGenerateCache(ConnectContext connectionContext) throws
             org.apache.doris.nereids.exceptions.AnalysisException {
-        // store two MTMVCaches: one is a cache where SessionVariables differ from those at creation time,
-        // and the MTMV plan includes a guardexpr;
-        // the other is a cache where SessionVariables are the same as at creation time, and the MTMV plan
-        // does not include a guardexpr;
-        // This way, when sessionVariables are the same, rewriting is possible;
-        // When sessionVariables are different, there are two cases:
-        // 1. If a guardexpr is present, rewriting is not possible;
-        // 2. If no guardexpr is present, rewriting is possible.
-        // Determine if current session variables match MV creation session variables
+        // 检查当前会话变量是否与 MV 创建时的会话变量匹配
         Map<String, String> currentSessionVars =
                 connectionContext.getSessionVariable().getAffectQueryResultInPlanVariables();
         boolean sessionVarsMatch = SessionVarGuardRewriter.checkSessionVariablesMatch(
                 currentSessionVars, this.sessionVariables);
 
-        // Select appropriate cache based on session variable match
+        // 根据会话变量是否匹配，选择对应的缓存
         readMvLock();
         try {
             if (sessionVarsMatch && cacheWithoutGuard != null) {
@@ -401,9 +403,8 @@ public class MTMV extends OlapTable {
             readMvUnlock();
         }
 
-        // Generate cache if not exists
-        // Concurrent situations may result in duplicate cache generation,
-        // but we tolerate this in order to prevent nested use of readLock and write MvLock for the table
+        // 缓存不存在时生成新缓存
+        // 并发情况下可能重复生成，但为了避免读写锁嵌套问题，我们容忍这种情况
         MTMVCache mtmvCache = MTMVCache.from(this.getQuerySql(),
                 MTMVPlanUtil.createMTMVContext(this, MTMVPlanUtil.DISABLE_RULES_WHEN_GENERATE_MTMV_CACHE),
                 true, false, connectionContext, !sessionVarsMatch);

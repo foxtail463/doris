@@ -28,6 +28,41 @@ import java.util.Map;
  * We will replace the partition slot to PartitionSlotInput#result in the partition predicate,
  * so that we can evaluate the expression tree.
  *
+ * 核心作用：为每个分区创建输入，将抽象的分区列替换为具体值，然后计算查询条件是否匹配该分区
+ *
+ * 直观例子1 - 列表分区：
+ * 表定义：
+ * CREATE TABLE orders (id INT, name VARCHAR) PARTITION BY LIST(region) (
+ *     PARTITION p_north VALUES IN ('north'),
+ *     PARTITION p_south VALUES IN ('south'),
+ *     PARTITION p_east VALUES IN ('east'),
+ *     PARTITION p_west VALUES IN ('west')
+ * );
+ * 
+ * 查询：SELECT * FROM orders WHERE region = 'north';
+ * 
+ * 为每个分区创建输入：
+ * 分区p_north: PartitionSlotInput(result = Literal('north'))  -> 'north' = 'north' = true  ✅ 扫描
+ * 分区p_south: PartitionSlotInput(result = Literal('south'))  -> 'south' = 'north' = false ❌ 跳过
+ * 分区p_east:  PartitionSlotInput(result = Literal('east'))   -> 'east' = 'north' = false  ❌ 跳过
+ * 分区p_west:  PartitionSlotInput(result = Literal('west'))   -> 'west' = 'north' = false  ❌ 跳过
+ *
+ * 直观例子2 - 范围分区：
+ * 表定义：
+ * CREATE TABLE sales (id INT, amount DECIMAL) PARTITION BY RANGE(year) (
+ *     PARTITION p2022 VALUES LESS THAN (2023),
+ *     PARTITION p2023 VALUES LESS THAN (2024),
+ *     PARTITION p2024 VALUES LESS THAN (2025)
+ * );
+ * 
+ * 查询：SELECT * FROM sales WHERE year > 2022;
+ * 
+ * 为每个分区创建输入：
+ * 分区p2022: PartitionSlotInput(result = Slot(year), columnRanges = {year: [0,2023)})  -> 部分匹配
+ * 分区p2023: PartitionSlotInput(result = Slot(year), columnRanges = {year: [2023,2024)}) -> 完全匹配 ✅ 扫描
+ * 分区p2024: PartitionSlotInput(result = Slot(year), columnRanges = {year: [2024,2025)}) -> 完全匹配 ✅ 扫描
+ *
+ * 原始例子 - 列表分区的值替换：
  * for example, the partition predicate: `part_column1 > 1`, and exist a partition range is [('1'), ('4')),
  * and part_column1 is int type.
  *

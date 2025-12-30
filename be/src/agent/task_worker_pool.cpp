@@ -455,43 +455,57 @@ bvar::Adder<uint64_t> GC_BINLOG_count("task", "GC_BINLOG");
 bvar::Adder<uint64_t> UPDATE_VISIBLE_VERSION_count("task", "UPDATE_VISIBLE_VERSION");
 bvar::Adder<uint64_t> CALCULATE_DELETE_BITMAP_count("task", "CALCULATE_DELETE_BITMAP");
 
+/**
+ * 更新任务计数器的函数
+ * @param task 任务请求对象
+ * @param n 计数的变化量（通常为+1表示任务开始，-1表示任务结束）
+ */
 void add_task_count(const TAgentTaskRequest& task, int n) {
     // clang-format off
     switch (task.task_type) {
+    // 使用宏定义简化重复的case语句
+    // 宏展开后相当于：case TTaskType::type: type##_count << n; return;
     #define ADD_TASK_COUNT(type) \
     case TTaskType::type:        \
         type##_count << n;       \
         return;
-    ADD_TASK_COUNT(ALTER_INVERTED_INDEX)
-    ADD_TASK_COUNT(CHECK_CONSISTENCY)
-    ADD_TASK_COUNT(UPLOAD)
-    ADD_TASK_COUNT(DOWNLOAD)
-    ADD_TASK_COUNT(MAKE_SNAPSHOT)
-    ADD_TASK_COUNT(RELEASE_SNAPSHOT)
-    ADD_TASK_COUNT(MOVE)
-    ADD_TASK_COUNT(COMPACTION)
-    ADD_TASK_COUNT(PUSH_STORAGE_POLICY)
-    ADD_TASK_COUNT(PUSH_INDEX_POLICY)
-    ADD_TASK_COUNT(PUSH_COOLDOWN_CONF)
-    ADD_TASK_COUNT(CREATE)
-    ADD_TASK_COUNT(DROP)
-    ADD_TASK_COUNT(PUBLISH_VERSION)
-    ADD_TASK_COUNT(CLEAR_TRANSACTION_TASK)
-    ADD_TASK_COUNT(UPDATE_TABLET_META_INFO)
-    ADD_TASK_COUNT(CLONE)
-    ADD_TASK_COUNT(STORAGE_MEDIUM_MIGRATE)
-    ADD_TASK_COUNT(GC_BINLOG)
-    ADD_TASK_COUNT(UPDATE_VISIBLE_VERSION)
-    ADD_TASK_COUNT(CALCULATE_DELETE_BITMAP)
-    #undef ADD_TASK_COUNT
-    case TTaskType::REALTIME_PUSH:
-    case TTaskType::PUSH:
+    
+    // 各种任务类型的计数更新
+    ADD_TASK_COUNT(ALTER_INVERTED_INDEX)    // 倒排索引变更任务
+    ADD_TASK_COUNT(CHECK_CONSISTENCY)       // 一致性检查任务
+    ADD_TASK_COUNT(UPLOAD)                  // 上传任务
+    ADD_TASK_COUNT(DOWNLOAD)                // 下载任务
+    ADD_TASK_COUNT(MAKE_SNAPSHOT)           // 创建快照任务
+    ADD_TASK_COUNT(RELEASE_SNAPSHOT)        // 释放快照任务
+    ADD_TASK_COUNT(MOVE)                    // 移动任务
+    ADD_TASK_COUNT(COMPACTION)              // 压缩任务
+    ADD_TASK_COUNT(PUSH_STORAGE_POLICY)     // 推送存储策略任务
+    ADD_TASK_COUNT(PUSH_INDEX_POLICY)       // 推送索引策略任务
+    ADD_TASK_COUNT(PUSH_COOLDOWN_CONF)      // 推送冷却配置任务
+    ADD_TASK_COUNT(CREATE)                  // 创建tablet任务
+    ADD_TASK_COUNT(DROP)                    // 删除tablet任务
+    ADD_TASK_COUNT(PUBLISH_VERSION)         // 发布版本任务
+    ADD_TASK_COUNT(CLEAR_TRANSACTION_TASK)  // 清理事务任务
+    ADD_TASK_COUNT(UPDATE_TABLET_META_INFO) // 更新tablet元信息任务
+    ADD_TASK_COUNT(CLONE)                   // 克隆任务
+    ADD_TASK_COUNT(STORAGE_MEDIUM_MIGRATE)  // 存储介质迁移任务
+    ADD_TASK_COUNT(GC_BINLOG)               // 垃圾回收binlog任务
+    ADD_TASK_COUNT(UPDATE_VISIBLE_VERSION)  // 更新可见版本任务
+    ADD_TASK_COUNT(CALCULATE_DELETE_BITMAP) // 计算删除位图任务
+    
+    #undef ADD_TASK_COUNT  // 取消宏定义
+    
+    // 特殊处理：推送任务根据推送类型分别计数
+    case TTaskType::REALTIME_PUSH:  // 实时推送
+    case TTaskType::PUSH:           // 普通推送
         if (task.push_req.push_type == TPushType::LOAD_V2) {
-            PUSH_count << n;
+            PUSH_count << n;        // 数据加载类型的推送任务
         } else if (task.push_req.push_type == TPushType::DELETE) {
-            DELETE_count << n;
+            DELETE_count << n;      // 删除类型的推送任务
         }
         return;
+    
+    // 特殊处理：ALTER任务需要额外的统计信息
     case TTaskType::ALTER:
     {
         ALTER_count << n;
@@ -506,8 +520,9 @@ void add_task_count(const TAgentTaskRequest& task, int n) {
         }
         return;
     }
+    
     default:
-        return;
+        return;  // 未知任务类型，不进行计数
     }
     // clang-format on
 }
@@ -1754,12 +1769,26 @@ void push_cooldown_conf_callback(StorageEngine& engine, const TAgentTaskRequest&
     }
 }
 
+/**
+ * 创建tablet的回调函数
+ * 这是CREATE任务的核心执行函数，负责在存储引擎中创建新的tablet
+ * @param engine 存储引擎引用，用于执行实际的tablet创建操作
+ * @param req 任务请求对象，包含创建tablet所需的所有信息
+ */
 void create_tablet_callback(StorageEngine& engine, const TAgentTaskRequest& req) {
+    // 提取创建tablet的请求参数
     const auto& create_tablet_req = req.create_tablet_req;
+    
+    // 创建性能分析器，用于监控创建tablet的性能
     RuntimeProfile runtime_profile("CreateTablet");
     RuntimeProfile* profile = &runtime_profile;
+    
+    // 创建计时器，用于测量整个创建过程的耗时
     MonotonicStopWatch watch;
     watch.start();
+    
+    // 使用RAII模式，在函数结束时自动执行性能分析
+    // 如果创建时间超过阈值，会记录详细的性能信息
     Defer defer = [&] {
         auto elapsed_time = static_cast<double>(watch.elapsed_time());
         if (elapsed_time / 1e9 > config::agent_task_trace_threshold_sec) {
@@ -1769,50 +1798,78 @@ void create_tablet_callback(StorageEngine& engine, const TAgentTaskRequest& req)
             LOG(WARNING) << "create tablet cost(s) " << elapsed_time / 1e9 << std::endl << ss.str();
         }
     };
+    
+    // 增加创建tablet请求的总数统计
     DorisMetrics::instance()->create_tablet_requests_total->increment(1);
+    
+    // 记录开始创建tablet的日志
     VLOG_NOTICE << "start to create tablet " << create_tablet_req.tablet_id;
 
+    // 用于存储创建成功的tablet信息，后续会报告给FE
     std::vector<TTabletInfo> finish_tablet_infos;
+    
+    // 记录创建tablet的详细请求信息
     VLOG_NOTICE << "create tablet: " << create_tablet_req;
+    
+    // 调用存储引擎创建tablet，这是实际执行创建操作的地方
     Status status = engine.create_tablet(create_tablet_req, profile);
+    
+    // 处理创建结果
     if (!status.ok()) {
+        // 创建失败：增加失败计数并记录错误日志
         DorisMetrics::instance()->create_tablet_requests_failed->increment(1);
         LOG_WARNING("failed to create tablet, reason={}", status.to_string())
                 .tag("signature", req.signature)
                 .tag("tablet_id", create_tablet_req.tablet_id)
                 .error(status);
     } else {
+        // 创建成功：增加报告版本号，通知FE有新的状态更新
         increase_report_version();
-        // get path hash of the created tablet
+        
+        // 获取刚创建的tablet对象，用于收集其信息
         TabletSharedPtr tablet;
         {
             SCOPED_TIMER(ADD_TIMER(profile, "GetTablet"));
             tablet = engine.tablet_manager()->get_tablet(create_tablet_req.tablet_id);
         }
+        
+        // 断言：确保tablet确实被创建了
         DCHECK(tablet != nullptr);
+        
+        // 构建tablet信息，准备报告给FE
         TTabletInfo tablet_info;
         tablet_info.tablet_id = tablet->tablet_id();
         tablet_info.schema_hash = tablet->schema_hash();
         tablet_info.version = create_tablet_req.version;
         // Useless but it is a required field in TTabletInfo
         tablet_info.version_hash = 0;
-        tablet_info.row_count = 0;
-        tablet_info.data_size = 0;
-        tablet_info.__set_path_hash(tablet->data_dir()->path_hash());
-        tablet_info.__set_replica_id(tablet->replica_id());
+        tablet_info.row_count = 0;                           // 新创建的tablet行数为0
+        tablet_info.data_size = 0;                           // 新创建的tablet数据大小为0
+        tablet_info.__set_path_hash(tablet->data_dir()->path_hash());  // 设置存储路径哈希
+        tablet_info.__set_replica_id(tablet->replica_id());           // 设置副本ID
+        
+        // 将tablet信息添加到完成列表中
         finish_tablet_infos.push_back(tablet_info);
+        
+        // 记录成功创建tablet的日志
         LOG_INFO("successfully create tablet")
                 .tag("signature", req.signature)
                 .tag("tablet_id", create_tablet_req.tablet_id);
     }
+    
+    // 构建任务完成请求，准备向FE报告
     TFinishTaskRequest finish_task_request;
-    finish_task_request.__set_finish_tablet_infos(finish_tablet_infos);
-    finish_task_request.__set_backend(BackendOptions::get_local_backend());
-    finish_task_request.__set_report_version(s_report_version);
-    finish_task_request.__set_task_type(req.task_type);
-    finish_task_request.__set_signature(req.signature);
-    finish_task_request.__set_task_status(status.to_thrift());
+    finish_task_request.__set_finish_tablet_infos(finish_tablet_infos);  // 设置完成的tablet信息
+    finish_task_request.__set_backend(BackendOptions::get_local_backend());  // 设置本机BE信息
+    finish_task_request.__set_report_version(s_report_version);  // 设置报告版本号
+    finish_task_request.__set_task_type(req.task_type);         // 设置任务类型
+    finish_task_request.__set_signature(req.signature);         // 设置任务签名
+    finish_task_request.__set_task_status(status.to_thrift());  // 设置任务执行状态
+    
+    // 向FE报告任务完成状态
     finish_task(finish_task_request);
+    
+    // 从任务管理器中移除已完成的任务信息
     remove_task_info(req.task_type, req.signature);
 }
 

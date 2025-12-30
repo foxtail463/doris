@@ -1079,15 +1079,27 @@ Status ScanLocalState<Derived>::_normalize_noneq_binary_predicate(
 template <typename Derived>
 Status ScanLocalState<Derived>::_prepare_scanners() {
     std::list<vectorized::ScannerSPtr> scanners;
+    // 1) 构建本 scan 算子要使用的底层 scanners 列表。
+    // scanners 通常对应具体数据源的读取器（如 OlapScanner / FileScanner 等），
+    // 后续会被调度并持续产出数据块（Block）。
     RETURN_IF_ERROR(_init_scanners(&scanners));
     // Init scanner wrapper
-    for (auto it = scanners.begin(); it != scanners.end(); ++it) {
-        _scanners.emplace_back(std::make_shared<vectorized::ScannerDelegate>(*it));
+    // 2) 将底层 scanner 包装成 ScannerDelegate。
+    // 目的：
+    // - 统一不同 scanner 的执行接口/生命周期管理
+    // - 便于在 pipeline 中做依赖/并发调度、统计与异常处理
+    for (const auto& scanner : scanners) {
+        _scanners.emplace_back(std::make_shared<vectorized::ScannerDelegate>(scanner));
     }
     if (scanners.empty()) {
+        // 3) 没有任何 scanner（例如 scan range 为空、或被裁剪后无数据可读）：
+        // - 直接标记 EOS（end of stream）
+        // - 将 scan dependency 置为 always ready，避免下游一直等待 scan 产出数据
         _eos = true;
         _scan_dependency->set_always_ready();
     } else {
+        // 4) 有 scanner：记录 scanner 数量，并启动 scanners 的执行（一般会在后台线程/线程池中运行）。
+        // scanner 启动后会不断填充队列/缓冲，为后续 get_block() 提供数据来源。
         COUNTER_SET(_num_scanners, static_cast<int64_t>(scanners.size()));
         RETURN_IF_ERROR(_start_scanners(_scanners));
     }
@@ -1374,12 +1386,21 @@ Status ScanLocalState<Derived>::close(RuntimeState* state) {
     return PipelineXLocalState<>::close(state);
 }
 
+// Source 算子：从 ScannerContext 的队列中拉取一批数据块
+// 流程：
+// 1) 取消检查 → 及时停止所有 scanner
+// 2) 已到 EOS 直接返回
+// 3) 从 _scanner_ctx 队列取块（可能为空块，视调度/IO情况而定）
+// 4) 清理仅在 scan 节点使用的临时列，避免影响下游
+// 5) 处理 limit，若到达上限则标记 EOS 并停止 scanners
 template <typename LocalStateType>
 Status ScanOperatorX<LocalStateType>::get_block(RuntimeState* state, vectorized::Block* block,
                                                 bool* eos) {
     auto& local_state = get_local_state(state);
     SCOPED_TIMER(local_state.exec_time_counter());
 
+    // 取消检测：
+    // - 一旦任务被取消，通知 ScannerContext 停止底层 scanners 并返回取消原因
     if (state->is_cancelled()) {
         if (local_state._scanner_ctx) {
             local_state._scanner_ctx->stop_scanners(state);
@@ -1387,17 +1408,30 @@ Status ScanOperatorX<LocalStateType>::get_block(RuntimeState* state, vectorized:
         return state->cancel_reason();
     }
 
+    // 本地 EOS 快速返回：
+    // - 当上次调用已判定 scan 源耗尽，则直接对外宣告结束
     if (local_state._eos) {
         *eos = true;
         return Status::OK();
     }
 
     DCHECK(local_state._scanner_ctx != nullptr);
+    // 从 ScannerContext 的“生产者-消费者队列”获取数据：
+    // - 该队列由多个扫描线程产出数据块；此处作为消费者读取
+    // - 第四个参数 channel_id=0：对单通道/默认通道读取
+    // - 行为可为阻塞/非阻塞，具体由底层实现与数据可用性决定
+    // - 返回后：
+    //   * block 可能为空（无可用数据但未到 EOS），上层应继续调度重试
+    //   * *eos=true 表示该 Source 已无更多数据
     RETURN_IF_ERROR(local_state._scanner_ctx->get_block_from_queue(state, block, eos, 0));
 
+    // limit 处理：
+    // - 若本 pipeline 设置了 limit，当累计返回行数达到上限：
+    //   * 截断当前 block 行数
+    //   * 置 *eos = true，触发下游完成
     local_state.reached_limit(block, eos);
     if (*eos) {
-        // reach limit, stop the scanners.
+        // 已到达末尾或命中 limit：停止后续扫描任务并标记信息
         local_state._scanner_ctx->stop_scanners(state);
         local_state._scanner_profile->add_info_string("EOS", "True");
     }

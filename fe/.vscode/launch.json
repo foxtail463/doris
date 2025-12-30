@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Doris FE (Start + Attach)",
+            "type": "java",
+            "request": "attach",
+            "hostName": "localhost",
+            "port": 5005,
+            "preLaunchTask": "start-doris-fe",
+            "postDebugTask": "stop-doris-fe"
+        }
+    ]
+} 

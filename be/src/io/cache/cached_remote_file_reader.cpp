@@ -278,17 +278,33 @@ Status CachedRemoteFileReader::_execute_remote_read(const std::vector<FileBlockS
     }
 }
 
+/**
+ * 从指定偏移量读取数据（带文件缓存支持）
+ * 
+ * 读取策略（优先级从高到低）：
+ * 1. 直接读取本地缓存文件（如果启用且数据完整）
+ * 2. 从缓存系统的缓存块读取（已下载完成的块）
+ * 3. 从远程文件系统读取（缓存未命中或下载失败）
+ * 
+ * @param offset 文件中的起始偏移量
+ * @param result 读取结果的缓冲区
+ * @param bytes_read 实际读取的字节数（输出参数）
+ * @param io_ctx I/O上下文，包含统计信息、是否干运行等
+ * @return 操作状态
+ */
 Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                                             const IOContext* io_ctx) {
     size_t already_read = 0;
     const bool is_dryrun = io_ctx->is_dryrun;
     DCHECK(!closed());
     DCHECK(io_ctx);
+    // 参数校验：偏移量不能超过文件大小
     if (offset > size()) {
         return Status::InvalidArgument(
                 fmt::format("offset exceeds file size(offset: {}, file size: {}, path: {})", offset,
                             size(), path().native()));
     }
+    // 计算实际需要读取的字节数（不超过文件剩余大小）
     size_t bytes_req = result.size;
     bytes_req = std::min(bytes_req, size() - offset);
     if (UNLIKELY(bytes_req == 0)) {
@@ -296,10 +312,12 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
         return Status::OK();
     }
 
+    // 初始化读取统计信息
     ReadStatistics stats;
     stats.bytes_read += bytes_req;
     MonotonicStopWatch read_at_sw;
     read_at_sw.start();
+    // 延迟执行的清理函数：在函数退出时更新统计信息、记录日志
     auto defer_func = [&](int*) {
         if (config::print_stack_when_cache_miss) {
             if (io_ctx->file_cache_stats == nullptr && !stats.hit_cache && !io_ctx->is_warmup) {
@@ -314,38 +332,48 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
                     io_ctx->is_warmup);
         }
         if (io_ctx->file_cache_stats && !is_dryrun) {
-            // update stats in io_ctx, for query profile
+            // 更新I/O上下文中的统计信息（用于查询Profile）
             _update_stats(stats, io_ctx->file_cache_stats, io_ctx->is_inverted_index);
-            // update stats increment in this reading procedure for file cache metrics
+            // 更新本次读取过程中的增量统计信息（用于文件缓存指标）
             FileCacheStatistics fcache_stats_increment;
             _update_stats(stats, &fcache_stats_increment, io_ctx->is_inverted_index);
             io::FileCacheMetrics::instance().update(&fcache_stats_increment);
         }
     };
     std::unique_ptr<int, decltype(defer_func)> defer((int*)0x01, std::move(defer_func));
+    
+    // ===== 阶段1：直接读取本地缓存文件（优化路径）=====
+    // 如果启用了直接读取缓存文件且是Doris表，尝试直接从本地缓存文件读取
+    // 这样可以避免经过缓存系统的间接路径，提高性能
     if (_is_doris_table && config::enable_read_cache_file_directly) {
-        // read directly
         SCOPED_RAW_TIMER(&stats.read_cache_file_directly_timer);
         size_t need_read_size = bytes_req;
         std::shared_lock lock(_mtx);
         if (!_cache_file_readers.empty()) {
-            // find the last offset > offset.
+            // 查找包含请求偏移量的缓存文件读取器
+            // upper_bound找到第一个大于offset的迭代器，然后回退一个位置
             auto iter = _cache_file_readers.upper_bound(offset);
             if (iter != _cache_file_readers.begin()) {
                 iter--;
             }
             size_t cur_offset = offset;
+            // 遍历连续的缓存文件读取器，读取所需数据
             while (need_read_size != 0 && iter != _cache_file_readers.end()) {
+                // 检查当前偏移量是否在缓存块的范围内
                 if (iter->second->offset() > cur_offset ||
                     iter->second->range().right < cur_offset) {
                     break;
                 }
+                // 计算在缓存块内的相对偏移量
                 size_t file_offset = cur_offset - iter->second->offset();
+                // 计算本次从该缓存块读取的字节数
                 size_t reserve_bytes =
                         std::min(need_read_size, iter->second->range().size() - file_offset);
                 if (is_dryrun) [[unlikely]] {
+                    // 干运行模式：只统计，不实际读取
                     g_skip_local_cache_io_sum_bytes << reserve_bytes;
                 } else {
+                    // 从缓存文件读取数据到结果缓冲区
                     SCOPED_RAW_TIMER(&stats.local_read_timer);
                     if (!iter->second
                                  ->read(Slice(result.data + (cur_offset - offset), reserve_bytes),
@@ -354,12 +382,14 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
                         break;
                     }
                 }
+                // 标记该缓存块需要更新LRU（最近使用）
                 _cache->add_need_update_lru_block(iter->second);
                 need_read_size -= reserve_bytes;
                 cur_offset += reserve_bytes;
                 already_read += reserve_bytes;
                 iter++;
             }
+            // 如果所有数据都已从直接缓存路径读取完成，直接返回
             if (need_read_size == 0) {
                 *bytes_read = bytes_req;
                 stats.hit_cache = true;
@@ -367,40 +397,51 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
                 g_read_cache_direct_whole_bytes << bytes_req;
                 return Status::OK();
             } else {
+                // 部分命中：记录部分读取的统计信息
                 g_read_cache_direct_partial_num << 1;
                 g_read_cache_direct_partial_bytes << already_read;
             }
         }
     }
-    // read from cache or remote
+    
+    // ===== 阶段2：通过缓存系统间接读取（如果直接读取未完全满足）=====
     g_read_cache_indirect_num << 1;
     size_t indirect_read_bytes = 0;
+    // 将对齐后的偏移量和大小（按缓存块大小对齐，提高缓存命中率）
     auto [align_left, align_size] =
             s_align_size(offset + already_read, bytes_req - already_read, size());
+    // 构建缓存上下文，用于缓存系统查询
     CacheContext cache_context(io_ctx);
     cache_context.stats = &stats;
     auto tablet_id = get_tablet_id(path().string());
     cache_context.tablet_id = tablet_id.value_or(0);
     MonotonicStopWatch sw;
     sw.start();
+    // 从缓存系统获取或设置缓存块（如果不存在则创建）
     FileBlocksHolder holder =
             _cache->get_or_set(_cache_hash, align_left, align_size, cache_context);
     stats.cache_get_or_set_timer += sw.elapsed_time();
+    
+    // ===== 阶段3：检查缓存块状态并分类处理 =====
     std::vector<FileBlockSPtr> empty_blocks;
     for (auto& block : holder.file_blocks) {
         switch (block->state()) {
         case FileBlock::State::EMPTY:
+            // 空块：缓存中不存在，需要从远程读取
             VLOG_DEBUG << fmt::format("Block EMPTY path={} hash={}:{}:{} offset={} cache_path={}",
                                       path().native(), _cache_hash.to_string(), _cache_hash.high(),
                                       _cache_hash.low(), block->offset(), block->get_cache_file());
+            // 尝试成为下载者（只有一个线程负责下载，其他线程等待）
             block->get_or_set_downloader();
             if (block->is_downloader()) {
+                // 当前线程负责下载，加入空块列表
                 empty_blocks.push_back(block);
                 TEST_SYNC_POINT_CALLBACK("CachedRemoteFileReader::EMPTY");
             }
             stats.hit_cache = false;
             break;
         case FileBlock::State::SKIP_CACHE:
+            // 跳过缓存：由于某些原因（如缓存空间不足）不缓存此块
             VLOG_DEBUG << fmt::format(
                     "Block SKIP_CACHE path={} hash={}:{}:{} offset={} cache_path={}",
                     path().native(), _cache_hash.to_string(), _cache_hash.high(), _cache_hash.low(),
@@ -410,44 +451,54 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
             stats.skip_cache = true;
             break;
         case FileBlock::State::DOWNLOADING:
+            // 下载中：其他线程正在下载，当前线程等待
             stats.hit_cache = false;
             break;
         case FileBlock::State::DOWNLOADED:
+            // 已下载：缓存块已就绪，插入到文件读取器映射中（用于后续直接读取）
             _insert_file_reader(block);
             break;
         }
     }
+    
+    // ===== 阶段4：处理空块（从远程读取并写入缓存）=====
     size_t empty_start = 0;
     size_t empty_end = 0;
     if (!empty_blocks.empty()) {
+        // 计算所有空块的连续范围
         empty_start = empty_blocks.front()->range().left;
         empty_end = empty_blocks.back()->range().right;
         size_t size = empty_end - empty_start + 1;
         std::unique_ptr<char[]> buffer(new char[size]);
 
-        // Determine read type and execute remote read
+        // 确定读取类型并执行远程读取（从S3/HDFS等）
         RETURN_IF_ERROR(
                 _execute_remote_read(empty_blocks, empty_start, size, buffer, stats, io_ctx));
 
+        // 将远程读取的数据写入缓存块（SKIP_CACHE块除外）
         for (auto& block : empty_blocks) {
             if (block->state() == FileBlock::State::SKIP_CACHE) {
                 continue;
             }
             SCOPED_RAW_TIMER(&stats.local_write_timer);
+            // 计算该块在缓冲区中的位置
             char* cur_ptr = buffer.get() + block->range().left - empty_start;
             size_t block_size = block->range().size();
+            // 将数据追加到缓存块
             Status st = block->append(Slice(cur_ptr, block_size));
             if (st.ok()) {
+                // 完成写入，标记为DOWNLOADED状态
                 st = block->finalize();
             }
             if (!st.ok()) {
                 LOG_EVERY_N(WARNING, 100) << "Write data to file cache failed. err=" << st.msg();
             } else {
+                // 成功写入后，插入到文件读取器映射中（用于后续直接读取）
                 _insert_file_reader(block);
             }
             stats.bytes_write_into_file_cache += block_size;
         }
-        // copy from memory directly
+        // 如果请求的数据范围与远程读取的数据范围有交集，直接从内存缓冲区复制
         size_t right_offset = offset + bytes_req - 1;
         if (empty_start <= right_offset && empty_end >= offset + already_read && !is_dryrun) {
             size_t copy_left_offset = std::max(offset + already_read, empty_start);
@@ -460,29 +511,36 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
         }
     }
 
+    // ===== 阶段5：从缓存块或远程读取最终数据 =====
     size_t current_offset = offset;
     size_t end_offset = offset + bytes_req - 1;
     *bytes_read = 0;
+    // 遍历所有缓存块，按顺序读取所需数据
     for (auto& block : holder.file_blocks) {
         if (current_offset > end_offset) {
             break;
         }
         size_t left = block->range().left;
         size_t right = block->range().right;
+        // 跳过不在请求范围内的块
         if (right < offset) {
             continue;
         }
+        // 计算从当前块需要读取的字节数
         size_t read_size =
                 end_offset > right ? right - current_offset + 1 : end_offset - current_offset + 1;
+        // 如果该块已经通过阶段4从内存缓冲区复制了数据，跳过
         if (empty_start <= left && right <= empty_end) {
             *bytes_read += read_size;
             current_offset = right + 1;
             continue;
         }
+        // 检查块状态
         FileBlock::State block_state = block->state();
         int64_t wait_time = 0;
         static int64_t max_wait_time = 10;
         TEST_SYNC_POINT_CALLBACK("CachedRemoteFileReader::max_wait_time", &max_wait_time);
+        // 如果块未下载完成，等待其他线程下载完成（最多等待10次）
         if (block_state != FileBlock::State::DOWNLOADED) {
             do {
                 SCOPED_RAW_TIMER(&stats.remote_wait_timer);
@@ -500,14 +558,16 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
         {
             Status st;
             /*
-             * If block_state == EMPTY, the thread reads the data from remote.
-             * If block_state == DOWNLOADED, when the cache file is deleted by the other process,
-             * the thread reads the data from remote too.
+             * 读取数据：
+             * - 如果block_state == DOWNLOADED：从缓存文件读取
+             * - 如果block_state == EMPTY：从远程文件读取（其他线程下载失败或缓存文件被删除）
              */
             if (block_state == FileBlock::State::DOWNLOADED) {
                 if (is_dryrun) [[unlikely]] {
+                    // 干运行模式：只统计
                     g_skip_local_cache_io_sum_bytes << read_size;
                 } else {
+                    // 从缓存文件读取数据
                     size_t file_offset = current_offset - left;
                     SCOPED_RAW_TIMER(&stats.local_read_timer);
                     st = block->read(Slice(result.data + (current_offset - offset), read_size),
@@ -515,6 +575,7 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
                     indirect_read_bytes += read_size;
                 }
             }
+            // 如果从缓存读取失败（如缓存文件被其他进程删除），回退到远程读取
             if (!st || block_state != FileBlock::State::DOWNLOADED) {
                 LOG(WARNING) << "Read data failed from file cache downloaded by others. err="
                              << st.msg() << ", block state=" << block_state;
@@ -522,6 +583,7 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
                 stats.hit_cache = false;
                 stats.from_peer_cache = false;
                 s3_read_counter << 1;
+                // 从远程文件系统直接读取
                 SCOPED_RAW_TIMER(&stats.remote_read_timer);
                 RETURN_IF_ERROR(_remote_file_reader->read_at(
                         current_offset, Slice(result.data + (current_offset - offset), read_size),
@@ -536,6 +598,7 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
     g_read_cache_indirect_bytes << indirect_read_bytes;
     g_read_cache_indirect_total_bytes << *bytes_read;
 
+    // 确保读取了请求的所有字节数
     DCHECK(*bytes_read == bytes_req);
     return Status::OK();
 }

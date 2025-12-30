@@ -155,40 +155,61 @@ public class HudiScanNode extends HiveScanNode {
         }
     }
 
+    /**
+     * 初始化 Hudi 扫描节点
+     * 
+     * 该方法负责初始化 Hudi 表扫描所需的各种组件和配置，包括：
+     * 1. 验证表类型和权限
+     * 2. 初始化基础配置（列过滤、后端策略、模式参数）
+     * 3. 设置 Hudi 客户端和表元数据
+     * 4. 处理增量读取配置
+     * 5. 确定查询时间点和表快照
+     * 6. 初始化列信息和文件系统视图
+     * 
+     * @throws UserException 当初始化过程中出现错误时抛出
+     */
     @Override
     protected void doInitialize() throws UserException {
+        // 1. 获取外部表对象并验证表类型
         ExternalTable table = (ExternalTable) desc.getTable();
         if (table.isView()) {
             throw new AnalysisException(
                     String.format("Querying external view '%s.%s' is not supported", table.getDbName(),
                             table.getName()));
         }
-        computeColumnsFilter();
-        initBackendPolicy();
-        initSchemaParams();
+        
+        // 2. 初始化基础配置
+        computeColumnsFilter();    // 计算列过滤器
+        initBackendPolicy();       // 初始化后端策略
+        initSchemaParams();        // 初始化模式参数
 
+        // 3. 设置 Hudi 客户端和表元数据
         hudiClient = hmsTable.getHudiClient();
-        hudiClient.reloadActiveTimeline();
-        basePath = hmsTable.getRemoteTable().getSd().getLocation();
-        inputFormat = hmsTable.getRemoteTable().getSd().getInputFormat();
-        serdeLib = hmsTable.getRemoteTable().getSd().getSerdeInfo().getSerializationLib();
+        hudiClient.reloadActiveTimeline();  // 重新加载活跃时间线
+        basePath = hmsTable.getRemoteTable().getSd().getLocation();  // 获取基础路径
+        inputFormat = hmsTable.getRemoteTable().getSd().getInputFormat();  // 获取输入格式
+        serdeLib = hmsTable.getRemoteTable().getSd().getSerdeInfo().getSerializationLib();  // 获取序列化库
 
+        // 4. 验证扫描参数，Hudi 表只支持增量读取
         if (scanParams != null && !scanParams.incrementalRead()) {
-            // Only support incremental read
+            // 只支持增量读取
             throw new UserException("Not support function '" + scanParams.getParamType() + "' in hudi table");
         }
+        
+        // 5. 处理增量读取配置
         if (incrementalRead) {
             if (isCowTable) {
                 try {
+                    // 检查是否为 RO 表（Read Optimized 表）
                     Map<String, String> serd = hmsTable.getRemoteTable().getSd().getSerdeInfo().getParameters();
                     if ("true".equals(serd.get("hoodie.query.as.ro.table"))
                             && hmsTable.getRemoteTable().getTableName().endsWith("_ro")) {
-                        // Incremental read RO table as RT table, I don't know why?
+                        // 将 RO 表作为 RT 表进行增量读取，原因未知
                         isCowTable = false;
                         LOG.warn("Execute incremental read on RO table: {}", hmsTable.getFullQualifiers());
                     }
                 } catch (Exception e) {
-                    // ignore
+                    // 忽略异常
                 }
             }
             if (incrementalRelation == null) {
@@ -196,16 +217,22 @@ public class HudiScanNode extends HiveScanNode {
             }
         }
 
+        // 6. 获取时间线和表快照
         timeline = hudiClient.getCommitsAndCompactionTimeline().filterCompletedInstants();
         TableSnapshot tableSnapshot = getQueryTableSnapshot();
+        
         if (tableSnapshot != null) {
+            // 如果指定了表快照，验证快照类型
             if (tableSnapshot.getType() == TableSnapshot.VersionType.VERSION) {
                 throw new UserException("Hudi does not support `FOR VERSION AS OF`, please use `FOR TIME AS OF`");
             }
+            // 格式化查询时间点，移除特殊字符
             queryInstant = tableSnapshot.getValue().replaceAll("[-: ]", "");
         } else {
+            // 如果没有指定快照，使用最新的完成实例
             Option<HoodieInstant> snapshotInstant = timeline.lastInstant();
             if (!snapshotInstant.isPresent()) {
+                // 如果没有可用的实例，设置空分区列表并返回
                 prunedPartitions = Collections.emptyList();
                 partitionInit = true;
                 return;
@@ -213,19 +240,21 @@ public class HudiScanNode extends HiveScanNode {
             queryInstant = snapshotInstant.get().requestedTime();
         }
 
+        // 7. 初始化列信息和模式
         HudiSchemaCacheValue hudiSchemaCacheValue = HudiUtils.getSchemaCacheValue(hmsTable, queryInstant);
         columnNames = hudiSchemaCacheValue.getSchema().stream().map(Column::getName).collect(Collectors.toList());
         columnTypes = hudiSchemaCacheValue.getColTypes();
 
+        // 8. 初始化文件系统视图
         fsView = Env.getCurrentEnv()
             .getExtMetaCacheMgr()
             .getFsViewProcessor(hmsTable.getCatalog())
             .getFsView(hmsTable.getDbName(), hmsTable.getName(), hudiClient);
-        // Todo: Get the current schema id of the table, instead of using -1.
-        // In Be Parquet/Rrc reader, if `current table schema id == current file schema id`, then its
-        // `table_info_node_ptr` will be `TableSchemaChangeHelper::ConstNode`. When using `ConstNode`,
-        // you need to pay special attention to the `case difference` between the `table column name`
-        // and `the file column name`.
+            
+        // TODO: 获取表的当前模式 ID，而不是使用 -1
+        // 在 BE 的 Parquet/Rc 读取器中，如果 `current table schema id == current file schema id`，
+        // 那么其 `table_info_node_ptr` 将是 `TableSchemaChangeHelper::ConstNode`。
+        // 使用 `ConstNode` 时，需要特别注意 `table column name` 和 `file column name` 之间的 `大小写差异`
         ExternalUtil.initSchemaInfo(params, -1L, table.getColumns());
     }
 

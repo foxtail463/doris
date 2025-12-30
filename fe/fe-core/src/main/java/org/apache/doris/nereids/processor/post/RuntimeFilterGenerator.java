@@ -106,14 +106,15 @@ public class RuntimeFilterGenerator extends PlanPostProcessor {
             return plan;
         }
 
+        // 先正常生成并下推 RF
         Plan result = plan.accept(this, ctx);
-        // try to push rf inside CTEProducer
-        // collect cteProducers
+        // 尝试将 RF 继续下推到 CTE Producer 内部
+        // 收集所有 CTEProducer
         RuntimeFilterContext rfCtx = ctx.getRuntimeFilterContext();
         Map<CTEId, PhysicalCTEProducer> cteProducerMap = plan.collect(PhysicalCTEProducer.class::isInstance)
                 .stream().collect(Collectors.toMap(p -> ((PhysicalCTEProducer) p).getCteId(),
                         p -> (PhysicalCTEProducer) p));
-        // collect cteConsumers which are RF targets
+        // 收集含有 RF 目标的 CTEConsumer 以及其关联的 RF/源表达式
         Map<CTEId, Set<PhysicalCTEConsumer>> cteIdToConsumersWithRF = Maps.newHashMap();
         Map<PhysicalCTEConsumer, Set<RuntimeFilter>> consumerToRFs = Maps.newHashMap();
         Map<PhysicalCTEConsumer, Set<Expression>> consumerToSrcExpression = Maps.newHashMap();
@@ -133,6 +134,7 @@ public class RuntimeFilterGenerator extends PlanPostProcessor {
         for (CTEId cteId : cteIdToConsumersWithRF.keySet()) {
             // if any consumer does not have RF, RF cannot be pushed down.
             // cteIdToConsumersWithRF.get(cteId).size() can not be 1, o.w. this cte will be inlined.
+            // 只有所有消费者都拥有 RF 且消费者数量≥2 时，才有必要向 Producer 下推
             if (ctx.getCteIdToConsumers().get(cteId).size() == cteIdToConsumersWithRF.get(cteId).size()
                         && cteIdToConsumersWithRF.get(cteId).size() >= 2) {
                 // check if there is a common srcExpr among all the consumers
@@ -164,6 +166,7 @@ public class RuntimeFilterGenerator extends PlanPostProcessor {
                         // the most right deep buildNode from rfsToPushDown is used as buildNode for pushDown rf
                         // since the srcExpr are the same, all buildNodes of rfToPushDown are in the same tree path
                         // the longest ancestors means its corresponding rf build node is the most right deep one.
+                        // 找到最“右深”的构建端 RF（相同源表达式意味着在同一路径上）
                         List<RuntimeFilter> rightDeepRfs = Lists.newArrayList();
                         List<Plan> rightDeepAncestors = rfsToPushDown.get(0).getBuilderNode().getAncestors();
                         int rightDeepAncestorsSize = rightDeepAncestors.size();
@@ -189,6 +192,7 @@ public class RuntimeFilterGenerator extends PlanPostProcessor {
                         }
                         Preconditions.checkArgument(rightDeepAncestors.contains(leftTop.getBuilderNode()));
                         // check nodes between right deep and left top are SPJ and not denied join and not mark join
+                        // 检查右深构建端到左上构建端路径上的节点是否合法（仅 SPJ 且不包含被禁用的 Join）
                         boolean valid = true;
                         for (Plan cursor : rightDeepAncestors) {
                             if (cursor.equals(leftTop.getBuilderNode())) {
@@ -213,6 +217,7 @@ public class RuntimeFilterGenerator extends PlanPostProcessor {
                         for (RuntimeFilter rfToPush : rightDeepRfs) {
                             Expression rightDeepTargetExpressionOnCTE = null;
                             int targetCount = rfToPush.getTargetExpressions().size();
+                            // 找到该 RF 在 CTEConsumer 上对应的目标表达式
                             for (int i = 0; i < targetCount; i++) {
                                 PhysicalRelation rel = rfToPush.getTargetScans().get(i);
                                 if (rel instanceof PhysicalCTEConsumer
@@ -229,6 +234,7 @@ public class RuntimeFilterGenerator extends PlanPostProcessor {
                                     cteProducerMap.get(cteId)
                             );
                             if (pushedDown) {
+                                // 已下推到 Producer，移除 Consumer 侧原有 RF
                                 rfCtx.removeFilter(
                                         rfToPush,
                                         rightDeepTargetExpressionOnCTE.getInputSlotExprIds().iterator().next());
@@ -242,57 +248,93 @@ public class RuntimeFilterGenerator extends PlanPostProcessor {
     }
 
     /**
-     * the runtime filter generator run at the phase of post process and plan translation of nereids planner.
-     * post process:
-     * first step: if encounter supported join type, generate nereids runtime filter for all the hash conjunctions
-     * and make association from exprId of the target slot references to the runtime filter. or delete the runtime
-     * filter whose target slot reference is one of the output slot references of the left child of the physical join as
-     * the runtime filter.
-     * second step: if encounter project, collect the association of its child and it for pushing down through
-     * the project node.
-     * plan translation:
-     * third step: generate nereids runtime filter target at scan node fragment.
-     * forth step: generate legacy runtime filter target and runtime filter at hash join node fragment.
-     * NOTICE: bottom-up travel the plan tree!!!
+     * 访问 PhysicalHashJoin 节点，为其生成运行时过滤器
+     * 
+     * 运行时过滤器生成器在 Nereids 优化器的后处理和计划翻译阶段运行。
+     * 
+     * 后处理阶段：
+     * 第一步：如果遇到支持的 join 类型，为所有 hash join 条件生成 Nereids 运行时过滤器，
+     * 并建立从目标 slot 引用的 exprId 到运行时过滤器的关联。或者删除那些目标 slot 引用
+     * 是物理 join 左子节点输出 slot 引用的运行时过滤器。
+     * 第二步：如果遇到 project 节点，收集其子节点和自身的关联，以便通过 project 节点下推。
+     * 
+     * 计划翻译阶段：
+     * 第三步：在扫描节点 fragment 生成 Nereids 运行时过滤器目标。
+     * 第四步：在 hash join 节点 fragment 生成传统运行时过滤器目标和运行时过滤器。
+     * 
+     * 注意：自底向上遍历计划树！！！
+     * 
+     * TODO: 当前支持 inner join、cross join、right outer join，未来将支持更多 join 类型。
      */
-    // TODO: current support inner join, cross join, right outer join, and will support more join type.
     @Override
     public PhysicalPlan visitPhysicalHashJoin(PhysicalHashJoin<? extends Plan, ? extends Plan> join,
             CascadesContext context) {
+        // 自底向上遍历：先访问右子节点（build side），再访问左子节点（probe side）
         join.right().accept(this, context);
         join.left().accept(this, context);
+        
+        // 检查是否应该为这个 join 生成运行时过滤器
+        // 如果 join 类型在拒绝列表中，或者是 mark join，则不生成 RF
         if (RuntimeFilterGenerator.DENIED_JOIN_TYPES.contains(join.getJoinType()) || join.isMarkJoin()) {
-            // do not generate RF on this join
             return join;
         }
+        
+        // 获取运行时过滤器上下文
         RuntimeFilterContext ctx = context.getRuntimeFilterContext();
+        // 获取会话变量允许的运行时过滤器类型列表
         List<TRuntimeFilterType> legalTypes = Arrays.stream(TRuntimeFilterType.values())
                 .filter(type -> ctx.getSessionVariable().allowedRuntimeFilterType(type))
                 .collect(Collectors.toList());
 
+        // 获取 hash join 的等值连接条件列表
         List<Expression> hashJoinConjuncts = join.getHashJoinConjuncts();
 
+        // 遍历每个 hash join 条件，为每个条件生成运行时过滤器
         for (int i = 0; i < hashJoinConjuncts.size(); i++) {
+            // 调整等值条件的左右顺序，确保左边是 probe side（左子节点），右边是 build side（右子节点）
             EqualPredicate equalTo = JoinUtils.swapEqualToForChildrenOrder(
                     (EqualPredicate) hashJoinConjuncts.get(i), join.left().getOutputSet());
+            
+            // 如果等值条件的两边都是唯一值，则不需要生成运行时过滤器
+            // 例如：T1 join T2 on T1.a=T2.a where T1.a=1 and T2.a=1
+            // 因为两边都是常量，运行时过滤器没有意义
             if (isUniqueValueEqualTo(join, equalTo)) {
                 continue;
             }
+            
+            // 为每个允许的运行时过滤器类型生成过滤器
             for (TRuntimeFilterType type : legalTypes) {
-                //bitmap rf is generated by nested loop join.
+                // BITMAP 类型的运行时过滤器由嵌套循环 join 生成，这里跳过
                 if (type == TRuntimeFilterType.BITMAP) {
                     continue;
                 }
+                
+                // 获取 build side（右子节点）的 NDV（不同值数量），用于评估过滤器效果
                 long buildSideNdv = getBuildSideNdv(join, equalTo);
+                
+                // 只有当等值条件左边（probe side）只包含一个 slot 时才生成运行时过滤器
+                // 这是因为运行时过滤器只能应用到单个列上
                 if (equalTo.left().getInputSlots().size() == 1) {
+                    // 创建下推上下文，包含生成运行时过滤器所需的所有信息
                     RuntimeFilterPushDownVisitor.PushDownContext pushDownContext =
                             RuntimeFilterPushDownVisitor.PushDownContext.createPushDownContextForHashJoin(
-                                    equalTo.right(), equalTo.left(), ctx, ctx.getRuntimeFilterIdGen(), type, join,
-                                    context.getStatementContext().isHasUnknownColStats(), buildSideNdv, i);
-                    // pushDownContext is not valid, if the target is an agg result.
-                    // Currently, we only apply RF on PhysicalScan. So skip this rf.
-                    // example: (select sum(x) as s from A) T join B on T.s=B.s
+                                    equalTo.right(),  // build side 表达式（源）
+                                    equalTo.left(),   // probe side 表达式（目标）
+                                    ctx,              // 运行时过滤器上下文
+                                    ctx.getRuntimeFilterIdGen(), // 运行时过滤器 ID 生成器
+                                    type,             // 过滤器类型
+                                    join,             // join 节点
+                                    context.getStatementContext().isHasUnknownColStats(), // 是否有未知列统计信息
+                                    buildSideNdv,     // build side 的 NDV
+                                    i);               // 连接条件的索引
+                    
+                    // 检查下推上下文是否有效
+                    // 如果目标是聚合结果，则下推上下文无效
+                    // 目前我们只在 PhysicalScan 上应用运行时过滤器，所以跳过这种情况
+                    // 例如：(select sum(x) as s from A) T join B on T.s=B.s
+                    // 在这种情况下，T.s 是聚合结果，不能应用运行时过滤器
                     if (pushDownContext.isValid()) {
+                        // 使用 RuntimeFilterPushDownVisitor 将运行时过滤器下推到扫描节点
                         join.accept(new RuntimeFilterPushDownVisitor(), pushDownContext);
                     }
                 }
@@ -302,29 +344,49 @@ public class RuntimeFilterGenerator extends PlanPostProcessor {
     }
 
     /**
-     *
-     * T1 join T1 on T1.a=T2.a where T1.a=1 and T2.a=1
-     * if T1.a = T2.a, no need to generate RF by "T1.a=T2.a"
-     *
-     * T1 join T1 on T1.a=T2.a where T1.a in (1, 2) and T2.a in (1, 2)
-     * in above case RF: T2.a->T1.a is generated, because the limitation of
-     * const propagation
+     * 检查等值条件的两边是否都是唯一值（uniform value）且相等
+     * 
+     * 如果等值条件的两边都是唯一值且相等，则不需要生成运行时过滤器，因为：
+     * 1. 唯一值意味着该列在整个表中只有一个值
+     * 2. 如果两边的唯一值相等，连接条件总是为真，运行时过滤器没有过滤效果
+     * 
+     * 示例1（不需要生成 RF）：
+     * T1 join T2 on T1.a=T2.a where T1.a=1 and T2.a=1
+     * 如果 T1.a 和 T2.a 都是唯一值且相等（都是1），则不需要为 "T1.a=T2.a" 生成运行时过滤器
+     * 
+     * 示例2（需要生成 RF）：
+     * T1 join T2 on T1.a=T2.a where T1.a in (1, 2) and T2.a in (1, 2)
+     * 在上面的情况下，由于常量传播的限制，T1.a 和 T2.a 可能不是唯一值，
+     * 所以仍然会生成运行时过滤器 RF: T2.a->T1.a
+     * 
+     * @param join hash join 节点
+     * @param equalTo 等值条件表达式
+     * @return 如果两边都是唯一值且相等，返回 true，表示不需要生成运行时过滤器；否则返回 false
      */
     private boolean isUniqueValueEqualTo(PhysicalHashJoin<? extends Plan, ? extends Plan> join,
                                          EqualPredicate equalTo) {
+        // 只有当等值条件的两边都是 Slot 类型时，才能检查唯一值
         if (equalTo.left() instanceof Slot && equalTo.right() instanceof Slot) {
+            // 获取左子节点（probe side）对应 slot 的唯一值
+            // uniform value 表示该列在整个表中只有一个值（例如：常量、唯一键等）
             Optional<Expression> leftValue = join.left().getLogicalProperties()
                     .getTrait().getUniformValue((Slot) equalTo.left());
+            // 获取右子节点（build side）对应 slot 的唯一值
             Optional<Expression> rightValue = join.right().getLogicalProperties()
                     .getTrait().getUniformValue((Slot) equalTo.right());
+            
+            // 检查是否成功获取到两边的唯一值
             if (leftValue != null && rightValue != null) {
+                // 如果两边都有唯一值（Optional.isPresent() 为 true）
                 if (leftValue.isPresent() && rightValue.isPresent()) {
+                    // 如果两边的唯一值相等，则不需要生成运行时过滤器
                     if (leftValue.get().equals(rightValue.get())) {
                         return true;
                     }
                 }
             }
         }
+        // 如果两边不是 Slot，或者没有唯一值，或者唯一值不相等，则需要生成运行时过滤器
         return false;
     }
 

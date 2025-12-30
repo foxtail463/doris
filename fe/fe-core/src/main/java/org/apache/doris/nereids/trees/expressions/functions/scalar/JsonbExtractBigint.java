@@ -77,6 +77,19 @@ public class JsonbExtractBigint extends ScalarFunction
         return visitor.visitJsonbExtractBigint(this, context);
     }
 
+    /**
+     * 在分析阶段重写表达式。
+     * <p>
+     * 将 jsonb_extract_bigint 重写为 jsonb_extract + Cast 的组合：
+     * <ol>
+     *   <li>首先调用 jsonb_extract 提取 JSON 值（返回 JSON 类型）</li>
+     *   <li>然后将结果转换为 BigInt 类型</li>
+     * </ol>
+     * <p>
+     * 这样可以将类型特定的提取函数统一为通用的 jsonb_extract + 类型转换的模式。
+     *
+     * @return 重写后的表达式：Cast(JsonbExtract(...), BigIntType)
+     */
     @Override
     public Expression rewriteWhenAnalyze() {
         JsonbExtract jsonExtract = new JsonbExtract(children.get(0), children.get(1));

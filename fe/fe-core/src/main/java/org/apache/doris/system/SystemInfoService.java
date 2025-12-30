@@ -499,15 +499,15 @@ public class SystemInfoService {
     }
 
     /**
-     * Select a set of backends for replica creation.
-     * The following parameters need to be considered when selecting backends.
+     * 为副本创建选择一组后端节点。
+     * 选择后端节点时需要考虑以下参数。
      *
-     * @param replicaAlloc
-     * @param nextIndexs create tablet round robin next be index, when enable_round_robin_create_tablet
-     * @param storageMedium
-     * @param isStorageMediumSpecified
-     * @param isOnlyForCheck set true if only used for check available backend
-     * @return return the selected backend ids group by tag.
+     * @param replicaAlloc 副本分配策略，指定每个标签需要多少个副本
+     * @param nextIndexs 创建tablet时的轮询索引，当启用enable_round_robin_create_tablet时使用
+     * @param storageMedium 期望的存储介质类型
+     * @param isStorageMediumSpecified 存储介质是否被明确指定
+     * @param isOnlyForCheck 如果仅用于检查可用后端则设为true
+     * @return 返回按标签分组的已选择后端ID，以及实际使用的存储介质
      * @throws DdlException
      */
     public Pair<Map<Tag, List<Long>>, TStorageMedium> selectBackendIdsForReplicaCreation(
@@ -515,50 +515,74 @@ public class SystemInfoService {
             TStorageMedium storageMedium, boolean isStorageMediumSpecified,
             boolean isOnlyForCheck)
             throws DdlException {
+        // 获取集群中所有后端节点的副本，避免并发修改
         Map<Long, Backend> copiedBackends = Maps.newHashMap(getAllClusterBackendsNoException());
+        // 存储每个标签选择的后端ID
         Map<Tag, List<Long>> chosenBackendIds = Maps.newHashMap();
+        // 获取副本分配映射：标签 -> 副本数量
         Map<Tag, Short> allocMap = replicaAlloc.getAllocMap();
         short totalReplicaNum = 0;
 
+        // 统计存活的后端节点数量
         int aliveBackendNum = (int) copiedBackends.values().stream().filter(Backend::isAlive).count();
+        // 检查存活节点数量是否足够创建所需副本
         if (aliveBackendNum < replicaAlloc.getTotalReplicaNum()) {
             throw new DdlException("replication num should be less than the number of available backends. "
                     + "replication num is " + replicaAlloc.getTotalReplicaNum()
                     + ", available backend num is " + aliveBackendNum);
         } else {
+            // 记录失败的副本分配信息
             List<String> failedEntries = Lists.newArrayList();
 
+            // 遍历每个标签的副本分配需求
             for (Map.Entry<Tag, Short> entry : allocMap.entrySet()) {
                 Tag tag = entry.getKey();
+                // 构建后端选择策略
                 BeSelectionPolicy.Builder builder = new BeSelectionPolicy.Builder()
-                        .needScheduleAvailable().needCheckDiskUsage().addTags(Sets.newHashSet(entry.getKey()))
-                        .setStorageMedium(storageMedium);
+                        .needScheduleAvailable()        // 需要可调度的节点
+                        .needCheckDiskUsage()          // 需要检查磁盘使用情况
+                        .addTags(Sets.newHashSet(entry.getKey()))  // 添加标签约束
+                        .setStorageMedium(storageMedium);          // 设置存储介质
+                
+                // 在测试环境或允许同主机副本时，允许在同一主机上创建副本
                 if (FeConstants.runningUnitTest || Config.allow_replica_on_same_host) {
                     builder.allowOnSameHost();
                 }
+                
+                // 如果启用轮询创建tablet，设置轮询索引
                 if (Config.enable_round_robin_create_tablet) {
                     builder.setEnableRoundRobin(true);
                     builder.setNextRoundRobinIndex(nextIndexs.getOrDefault(tag, -1));
                 }
 
+                // 根据策略选择后端节点
                 BeSelectionPolicy policy = builder.build();
                 List<Long> beIds = selectBackendIdsByPolicy(policy, entry.getValue());
-                // first time empty, retry with different storage medium
-                // if only for check, no need to retry different storage medium to get backend
+                
+                // 【关键逻辑】第一次选择失败时，尝试使用不同的存储介质
+                // 如果仅用于检查，不需要重试不同存储介质
                 TStorageMedium originalStorageMedium = storageMedium;
                 if (beIds.isEmpty() && storageMedium != null && !isStorageMediumSpecified && !isOnlyForCheck) {
+                    // 存储介质切换：HDD <-> SSD
                     storageMedium = (storageMedium == TStorageMedium.HDD) ? TStorageMedium.SSD : TStorageMedium.HDD;
                     builder.setStorageMedium(storageMedium);
+                    
+                    // 重新设置轮询索引
                     if (Config.enable_round_robin_create_tablet) {
                         builder.setNextRoundRobinIndex(nextIndexs.getOrDefault(tag, -1));
                     }
+                    
+                    // 使用新存储介质重新选择后端节点
                     policy = builder.build();
                     beIds = selectBackendIdsByPolicy(policy, entry.getValue());
                 }
+                
+                // 更新轮询索引
                 if (Config.enable_round_robin_create_tablet) {
                     nextIndexs.put(tag, policy.nextRoundRobinIndex);
                 }
-                // after retry different storage medium, it's still empty
+                
+                // 即使切换存储介质后仍然没有找到合适的后端节点
                 if (beIds.isEmpty()) {
                     LOG.error("failed backend(s) for policy: {} real medium {}", policy, originalStorageMedium);
                     String errorReplication = "replication tag: " + entry.getKey()
@@ -566,11 +590,13 @@ public class SystemInfoService {
                             + ", storage medium: " + originalStorageMedium;
                     failedEntries.add(errorReplication);
                 } else {
+                    // 成功选择后端节点，记录结果
                     chosenBackendIds.put(entry.getKey(), beIds);
                     totalReplicaNum += beIds.size();
                 }
             }
 
+            // 如果有失败的副本分配，抛出异常
             if (!failedEntries.isEmpty()) {
                 String failedMsg = Joiner.on("\n").join(failedEntries);
                 throw new DdlException("Failed to find enough backend, please check the replication num,"
@@ -580,6 +606,7 @@ public class SystemInfoService {
             }
         }
 
+        // 验证总副本数量是否正确
         Preconditions.checkState(totalReplicaNum == replicaAlloc.getTotalReplicaNum());
         return Pair.of(chosenBackendIds, storageMedium);
     }
@@ -612,8 +639,10 @@ public class SystemInfoService {
             List<Backend> backendList) {
         Preconditions.checkArgument(number >= -1);
 
+        // 根据策略从输入后端列表中过滤得到候选后端
         List<Backend> candidates = policy.getCandidateBackends(backendList);
 
+        // 候选数不足或为空，直接返回空列表，表示不满足策略要求
         if (candidates.size() < number || candidates.isEmpty()) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Not match policy: {}. candidates num: {}, expected: {}", policy, candidates.size(), number);
@@ -621,7 +650,7 @@ public class SystemInfoService {
             return Lists.newArrayList();
         }
 
-        // If only need one Backend, just return a random one.
+        // 若只需要 1 个后端且不启用轮询，随机返回一个即可
         if (number == 1 && !policy.enableRoundRobin) {
             Collections.shuffle(candidates);
             return Lists.newArrayList(candidates.get(0).getId());
@@ -629,7 +658,7 @@ public class SystemInfoService {
 
         boolean hasSameHost = false;
         if (!policy.allowOnSameHost) {
-            // for each host, random select one backend.
+            // 不允许同主机时：按 host 分组，每个主机随机挑选一个后端，避免同一主机被重复选择
             Map<String, List<Backend>> backendMaps = Maps.newHashMap();
             for (Backend backend : candidates) {
                 if (backendMaps.containsKey(backend.getHost())) {
@@ -641,16 +670,18 @@ public class SystemInfoService {
                 }
             }
 
+            // 重建候选列表：每个主机最多保留一个后端
             candidates.clear();
             for (List<Backend> list : backendMaps.values()) {
                 if (list.size() > 1) {
-                    Collections.shuffle(list);
-                    hasSameHost = true;
+                    Collections.shuffle(list); // 同一主机多个后端随机化
+                    hasSameHost = true;        // 标记存在同主机候选
                 }
                 candidates.add(list.get(0));
             }
         }
 
+        // 再次校验数量是否足够
         if (candidates.size() < number) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Not match policy: {}. candidates num: {}, expected: {}", policy, candidates.size(), number);
@@ -659,18 +690,21 @@ public class SystemInfoService {
         }
 
         if (policy.enableRoundRobin) {
+            // 启用轮询：根据是否允许同主机，选择不同的排序维度
             if (!policy.allowOnSameHost && hasSameHost) {
-                // not allow same host and has same host,
-                // then we compare them with their host
+                // 不允许同主机且存在同主机候选时，按 host 排序，保证轮询在主机维度均衡
                 Collections.sort(candidates, new BeHostComparator());
             } else {
+                // 允许同主机或不存在同主机冲突时，按 BE id 排序，保证轮询稳定顺序
                 Collections.sort(candidates, new BeIdComparator());
             }
 
+            // 初始化轮询起点索引（如未设置则随机起点）
             if (policy.nextRoundRobinIndex < 0) {
                 policy.nextRoundRobinIndex = new SecureRandom().nextInt(candidates.size());
             }
 
+            // 计算实际起点，按轮询顺序构建偏序列表
             int realIndex = policy.nextRoundRobinIndex % candidates.size();
             List<Long> partialOrderList = new ArrayList<Long>();
             partialOrderList.addAll(candidates.subList(realIndex, candidates.size())
@@ -678,11 +712,14 @@ public class SystemInfoService {
             partialOrderList.addAll(candidates.subList(0, realIndex)
                     .stream().map(Backend::getId).collect(Collectors.toList()));
 
+            // 截取需要的数量；若为 -1 则返回全部
             List<Long> result = number == -1 ? partialOrderList : partialOrderList.subList(0, number);
+            // 推进轮询索引，确保下次选择从下一个位置开始
             policy.nextRoundRobinIndex = realIndex + result.size();
 
             return result;
         } else {
+            // 未启用轮询：打乱候选后按需返回
             Collections.shuffle(candidates);
             if (number != -1) {
                 return candidates.subList(0, number).stream().map(Backend::getId).collect(Collectors.toList());

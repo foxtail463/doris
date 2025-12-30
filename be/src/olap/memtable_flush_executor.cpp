@@ -182,74 +182,162 @@ Status FlushToken::_try_reserve_memory(const std::shared_ptr<ResourceContext>& r
 }
 
 Status FlushToken::_do_flush_memtable(MemTable* memtable, int32_t segment_id, int64_t* flush_size) {
+    // 记录刷新开始的详细信息：包含tablet ID、内存大小和行数
+    // 这些信息用于性能监控和问题诊断，便于追踪特定tablet的刷新性能
     VLOG_CRITICAL << "begin to flush memtable for tablet: " << memtable->tablet_id()
                   << ", memsize: " << PrettyPrinter::print_bytes(memtable->memory_usage())
                   << ", rows: " << memtable->stat().raw_rows;
+    
+    // 更新内存表状态为"刷新中"：表示内存表正在进行刷新操作
+    // 这个状态变化用于跟踪内存表的生命周期，防止在刷新过程中进行其他操作
     memtable->update_mem_type(MemType::FLUSH);
+    
+    // 声明持续时间变量：用于记录刷新操作的实际执行时间
+    // 这个时间不包含等待时间，只包含实际的刷新操作耗时
     int64_t duration_ns = 0;
+    
+    // 性能监控和资源管理的作用域块
     {
+        // 开始性能计时：记录刷新操作的精确执行时间
+        // 使用纳秒级精度，提供高精度的性能数据
         SCOPED_RAW_TIMER(&duration_ns);
+        
+        // 附加任务上下文：将当前刷新任务与资源上下文关联
+        // 用于资源跟踪和限制，确保任务在正确的资源上下文中执行
         SCOPED_ATTACH_TASK(memtable->resource_ctx());
+        
+        // 切换线程内存跟踪器：使用写入跟踪器监控内存使用
+        // 这有助于区分刷新操作和其他操作的内存使用情况
         SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(
                 memtable->resource_ctx()->memory_context()->mem_tracker()->write_tracker());
+        
+        // 消费内存跟踪器：记录当前刷新操作的内存消耗
+        // 用于内存使用统计和限制，防止内存过度使用
         SCOPED_CONSUME_MEM_TRACKER(memtable->mem_tracker());
 
+        // 延迟释放预留内存：确保在刷新过程中有足够的内存
+        // 这是一个防御性措施，防止内存不足导致的刷新失败
         DEFER_RELEASE_RESERVED();
 
+        // 获取刷新所需的内存大小：计算刷新操作需要预留的内存
+        // 这个大小通常基于内存表的数据量和刷新算法的需求
         auto reserve_size = memtable->get_flush_reserve_memory_size();
+        
+        // 内存预留检查：如果启用了内存预留且需要预留内存，则尝试预留
+        // 内存预留机制确保刷新操作有足够的内存资源，提高成功率
         if (memtable->resource_ctx()->task_controller()->is_enable_reserve_memory() &&
             reserve_size > 0) {
             RETURN_IF_ERROR(_try_reserve_memory(memtable->resource_ctx(), reserve_size));
         }
 
+        // 延迟清理函数：在刷新完成后减少刷新任务计数
+        // 使用RAII模式确保计数正确更新，即使发生异常也能执行清理
         Defer defer {[&]() {
             ExecEnv::GetInstance()->storage_engine().memtable_flush_executor()->dec_flushing_task();
         }};
+        
+        // 数据转换：将内存表转换为数据块格式
+        // 这是刷新过程的关键步骤，将内存中的数据结构转换为可序列化的格式
         std::unique_ptr<vectorized::Block> block;
         RETURN_IF_ERROR(memtable->to_block(&block));
+        
+        // 核心刷新操作：调用RowsetWriter将数据块写入磁盘
+        // 这是真正的磁盘写入操作，包含数据序列化、文件写入和索引构建
         RETURN_IF_ERROR(_rowset_writer->flush_memtable(block.get(), segment_id, flush_size));
+        
+        // 标记刷新成功：更新内存表状态，表示刷新操作已完成
+        // 这个状态变化用于后续的资源清理和内存表重用
         memtable->set_flush_success();
     }
+    
+    // 统计信息更新：累加内存表的统计信息到总统计中
+    // 这些统计信息用于系统性能分析和监控
     _memtable_stat += memtable->stat();
+    
+    // 全局指标更新：增加刷新总数计数
+    // 用于监控系统的整体刷新性能和负载情况
     DorisMetrics::instance()->memtable_flush_total->increment(1);
+    
+    // 全局指标更新：累加刷新持续时间（微秒）
+    // 用于分析刷新操作的性能趋势和瓶颈
     DorisMetrics::instance()->memtable_flush_duration_us->increment(duration_ns / 1000);
+    
+    // 记录刷新完成的详细信息：包含tablet ID和刷新后的磁盘大小
+    // 这些信息用于验证刷新结果和性能分析
     VLOG_CRITICAL << "after flush memtable for tablet: " << memtable->tablet_id()
                   << ", flushsize: " << PrettyPrinter::print_bytes(*flush_size);
+    
+    // 返回成功状态：表示刷新操作已成功完成
     return Status::OK();
 }
 
 void FlushToken::_flush_memtable(std::shared_ptr<MemTable> memtable_ptr, int32_t segment_id,
                                  int64_t submit_task_time) {
+    // 设置信号任务ID：将当前刷新任务与特定的加载任务关联
+    // 用于任务跟踪和调试，便于识别刷新任务属于哪个加载操作
     signal::set_signal_task_id(_rowset_writer->load_id());
+    
+    // 设置tablet ID：记录当前刷新的tablet标识
+    // 用于日志记录和性能监控，便于追踪特定tablet的刷新性能
     signal::tablet_id = memtable_ptr->tablet_id();
+    
+    // 延迟清理函数：在函数退出时自动执行清理操作
+    // 使用RAII模式确保资源正确释放，即使发生异常也能执行清理
     Defer defer {[&]() {
         std::lock_guard<std::mutex> lock(_mutex);
+        
+        // 减少提交任务计数：表示一个提交的任务开始执行
         _stats.flush_submit_count--;
+        // 如果所有提交的任务都开始执行，通知等待线程
         if (_stats.flush_submit_count == 0) {
             _submit_task_finish_cond.notify_one();
         }
+        
+        // 减少运行任务计数：表示一个运行的任务完成
         _stats.flush_running_count--;
+        // 如果所有运行的任务都完成，通知等待线程
         if (_stats.flush_running_count == 0) {
             _running_task_finish_cond.notify_one();
         }
     }};
+    
+    // 调试模式：在第一次关闭检查前等待10秒
+    // 用于测试关闭逻辑和超时机制
     DBUG_EXECUTE_IF("FlushToken.flush_memtable.wait_before_first_shutdown",
                     { std::this_thread::sleep_for(std::chrono::milliseconds(10 * 1000)); });
+    
+    // 第一次关闭检查：如果刷新令牌已关闭，直接返回
+    // 避免在已关闭的令牌上执行刷新操作
     if (_is_shutdown()) {
         return;
     }
+    
+    // 调试模式：在第一次关闭检查后等待10秒
+    // 用于测试关闭检查的时序
     DBUG_EXECUTE_IF("FlushToken.flush_memtable.wait_after_first_shutdown",
                     { std::this_thread::sleep_for(std::chrono::milliseconds(10 * 1000)); });
+    
+    // 增加运行任务计数：表示当前任务开始运行
     _stats.flush_running_count++;
-    // double check if shutdown to avoid wait running task finish count not accurate
+    
+    // 双重关闭检查：再次检查是否已关闭，确保计数准确性
+    // 这是因为在第一次检查和增加计数之间可能发生关闭操作
     if (_is_shutdown()) {
         return;
     }
+    
+    // 调试模式：在第二次关闭检查后等待10秒
+    // 用于测试双重关闭检查的逻辑
     DBUG_EXECUTE_IF("FlushToken.flush_memtable.wait_after_second_shutdown",
                     { std::this_thread::sleep_for(std::chrono::milliseconds(10 * 1000)); });
+    
+    // 计算刷新等待时间：从任务提交到开始执行的时间间隔
+    // 用于监控刷新任务的调度延迟，识别系统瓶颈
     uint64_t flush_wait_time_ns = MonotonicNanos() - submit_task_time;
     _stats.flush_wait_time_ns += flush_wait_time_ns;
-    // If previous flush has failed, return directly
+    
+    // 检查刷新状态：如果之前的刷新已失败，直接返回
+    // 使用共享锁读取状态，避免阻塞其他读取操作
     {
         std::shared_lock rdlk(_flush_status_lock);
         if (!_flush_status.ok()) {
@@ -257,27 +345,37 @@ void FlushToken::_flush_memtable(std::shared_ptr<MemTable> memtable_ptr, int32_t
         }
     }
 
+    // 开始性能计时：记录刷新操作的执行时间
     MonotonicStopWatch timer;
     timer.start();
+    
+    // 记录内存使用量：用于统计和监控内存使用情况
     size_t memory_usage = memtable_ptr->memory_usage();
 
+    // 执行实际的刷新操作：将内存表数据写入磁盘
+    // 这是整个刷新过程的核心，包含数据序列化和文件写入
     int64_t flush_size;
     Status s = _do_flush_memtable(memtable_ptr.get(), segment_id, &flush_size);
 
+    // 再次检查刷新状态：确保在刷新过程中没有发生状态变化
     {
         std::shared_lock rdlk(_flush_status_lock);
         if (!_flush_status.ok()) {
             return;
         }
     }
+    
+    // 错误处理：如果刷新失败，更新状态并记录错误日志
     if (!s.ok()) {
-        std::lock_guard wrlk(_flush_status_lock);
+        std::lock_guard wrlk(_flush_status_lock);  // 使用写锁更新状态
         LOG(WARNING) << "Flush memtable failed with res = " << s
                      << ", load_id: " << print_id(_rowset_writer->load_id());
-        _flush_status = s;
+        _flush_status = s;  // 更新刷新状态为失败状态
         return;
     }
 
+    // 记录详细的刷新统计信息：包含等待时间、执行时间、各种计数和大小信息
+    // 这些信息用于性能分析和系统监控
     VLOG_CRITICAL << "flush memtable wait time: "
                   << PrettyPrinter::print(flush_wait_time_ns, TUnit::TIME_NS)
                   << ", flush memtable cost: "
@@ -287,10 +385,12 @@ void FlushToken::_flush_memtable(std::shared_ptr<MemTable> memtable_ptr, int32_t
                   << ", finish count: " << _stats.flush_finish_count
                   << ", mem size: " << PrettyPrinter::print_bytes(memory_usage)
                   << ", disk size: " << PrettyPrinter::print_bytes(flush_size);
-    _stats.flush_time_ns += timer.elapsed_time();
-    _stats.flush_finish_count++;
-    _stats.flush_size_bytes += memtable_ptr->memory_usage();
-    _stats.flush_disk_size_bytes += flush_size;
+    
+    // 更新统计信息：累加各种性能指标
+    _stats.flush_time_ns += timer.elapsed_time();           // 累加刷新执行时间
+    _stats.flush_finish_count++;                           // 增加完成刷新计数
+    _stats.flush_size_bytes += memtable_ptr->memory_usage(); // 累加刷新内存大小
+    _stats.flush_disk_size_bytes += flush_size;            // 累加刷新磁盘大小
 }
 
 void MemTableFlushExecutor::init(int num_disk) {

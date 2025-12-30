@@ -483,38 +483,77 @@ Status Tablet::revise_tablet_meta(const std::vector<RowsetSharedPtr>& to_add,
     return Status::OK();
 }
 
+/**
+ * 向tablet中添加新的行集（rowset）
+ * 这是tablet版本管理的核心方法，负责新行集的注册、版本冲突检测和旧行集清理
+ * 
+ * @param rowset 要添加的行集指针
+ * @return 添加结果状态
+ */
 Status Tablet::add_rowset(RowsetSharedPtr rowset) {
+    // 断言检查：确保行集指针不为空
     DCHECK(rowset != nullptr);
+    
+    // 获取写锁：保护tablet元数据的并发访问
+    // 使用shared_mutex支持读写锁，提高并发性能
     std::lock_guard<std::shared_mutex> wrlock(_meta_lock);
+    
+    // 性能跟踪：如果锁定时间超过阈值，记录跟踪信息
     SCOPED_SIMPLE_TRACE_IF_TIMEOUT(TRACE_TABLET_LOCK_THRESHOLD);
-    // If the rowset already exist, just return directly.  The rowset_id is an unique-id,
-    // we can use it to check this situation.
+    
+    // 重复检查：如果行集已经存在，直接返回成功
+    // rowset_id是唯一标识符，可以用来检测重复添加的情况
     if (_contains_rowset(rowset->rowset_id())) {
         return Status::OK();
     }
-    // Otherwise, the version should be not contained in any existing rowset.
+    
+    // 版本冲突检查：确保新行集的版本不与现有行集冲突
+    // 版本冲突可能导致数据不一致或查询错误
     RETURN_IF_ERROR(_contains_version(rowset->version()));
 
+    // 将行集元数据添加到tablet元数据中
+    // 这确保了行集信息被持久化到磁盘
     RETURN_IF_ERROR(_tablet_meta->add_rs_meta(rowset->rowset_meta()));
+    
+    // 将行集添加到版本映射表中：版本 -> 行集
+    // 这是tablet版本管理的核心数据结构
     _rs_version_map[rowset->version()] = rowset;
+    
+    // 向时间戳版本跟踪器添加新版本
+    // 用于支持基于时间戳的查询优化和垃圾回收
     _timestamped_version_tracker.add_version(rowset->version());
+    
+    // 添加合并分数：用于后续的compaction决策
+    // 分数越高，越优先进行合并操作
     add_compaction_score(rowset->rowset_meta()->get_compaction_score());
 
+    // 检测并收集需要删除的旧行集
+    // 当新行集的版本范围完全包含旧行集时，旧行集可以被删除
     std::vector<RowsetSharedPtr> rowsets_to_delete;
-    // yiguolei: temp code, should remove the rowset contains by this rowset
-    // but it should be removed in multi path version
+    
+    // 遍历所有现有的行集，检查版本包含关系
     for (auto& it : _rs_version_map) {
+        // 检查新行集是否包含旧行集的版本，且不是同一个版本
         if (rowset->version().contains(it.first) && rowset->version() != it.first) {
+            // 断言检查：确保旧行集指针不为空
             CHECK(it.second != nullptr)
                     << "there exist a version=" << it.first
                     << " contains the input rs with version=" << rowset->version()
                     << ", but the related rs is null";
+            
+            // 将需要删除的行集添加到列表中
             rowsets_to_delete.push_back(it.second);
         }
     }
+    
+    // 执行行集修改操作：删除被包含的旧行集
+    // 第一个参数是空向量（不添加新行集），第二个参数是要删除的行集列表
     std::vector<RowsetSharedPtr> empty_vec;
     RETURN_IF_ERROR(modify_rowsets(empty_vec, rowsets_to_delete));
+    
+    // 更新新创建行集的计数器：用于统计和监控
     ++_newly_created_rowset_num;
+    
     return Status::OK();
 }
 
@@ -1915,25 +1954,53 @@ void Tablet::execute_compaction(CompactionMixin& compaction) {
     }
 }
 
+/**
+ * 创建tablet的初始行集（Rowset）
+ * 为新创建的tablet生成一个空的初始版本，用于初始化tablet的版本管理
+ * @param req_version 请求的版本号，必须大于等于1
+ * @return 创建结果状态
+ */
 Status Tablet::create_initial_rowset(const int64_t req_version) {
+    // 验证版本号的有效性：初始版本必须大于等于1
     if (req_version < 1) {
         return Status::Error<CE_CMD_PARAMS_ERROR>(
                 "init version of tablet should at least 1. req.ver={}", req_version);
     }
+    
+    // 创建版本对象：从0到req_version的版本范围
+    // 初始行集通常覆盖从0开始的版本范围
     Version version(0, req_version);
+    
+    // 新创建的行集指针
     RowsetSharedPtr new_rowset;
-    // there is no data in init rowset, so overlapping info is unknown.
+    
+    // 由于初始行集中没有实际数据，所以重叠信息是未知的
+    // 创建行集写入上下文
     RowsetWriterContext context;
-    context.version = version;
-    context.rowset_state = VISIBLE;
-    context.segments_overlap = OVERLAP_UNKNOWN;
-    context.tablet_schema = tablet_schema();
-    context.newest_write_timestamp = UnixSeconds();
+    context.version = version;                    // 设置版本信息
+    context.rowset_state = VISIBLE;              // 设置行集状态为可见
+    context.segments_overlap = OVERLAP_UNKNOWN;  // 设置段重叠信息为未知
+    context.tablet_schema = tablet_schema();     // 设置tablet的schema
+    context.newest_write_timestamp = UnixSeconds(); // 设置最新写入时间戳
+    
+    // 创建行集写入器，用于构建行集
+    // 第二个参数false表示不启用内存优化
     auto rs_writer = DORIS_TRY(create_rowset_writer(context, false));
+    
+    // 刷新写入器，确保所有数据都写入磁盘
     RETURN_IF_ERROR(rs_writer->flush());
+    
+    // 构建行集对象
     RETURN_IF_ERROR(rs_writer->build(new_rowset));
+    
+    // 将新创建的行集添加到tablet中
+    // 使用std::move避免不必要的拷贝
     RETURN_IF_ERROR(add_rowset(std::move(new_rowset)));
+    
+    // 设置累积层点（cumulative layer point）
+    // 下一个版本将从req_version + 1开始
     set_cumulative_layer_point(req_version + 1);
+    
     return Status::OK();
 }
 

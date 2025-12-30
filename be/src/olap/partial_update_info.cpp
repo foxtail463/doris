@@ -364,14 +364,41 @@ Status FixedReadPlan::read_columns_by_plan(
     return Status::OK();
 }
 
+/**
+ * FixedReadPlan::fill_missing_columns：在固定部分更新场景下，填充缺失列的值
+ * 
+ * 功能说明：
+ * 在固定部分更新（UPDATE_FIXED_COLUMNS）模式下，用户只更新部分列（update_cids），
+ * 缺失列（missing_cids）的值需要从历史数据中读取，或者使用默认值。
+ * 
+ * 主要流程：
+ * 1. 准备缺失列的旧值 Block（从历史数据中读取）
+ * 2. 生成默认值 Block（用于新行或删除的行）
+ * 3. 对每行数据，根据 use_default_or_null_flag 和删除标记，决定使用旧值还是默认值
+ * 
+ * @param rowset_ctx Rowset 写入上下文，包含部分更新信息
+ * @param rsid_to_rowset Rowset ID 到 Rowset 的映射，用于读取历史数据
+ * @param tablet_schema Tablet Schema
+ * @param full_block 完整的 Block（输出），包含所有列的数据
+ * @param use_default_or_null_flag 每行是否应该使用默认值（true）还是旧值（false）
+ * @param has_default_or_nullable 是否有默认值或可空列
+ * @param segment_start_pos Segment 中的起始位置
+ * @param block 输入的 Block，包含部分更新的数据（update_cids）
+ * @return 操作状态
+ */
 Status FixedReadPlan::fill_missing_columns(
         RowsetWriterContext* rowset_ctx, const std::map<RowsetId, RowsetSharedPtr>& rsid_to_rowset,
         const TabletSchema& tablet_schema, vectorized::Block& full_block,
         const std::vector<bool>& use_default_or_null_flag, bool has_default_or_nullable,
         uint32_t segment_start_pos, const vectorized::Block* block) const {
+    // 1. 获取完整 Block 的可变列引用（用于填充数据）
     auto mutable_full_columns = full_block.mutate_columns();
-    // create old value columns
+    
+    // 2. 获取缺失列的列 ID 列表（不在部分更新中的列）
     const auto& missing_cids = rowset_ctx->partial_update_info->missing_cids;
+    
+    // 3. 检查输入数据中是否包含序列列
+    // 序列列用于去重，如果输入数据中包含序列列，需要特殊处理
     bool have_input_seq_column = false;
     if (tablet_schema.has_sequence_col()) {
         const std::vector<uint32_t>& including_cids = rowset_ctx->partial_update_info->update_cids;
@@ -380,61 +407,79 @@ Status FixedReadPlan::fill_missing_columns(
                            tablet_schema.sequence_col_idx()) != including_cids.cend());
     }
 
+    // 4. 创建用于存储缺失列旧值的 Block
+    // 这个 Block 将从历史数据中读取缺失列的值
     auto old_value_block = tablet_schema.create_block_by_cids(missing_cids);
     CHECK_EQ(missing_cids.size(), old_value_block.columns());
 
-    // segment pos to write -> rowid to read in old_value_block
+    // 5. 从历史数据中读取缺失列的值
+    // read_index 映射：segment 中的位置 -> old_value_block 中的行 ID
     std::map<uint32_t, uint32_t> read_index;
     RETURN_IF_ERROR(read_columns_by_plan(tablet_schema, missing_cids, rsid_to_rowset,
                                          old_value_block, &read_index, true, nullptr));
 
+    // 6. 获取旧行的删除标记列数据
+    // 如果旧行被删除，某些列需要使用默认值而不是旧值
     const auto* old_delete_signs = BaseTablet::get_delete_sign_column_data(old_value_block);
     if (old_delete_signs == nullptr) {
         return Status::InternalError("old delete signs column not found, block: {}",
                                      old_value_block.dump_structure());
     }
-    // build default value columns
+    
+    // 7. 生成默认值 Block
+    // 用于新行或删除的行，当需要填充默认值时使用
     auto default_value_block = old_value_block.clone_empty();
     RETURN_IF_ERROR(BaseTablet::generate_default_value_block(
             tablet_schema, missing_cids, rowset_ctx->partial_update_info->default_values,
             old_value_block, default_value_block));
     auto mutable_default_value_columns = default_value_block.mutate_columns();
 
-    // fill all missing value from mutable_old_columns, need to consider default value and null value
+    // 8. 填充所有缺失列的值
+    // 对每行数据，根据 use_default_or_null_flag 和删除标记，决定使用旧值还是默认值
     for (auto idx = 0; idx < use_default_or_null_flag.size(); idx++) {
         auto segment_pos = idx + segment_start_pos;
         auto pos_in_old_block = read_index[segment_pos];
 
+        // 8.1 遍历所有缺失列
         for (auto i = 0; i < missing_cids.size(); ++i) {
-            // if the column has default value, fill it with default value
-            // otherwise, if the column is nullable, fill it with null value
             const auto& tablet_column = tablet_schema.column(missing_cids[i]);
             auto& missing_col = mutable_full_columns[missing_cids[i]];
 
+            // 8.2 判断是否应该使用默认值
+            // use_default_or_null_flag[idx] 为 true 表示该行是新行，应使用默认值
             bool should_use_default = use_default_or_null_flag[idx];
+            
+            // 8.3 如果原本打算使用旧值，但旧行被删除了，需要重新判断
             if (!should_use_default) {
                 bool old_row_delete_sign =
                         (old_delete_signs != nullptr && old_delete_signs[pos_in_old_block] != 0);
                 if (old_row_delete_sign) {
+                    // 如果表没有序列列，删除的行应使用默认值
                     if (!tablet_schema.has_sequence_col()) {
                         should_use_default = true;
                     } else if (have_input_seq_column || (!tablet_column.is_seqeunce_col())) {
-                        // to keep the sequence column value not decreasing, we should read values of seq column
-                        // from old rows even if the old row is deleted when the input don't specify the sequence column, otherwise
-                        // it may cause the merge-on-read based compaction to produce incorrect results
+                        // 为了保持序列列的值不递减，当输入指定了序列列时，
+                        // 即使旧行被删除，非序列列也应使用默认值
+                        // 这样可以避免基于 merge-on-read 的 compaction 产生错误结果
                         should_use_default = true;
                     }
                 }
             }
 
+            // 8.4 根据判断结果填充缺失列的值
             if (should_use_default) {
+                // 8.4.1 如果列有默认值，使用默认值
                 if (tablet_column.has_default_value()) {
                     missing_col->insert_from(*mutable_default_value_columns[i], 0);
-                } else if (tablet_column.is_nullable()) {
+                } 
+                // 8.4.2 如果列可空，插入 NULL 值
+                else if (tablet_column.is_nullable()) {
                     auto* nullable_column =
                             assert_cast<vectorized::ColumnNullable*>(missing_col.get());
                     nullable_column->insert_many_defaults(1);
-                } else if (tablet_schema.auto_increment_column() == tablet_column.name()) {
+                } 
+                // 8.4.3 如果是自增列，从输入 Block 中读取生成的自增值
+                else if (tablet_schema.auto_increment_column() == tablet_column.name()) {
                     const auto& column =
                             *DORIS_TRY(rowset_ctx->tablet_schema->column(tablet_column.name()));
                     DCHECK(column.type() == FieldType::OLAP_FIELD_TYPE_BIGINT);
@@ -446,18 +491,21 @@ Status FixedReadPlan::fill_missing_columns(
                                                      block->dump_structure());
                     }
                     auto_inc_column->insert_from(*block->get_by_position(pos).column.get(), idx);
-                } else {
-                    // If the control flow reaches this branch, the column neither has default value
-                    // nor is nullable. It means that the row's delete sign is marked, and the value
-                    // columns are useless and won't be read. So we can just put arbitary values in the cells
+                } 
+                // 8.4.4 其他情况：列既没有默认值也不可空
+                // 这种情况通常发生在行被删除时，值列不会被读取，可以填入任意值
+                else {
                     missing_col->insert(tablet_column.get_vec_type()->get_default());
                 }
             } else {
+                // 8.5 使用旧值：从 old_value_block 中读取历史数据
                 missing_col->insert_from(*old_value_block.get_by_position(i).column,
                                          pos_in_old_block);
             }
         }
     }
+    
+    // 9. 将填充好的列设置回完整 Block
     full_block.set_columns(std::move(mutable_full_columns));
     return Status::OK();
 }
@@ -542,34 +590,106 @@ Status FlexibleReadPlan::read_columns_by_plan(
     return Status::OK();
 }
 
+/**
+ * FlexibleReadPlan::fill_non_primary_key_columns：在灵活部分更新场景下，填充非主键列的值
+ * 
+ * 功能说明：
+ * 在灵活部分更新（UPDATE_FLEXIBLE_COLUMNS）模式下，用户只更新部分列（通过 skip_bitmap 标记），
+ * 非主键列（non_sort_key_cids）的值需要根据 skip_bitmap 判断：
+ * - 如果列在 skip_bitmap 中（未指定）：从历史数据读取旧值，或使用默认值
+ * - 如果列不在 skip_bitmap 中（已指定）：使用输入数据中的新值
+ * 
+ * 主要流程：
+ * 1. 获取完整 Block 的可变列引用（用于填充数据）
+ * 2. 获取非主键列的列 ID 列表（missing_cids = 所有非排序键列）
+ * 3. 创建用于存储历史数据的 Block（old_value_block）
+ * 4. 根据存储格式（列式存储或行式存储）调用相应的填充函数
+ * 5. 将填充好的列设置回完整 Block
+ * 
+ * @param rowset_ctx Rowset 写入上下文，包含部分更新信息
+ * @param rsid_to_rowset Rowset ID 到 Rowset 的映射，用于读取历史数据
+ * @param tablet_schema Tablet Schema
+ * @param full_block 完整的 Block（输出），包含所有列的数据
+ * @param use_default_or_null_flag 每行是否应该使用默认值（true）还是旧值（false）
+ * @param has_default_or_nullable 是否有默认值或可空列
+ * @param segment_start_pos Segment 中的起始位置
+ * @param block_start_pos Block 中的起始位置
+ * @param block 输入的 Block，包含部分更新的数据
+ * @param skip_bitmaps 每行的 skip bitmap，标记哪些列未指定（需要保留旧值）
+ * @return 操作状态
+ */
 Status FlexibleReadPlan::fill_non_primary_key_columns(
         RowsetWriterContext* rowset_ctx, const std::map<RowsetId, RowsetSharedPtr>& rsid_to_rowset,
         const TabletSchema& tablet_schema, vectorized::Block& full_block,
         const std::vector<bool>& use_default_or_null_flag, bool has_default_or_nullable,
         uint32_t segment_start_pos, uint32_t block_start_pos, const vectorized::Block* block,
         std::vector<BitmapValue>* skip_bitmaps) const {
+    // 1. 获取完整 Block 的可变列引用（用于填充数据）
     auto mutable_full_columns = full_block.mutate_columns();
 
-    // missing_cids are all non sort key columns' cids
+    // 2. 获取非主键列的列 ID 列表
+    // 在灵活部分更新中，missing_cids 是所有非排序键列（即非主键列）的列 ID
+    // 这些列需要根据 skip_bitmap 判断是使用新值还是旧值
     const auto& non_sort_key_cids = rowset_ctx->partial_update_info->missing_cids;
+    
+    // 3. 创建用于存储历史数据的 Block
+    // 这个 Block 将从历史数据中读取非主键列的旧值
     auto old_value_block = tablet_schema.create_block_by_cids(non_sort_key_cids);
     CHECK_EQ(non_sort_key_cids.size(), old_value_block.columns());
 
+    // 4. 根据存储格式调用相应的填充函数
+    // 4.1 列式存储：使用列式存储的填充逻辑
     if (!use_row_store) {
         RETURN_IF_ERROR(fill_non_primary_key_columns_for_column_store(
                 rowset_ctx, rsid_to_rowset, tablet_schema, non_sort_key_cids, old_value_block,
                 mutable_full_columns, use_default_or_null_flag, has_default_or_nullable,
                 segment_start_pos, block_start_pos, block, skip_bitmaps));
-    } else {
+    } 
+    // 4.2 行式存储：使用行式存储的填充逻辑
+    else {
         RETURN_IF_ERROR(fill_non_primary_key_columns_for_row_store(
                 rowset_ctx, rsid_to_rowset, tablet_schema, non_sort_key_cids, old_value_block,
                 mutable_full_columns, use_default_or_null_flag, has_default_or_nullable,
                 segment_start_pos, block_start_pos, block, skip_bitmaps));
     }
+    
+    // 5. 将填充好的列设置回完整 Block
     full_block.set_columns(std::move(mutable_full_columns));
     return Status::OK();
 }
 
+/**
+ * FlexibleReadPlan::fill_non_primary_key_columns_for_column_store：
+ * 在灵活部分更新场景下，为列式存储填充非主键列的值
+ * 
+ * 功能说明：
+ * 在灵活部分更新（UPDATE_FLEXIBLE_COLUMNS）模式下，使用列式存储时，
+ * 需要根据 skip_bitmap 判断哪些列被指定（需要更新），哪些列未指定（需要保留旧值）。
+ * 
+ * skip_bitmap 的含义：
+ * - 如果列的唯一 ID **在** skip_bitmap 中：表示该列未指定（skipped = true），需要从历史数据读取
+ * - 如果列的唯一 ID **不在** skip_bitmap 中：表示该列已指定（skipped = false），使用新值
+ * 
+ * 填充策略：
+ * 1. 如果列未指定（skipped = true）：从历史数据读取旧值，或使用默认值
+ * 2. 如果列已指定（skipped = false）：使用输入数据中的新值
+ * 
+ * 注意：由于灵活部分更新中每行可能更新不同的列，old_value_block 中各列的行数可能不同
+ * 
+ * @param rowset_ctx Rowset 写入上下文，包含部分更新信息
+ * @param rsid_to_rowset Rowset ID 到 Rowset 的映射，用于读取历史数据
+ * @param tablet_schema Tablet Schema
+ * @param non_sort_key_cids 非排序键列的列 ID 列表（即非主键列）
+ * @param old_value_block 从历史数据中读取的旧值 Block（输入，已填充）
+ * @param mutable_full_columns 完整 Block 的可变列引用（输出，会被填充）
+ * @param use_default_or_null_flag 每行是否应该使用默认值（true）还是旧值（false）
+ * @param has_default_or_nullable 是否有默认值或可空列
+ * @param segment_start_pos Segment 中的起始位置
+ * @param block_start_pos Block 中的起始位置
+ * @param block 输入的 Block，包含部分更新的数据
+ * @param skip_bitmaps 每行的 skip bitmap，标记哪些列未指定
+ * @return 操作状态
+ */
 Status FlexibleReadPlan::fill_non_primary_key_columns_for_column_store(
         RowsetWriterContext* rowset_ctx, const std::map<RowsetId, RowsetSharedPtr>& rsid_to_rowset,
         const TabletSchema& tablet_schema, const std::vector<uint32_t>& non_sort_key_cids,
@@ -578,18 +698,26 @@ Status FlexibleReadPlan::fill_non_primary_key_columns_for_column_store(
         uint32_t segment_start_pos, uint32_t block_start_pos, const vectorized::Block* block,
         std::vector<BitmapValue>* skip_bitmaps) const {
     auto* info = rowset_ctx->partial_update_info.get();
+    
+    // 1. 获取序列列的唯一 ID（如果存在）
     int32_t seq_col_unique_id = -1;
     if (tablet_schema.has_sequence_col()) {
         seq_col_unique_id = tablet_schema.column(tablet_schema.sequence_col_idx()).unique_id();
     }
-    // cid -> segment pos to write -> rowid to read in old_value_block
+    
+    // 2. 构建读取索引：cid -> segment_pos -> rowid in old_value_block
+    // 用于快速定位 old_value_block 中对应列和位置的值
     std::map<uint32_t, std::map<uint32_t, uint32_t>> read_index;
     RETURN_IF_ERROR(
             read_columns_by_plan(tablet_schema, rsid_to_rowset, old_value_block, &read_index));
     // !!!ATTENTION!!!: columns in old_value_block may have different size because every row has different columns to update
+    // 注意：由于灵活部分更新中每行可能更新不同的列，old_value_block 中各列的行数可能不同
 
+    // 3. 获取旧行的删除标记列数据
     const auto* delete_sign_column_data = BaseTablet::get_delete_sign_column_data(old_value_block);
-    // build default value columns
+    
+    // 4. 生成默认值 Block
+    // 用于新行或删除的行，当需要填充默认值时使用
     auto default_value_block = old_value_block.clone_empty();
     if (has_default_or_nullable || delete_sign_column_data != nullptr) {
         RETURN_IF_ERROR(BaseTablet::generate_default_value_block(
@@ -597,19 +725,44 @@ Status FlexibleReadPlan::fill_non_primary_key_columns_for_column_store(
                 default_value_block));
     }
 
+    // 5. 定义 fill_one_cell lambda 函数：填充单个单元格的值
+    // 根据列是否被指定（skipped）和删除标记，决定使用新值、旧值还是默认值
     auto fill_one_cell = [&tablet_schema, &read_index, info](
-                                 const TabletColumn& tablet_column, uint32_t cid,
+                                 // 列定义信息：包含列的类型、是否可空、是否有默认值等元信息
+                                 const TabletColumn& tablet_column,
+                                 // 列 ID：当前要填充的列的列 ID
+                                 uint32_t cid,
+                                 // 输出的新列：填充后的结果列（可变列指针），会被写入完整 Block
                                  vectorized::MutableColumnPtr& new_col,
+                                 // 默认值列：包含该列的默认值（如果存在）
                                  const vectorized::IColumn& default_value_col,
+                                 // 旧值列：从历史数据中读取的旧值列
                                  const vectorized::IColumn& old_value_col,
-                                 const vectorized::IColumn& cur_col, std::size_t block_pos,
-                                 uint32_t segment_pos, bool skipped, bool row_has_sequence_col,
-                                 bool use_default, const signed char* delete_sign_column_data) {
+                                 // 当前输入列：输入 Block 中对应列的数据（部分更新的新值）
+                                 const vectorized::IColumn& cur_col,
+                                 // Block 中的位置：当前行在输入 Block 中的行索引
+                                 std::size_t block_pos,
+                                 // Segment 中的位置：当前行在 Segment 中的位置（用于定位历史数据）
+                                 uint32_t segment_pos,
+                                 // 是否跳过：true 表示列未指定（在 skip_bitmap 中），需要从历史数据读取或使用默认值
+                                 //           false 表示列已指定（不在 skip_bitmap 中），使用输入数据中的新值
+                                 bool skipped,
+                                 // 行是否有序列列：true 表示该行的输入数据中指定了序列列
+                                 //               用于判断删除行的处理策略
+                                 bool row_has_sequence_col,
+                                 // 是否使用默认值：true 表示该行是新行或旧行被删除，应使用默认值
+                                 //                false 表示应使用历史数据中的旧值
+                                 bool use_default,
+                                 // 删除标记列数据：指向旧行的删除标记列数据（signed char 数组）
+                                 //                nullptr 表示没有删除标记列
+                                 const signed char* delete_sign_column_data) {
         if (skipped) {
+            // 5.1 列未指定（在 skip_bitmap 中）：需要从历史数据读取或使用默认值
             DCHECK(cid != tablet_schema.skip_bitmap_col_idx());
             DCHECK(cid != tablet_schema.version_col_idx());
             DCHECK(!tablet_column.is_row_store_column());
 
+            // 5.1.1 如果原本打算使用旧值，但旧行被删除了，需要重新判断
             if (!use_default) {
                 if (delete_sign_column_data != nullptr) {
                     bool old_row_delete_sign = false;
@@ -619,64 +772,84 @@ Status FlexibleReadPlan::fill_non_primary_key_columns_for_column_store(
                     }
 
                     if (old_row_delete_sign) {
+                        // 如果表没有序列列，删除的行应使用默认值
                         if (!tablet_schema.has_sequence_col()) {
                             use_default = true;
                         } else if (row_has_sequence_col ||
                                    (!tablet_column.is_seqeunce_col() &&
                                     (tablet_column.unique_id() != info->sequence_map_col_uid()))) {
-                            // to keep the sequence column value not decreasing, we should read values of seq column(and seq map column)
-                            // from old rows even if the old row is deleted when the input don't specify the sequence column, otherwise
-                            // it may cause the merge-on-read based compaction to produce incorrect results
+                            // 为了保持序列列的值不递减，当输入指定了序列列时，
+                            // 即使旧行被删除，非序列列（且非序列映射列）也应使用默认值
+                            // 这样可以避免基于 merge-on-read 的 compaction 产生错误结果
                             use_default = true;
                         }
                     }
                 }
             }
+            
+            // 5.1.2 如果列有 ON UPDATE CURRENT_TIMESTAMP 属性，使用默认值（当前时间戳）
             if (!use_default && tablet_column.is_on_update_current_timestamp()) {
                 use_default = true;
             }
+            
+            // 5.1.3 根据判断结果填充值
             if (use_default) {
+                // 使用默认值
                 if (tablet_column.has_default_value()) {
                     new_col->insert_from(default_value_col, 0);
                 } else if (tablet_column.is_nullable()) {
+                    // 列可空，插入 NULL 值
                     assert_cast<vectorized::ColumnNullable*, TypeCheckOnRelease::DISABLE>(
                             new_col.get())
                             ->insert_many_defaults(1);
                 } else if (tablet_column.is_auto_increment()) {
-                    // In flexible partial update, the skip bitmap indicates whether a cell
-                    // is specified in the original load, so the generated auto-increment value is filled
-                    // in current block in place if needed rather than using a seperate column to
-                    // store the generated auto-increment value in fixed partial update
+                    // 自增列：在灵活部分更新中，skip bitmap 标记了单元格是否在原始加载中被指定
+                    // 因此生成的自增值在当前 block 中就地填充（如果需要），
+                    // 而不是像固定部分更新那样使用单独的列来存储生成的自增值
                     new_col->insert_from(cur_col, block_pos);
                 } else {
+                    // 其他情况：使用列类型的默认值
                     new_col->insert(tablet_column.get_vec_type()->get_default());
                 }
             } else {
+                // 使用旧值：从 old_value_block 中读取历史数据
                 auto pos_in_old_block = read_index.at(cid).at(segment_pos);
                 new_col->insert_from(old_value_col, pos_in_old_block);
             }
         } else {
+            // 5.2 列已指定（不在 skip_bitmap 中）：使用输入数据中的新值
             new_col->insert_from(cur_col, block_pos);
         }
     };
 
-    // fill all non sort key columns from mutable_old_columns, need to consider default value and null value
+    // 6. 填充所有非排序键列
+    // 对每列和每行，调用 fill_one_cell 填充单元格值
     for (std::size_t i {0}; i < non_sort_key_cids.size(); i++) {
         auto cid = non_sort_key_cids[i];
         const auto& tablet_column = tablet_schema.column(cid);
         auto col_uid = tablet_column.unique_id();
+        
+        // 6.1 遍历所有行
         for (auto idx = 0; idx < use_default_or_null_flag.size(); idx++) {
             auto segment_pos = segment_start_pos + idx;
             auto block_pos = block_start_pos + idx;
 
+            // 6.2 判断列是否被指定
+            // skip_bitmaps->at(block_pos).contains(col_uid) == true 表示列未指定（skipped）
+            bool skipped = skip_bitmaps->at(block_pos).contains(col_uid);
+            
+            // 6.3 判断行是否有序列列
+            // 如果表有序列列，且该行的 skip_bitmap 中不包含序列列的唯一 ID，说明输入指定了序列列
+            bool row_has_sequence_col = tablet_schema.has_sequence_col()
+                    ? !skip_bitmaps->at(block_pos).contains(seq_col_unique_id)
+                    : false;
+
+            // 6.4 调用 fill_one_cell 填充单元格
             fill_one_cell(tablet_column, cid, mutable_full_columns[cid],
                           *default_value_block.get_by_position(i).column,
                           *old_value_block.get_by_position(i).column,
                           *block->get_by_position(cid).column, block_pos, segment_pos,
-                          skip_bitmaps->at(block_pos).contains(col_uid),
-                          tablet_schema.has_sequence_col()
-                                  ? !skip_bitmaps->at(block_pos).contains(seq_col_unique_id)
-                                  : false,
+                          skipped, row_has_sequence_col,
                           use_default_or_null_flag[idx], delete_sign_column_data);
         }
     }
@@ -794,27 +967,61 @@ Status FlexibleReadPlan::fill_non_primary_key_columns_for_row_store(
 BlockAggregator::BlockAggregator(segment_v2::VerticalSegmentWriter& vertical_segment_writer)
         : _writer(vertical_segment_writer), _tablet_schema(*_writer._tablet_schema) {}
 
+/**
+ * BlockAggregator::merge_one_row：在灵活部分更新场景下，将新行合并到已有行中
+ * 
+ * 功能说明：
+ * 在灵活部分更新（UPDATE_FLEXIBLE_COLUMNS）模式下，当遇到相同主键的多行数据时，
+ * 需要将这些行合并成一行。skip_bitmap 用于标记哪些列在输入数据中被指定（需要更新），
+ * 哪些列未指定（需要保留旧值）。
+ * 
+ * skip_bitmap 的含义：
+ * - 如果列的唯一 ID **不在** skip_bitmap 中：表示该列在输入数据中被指定，应该用新值更新
+ * - 如果列的唯一 ID **在** skip_bitmap 中：表示该列在输入数据中未指定，应该保留旧值
+ * 
+ * 合并策略：
+ * 1. skip_bitmap 列本身：做位图交集操作（&=），保留两个位图中都标记为"未指定"的列
+ * 2. 其他列：如果列在 skip_bitmap 中不存在（即被指定），则用新值替换旧值
+ * 
+ * @param dst_block 目标 Block（已有行，会被更新）
+ * @param src_block 源 Block（新行，包含要合并的数据）
+ * @param rid 源 Block 中的行索引
+ * @param skip_bitmap 跳过位图，标记哪些列未指定（需要保留旧值）
+ */
 void BlockAggregator::merge_one_row(vectorized::MutableBlock& dst_block,
                                     vectorized::Block* src_block, int rid,
                                     BitmapValue& skip_bitmap) {
+    // 遍历所有非主键列（主键列在合并时不会改变）
     for (size_t cid {_tablet_schema.num_key_columns()}; cid < _tablet_schema.num_columns(); cid++) {
+        // 1. 特殊处理 skip_bitmap 列本身
+        // skip_bitmap 列存储了每行的 skip bitmap，用于标记哪些列未指定
         if (cid == _tablet_schema.skip_bitmap_col_idx()) {
+            // 获取目标 Block 中最后一行的 skip_bitmap（已有行的 skip_bitmap）
             auto& cur_skip_bitmap =
                     assert_cast<vectorized::ColumnBitmap*>(dst_block.mutable_columns()[cid].get())
                             ->get_data()
                             .back();
+            // 获取源 Block 中当前行的 skip_bitmap（新行的 skip_bitmap）
             const auto& new_row_skip_bitmap =
                     assert_cast<vectorized::ColumnBitmap*>(
                             src_block->get_by_position(cid).column->assume_mutable().get())
                             ->get_data()[rid];
+            // 做位图交集操作：只有两个位图中都标记为"未指定"的列，才保留为"未指定"
+            // 这样确保合并后的行只保留那些在所有合并行中都未指定的列
             cur_skip_bitmap &= new_row_skip_bitmap;
             continue;
         }
+        
+        // 2. 处理其他列：如果列在 skip_bitmap 中不存在（即被指定），则用新值更新
+        // skip_bitmap.contains(unique_id) == false 表示该列在输入数据中被指定了
         if (!skip_bitmap.contains(_tablet_schema.column(cid).unique_id())) {
+            // 移除目标 Block 中最后一行的旧值
             dst_block.mutable_columns()[cid]->pop_back(1);
+            // 插入源 Block 中的新值
             dst_block.mutable_columns()[cid]->insert_from(*src_block->get_by_position(cid).column,
                                                           rid);
         }
+        // 注意：如果列在 skip_bitmap 中存在（即未指定），则不做任何操作，保留旧值
     }
     VLOG_DEBUG << fmt::format("merge a row, after merge, output_block.rows()={}, state: {}",
                               dst_block.rows(), _state.to_string());

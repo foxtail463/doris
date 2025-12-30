@@ -423,11 +423,13 @@ public class Rewriter extends AbstractBatchJobExecutor {
             ImmutableSet.of(LogicalCTEAnchor.class),
             () -> jobs(
                 topic("Plan Normalization",
+                        // 计划规范化阶段，提前完成 SQL 缓存折叠与投影合并，让后续规则匹配更加顺滑
                         custom(RuleType.FOLD_CONSTANT_FOR_SQL_CACHE, FoldConstantForSqlCache::new),
                         // move MergeProjects rule from analyze phase
                         // because SubqueryToApply and BindSink rule may create extra project node
                         // we need merge them at the beginning of rewrite phase to let later rules happy
                         topDown(new MergeProjectable()),
+                        // 第一批 top-down 规则，负责消除无效排序/别名、做表达式归一化以及聚合改写
                         topDown(
                                 new EliminateOrderByConstant(),
                                 new EliminateSortUnderSubqueryOrView(),
@@ -443,6 +445,7 @@ public class Rewriter extends AbstractBatchJobExecutor {
                                 new CountDistinctRewrite(),
                                 new ExtractFilterFromCrossJoin()
                         ),
+                        // 该规则需单独成批运行，避免与 InPredicateToEqualToRule 互相影响导致死循环
                         topDown(
                                 // ExtractSingleTableExpressionFromDisjunction conflict to InPredicateToEqualToRule
                                 // in the ExpressionNormalization, so must invoke in another job, otherwise dead loop.
@@ -962,9 +965,44 @@ public class Rewriter extends AbstractBatchJobExecutor {
         }
     }
 
+    /**
+     * 执行逻辑计划重写任务
+     * 
+     * <p>核心逻辑：
+     * <ol>
+     *   <li>通过 {@code MoreFieldsThread.keepFunctionSignature()} 包装执行逻辑，确保在重写过程中保留函数的原始签名信息</li>
+     *   <li>调用父类的 {@code super.execute()} 方法来执行实际的重写任务序列</li>
+     * </ol>
+     * 
+     * <p>keepFunctionSignature 的作用：
+     * <ul>
+     *   <li>保证签名计算的幂等性：在表达式重写过程中，函数的签名可能会被重新计算，但通过保留原始签名可以避免重复计算</li>
+     *   <li>提升性能：避免不必要的签名重新计算开销</li>
+     *   <li>保持一致性：确保重写前后的函数签名保持一致</li>
+     * </ul>
+     * 
+     * <p>执行流程：
+     * <pre>{@code
+     *  1. 设置 keepFunctionSignature 标志为 true
+     *  2. 调用父类的 execute() 方法执行重写任务序列
+     *  3. 清理 keepFunctionSignature 标志
+     * }</pre>
+     * 
+     * <p>典型的执行场景：
+     * <ul>
+     *   <li>表达式规范化：如常量折叠、函数签名计算等</li>
+     *   <li>查询计划重写：如谓词下推、列裁剪等优化规则</li>
+     *   <li>类型推导：在重写过程中推导表达式的类型信息</li>
+     * </ul>
+     * 
+     * @see MoreFieldsThread#keepFunctionSignature(java.util.function.Supplier)
+     * @see FunctionParams#originFunction 原始函数的保留
+     */
     @Override
     public void execute() {
+        // 在重写执行期间保留函数的原始签名，避免重复计算签名以提升性能
         MoreFieldsThread.keepFunctionSignature(() -> {
+            // 调用父类执行方法，实际执行重写任务序列
             super.execute();
             return null;
         });

@@ -62,24 +62,70 @@ public class BuiltinFunctionBuilder extends FunctionBuilder {
         return functionClass;
     }
 
+    /**
+     * 检查给定的参数列表是否能够匹配当前函数构建器的构造函数。
+     *
+     * 该方法执行两个层次的检查：
+     * 1. 参数个数检查：验证参数个数是否匹配构造函数的要求
+     *    - 变长参数函数：参数个数必须 >= arity - 1（至少要有固定参数部分）
+     *    - 定长参数函数：参数个数必须 == arity（完全匹配）
+     * 2. 参数类型检查：验证每个参数的类型是否匹配构造函数参数类型
+     *    - 直接类型匹配：使用 isInstance() 检查
+     *    - 基本类型兼容：处理基本类型和包装类型之间的兼容性（如 int 和 Integer）
+     *
+     * 示例：
+     * - 构造函数：Concat(Expression... args)，arity = 1，isVariableLength = true
+     *   - 参数 [expr1, expr2, expr3]：个数 3 >= 1-1 = 0，通过个数检查
+     * - 构造函数：Abs(Expression arg)，arity = 1，isVariableLength = false
+     *   - 参数 [expr]：个数 1 == 1，通过个数检查
+     *   - 参数 [expr1, expr2]：个数 2 != 1，不通过个数检查
+     *
+     * @param arguments 待检查的参数列表
+     * @return true 如果参数能够匹配构造函数，false 否则
+     */
     @Override
     public boolean canApply(List<? extends Object> arguments) {
-        if (isVariableLength && arity > arguments.size() + 1) {
-            return false;
+        // 步骤 1: 检查参数个数是否匹配
+        if (isVariableLength) {
+            // 变长参数函数：参数个数必须 >= arity - 1
+            // 例如：Concat(Expression... args)，arity = 1
+            //   - 至少需要 0 个参数（arity - 1 = 0），可以接受任意多个参数
+            //   - 如果 arguments.size() = 0，则 arity (1) > 0 + 1 = 1，返回 false（错误）
+            //   - 如果 arguments.size() = 1，则 arity (1) > 1 + 1 = 2，返回 false（错误）
+            // 实际上应该是：arity - 1 <= arguments.size()
+            // 即：arguments.size() >= arity - 1
+            // 所以条件应该是：arity > arguments.size() + 1 等价于 arguments.size() < arity - 1
+            if (arity > arguments.size() + 1) {
+                return false;
+            }
+        } else {
+            // 定长参数函数：参数个数必须完全匹配
+            // 例如：Abs(Expression arg)，arity = 1
+            //   - 必须恰好有 1 个参数
+            if (arguments.size() != arity) {
+                return false;
+            }
         }
-        if (!isVariableLength && arguments.size() != arity) {
-            return false;
-        }
+
+        // 步骤 2: 检查每个参数的类型是否匹配构造函数参数类型
         for (int i = 0; i < arguments.size(); i++) {
+            // 获取构造函数中第 i 个参数的类型
+            // 对于变长参数，索引 >= arity - 1 的参数都使用数组元素类型
             Class constructorArgumentType = getConstructorArgumentType(i);
             Object argument = arguments.get(i);
+            
+            // 检查参数类型是否直接匹配（使用 isInstance() 进行运行时类型检查）
             if (!constructorArgumentType.isInstance(argument)) {
+                // 如果直接类型不匹配，尝试基本类型兼容性检查
+                // 例如：构造函数参数是 Integer，实际参数是 int（基本类型）
                 Optional<Class> primitiveType = ReflectionUtils.getPrimitiveType(argument.getClass());
                 if (!primitiveType.isPresent() || !constructorArgumentType.isAssignableFrom(primitiveType.get())) {
+                    // 如果无法找到对应的基本类型，或者基本类型也无法赋值给构造函数参数类型，则不匹配
                     return false;
                 }
             }
         }
+        // 所有检查通过，参数可以匹配构造函数
         return true;
     }
 
@@ -94,8 +140,10 @@ public class BuiltinFunctionBuilder extends FunctionBuilder {
     public Pair<BoundFunction, BoundFunction> build(String name, List<? extends Object> arguments) {
         try {
             if (isVariableLength) {
+                // 变长参数构造器：将固定参数原样传入，将可变参数段打包成数组实例，匹配最后一个数组类型入参
                 return Pair.ofSame(builderMethod.newInstance(toVariableLengthArguments(arguments)));
             } else {
+                // 定长参数构造器：直接以 arguments.toArray() 作为入参，按顺序调用构造函数
                 return Pair.ofSame(builderMethod.newInstance(arguments.toArray()));
             }
         } catch (Throwable t) {

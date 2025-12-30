@@ -31,29 +31,20 @@ DORIS_HOME=$(
 )
 export DORIS_HOME
 
-if [[ "$(uname -s)" == 'Darwin' ]]; then
-    if ! command -v brew &>/dev/null; then
-        echo "Error: Homebrew is missing. Please install it first due to we use Homebrew to manage the tools which are needed to build the project."
-        exit 1
-    fi
-    if ! brew list llvm@16 > /dev/null 2>&1; then
-        echo "Error: Please install llvm@16 firt due to we use it to format code."
-        exit 1
-    fi
-    export PATH=$(brew --prefix llvm@16)/bin:$PATH
-fi
-
-if [[ -z $(command -v clang-format) ]]; then
-    echo "clang-format not found, please install clang-format"
+# 专门使用 clang-format-16
+if [[ -z $(command -v clang-format-16) ]]; then
+    echo "clang-format-16 not found, please install clang-format-16"
     exit 1
 fi
 
-CLANG_FORMAT_VERSION=$(clang-format --version | perl -nle 'print $& if m{version \K[0-9]+}')
+# 验证 clang-format-16 版本
+CLANG_FORMAT_VERSION=$(clang-format-16 --version | perl -nle 'print $& if m{version \K[0-9]+}')
 if [[ ${CLANG_FORMAT_VERSION} -ne 16 ]]; then
-    echo "clang-format version is not 16, please install clang-format version 16 or upgrade your clang-format version to 16"
+    echo "clang-format-16 version is not 16, please install clang-format-16 version 16 or upgrade your clang-format-16 version to 16"
     exit 1
 fi
 
-CLANG_FORMAT="${CLANG_FORMAT_BINARY:=$(command -v clang-format)}"
+# 直接使用 clang-format-16
+CLANG_FORMAT="clang-format-16"
 
 python "${DORIS_HOME}/build-support/run_clang_format.py" "--clang-format-executable" "${CLANG_FORMAT}" "-r" "--style" "file" "--inplace" "true" "--extensions" "c,h,C,H,cpp,hpp,cc,hh,c++,h++,cxx,hxx" "--exclude" "none" "be/src be/test cloud/src cloud/test"

@@ -170,49 +170,108 @@ private:
     std::atomic<int64_t> _num_rows_filtered = 0;
 };
 
+/**
+ * 段创建器类
+ * 负责管理行集中段的创建、分配和刷新操作
+ * 提供段ID分配、数据块写入、段刷新等核心功能
+ * 支持部分更新和线程安全的操作
+ */
 class SegmentCreator {
 public:
+    /**
+     * 构造函数
+     * @param context 行集写入上下文，包含配置和元数据信息
+     * @param seg_files 段文件集合，用于管理段文件的写入器
+     * @param idx_files 倒排索引文件集合，用于管理索引文件的写入器
+     */
     SegmentCreator(RowsetWriterContext& context, SegmentFileCollection& seg_files,
                    InvertedIndexFileCollection& idx_files);
 
     ~SegmentCreator() = default;
 
+    /**
+     * 设置段起始ID
+     * 用于指定下一个要分配的段ID的起始值
+     * @param start_id 起始段ID
+     */
     void set_segment_start_id(uint32_t start_id) { _next_segment_id = start_id; }
 
+    /**
+     * 添加数据块到段中
+     * 将数据块添加到内部缓冲区，等待刷新到磁盘
+     * @param block 向量化的数据块
+     * @return 操作状态
+     */
     Status add_block(const vectorized::Block* block);
 
+    /**
+     * 刷新所有缓冲的数据到磁盘
+     * 将内存中积累的数据块写入到段文件中
+     * @return 操作状态
+     */
     Status flush();
 
+    /**
+     * 分配新的段ID
+     * 原子操作，返回当前值并递增
+     * @return 新分配的段ID
+     */
     int32_t allocate_segment_id() { return _next_segment_id.fetch_add(1); }
 
+    /**
+     * 获取下一个要分配的段ID
+     * 原子操作，返回当前值但不递增
+     * @return 下一个段ID
+     */
     int32_t next_segment_id() const { return _next_segment_id.load(); }
 
+    /**
+     * 获取已写入的总行数
+     * @return 总行数
+     */
     int64_t num_rows_written() const { return _segment_flusher.num_rows_written(); }
 
-    // for partial update
-    int64_t num_rows_updated() const { return _segment_flusher.num_rows_updated(); }
-    int64_t num_rows_deleted() const { return _segment_flusher.num_rows_deleted(); }
-    int64_t num_rows_new_added() const { return _segment_flusher.num_rows_new_added(); }
-    int64_t num_rows_filtered() const { return _segment_flusher.num_rows_filtered(); }
+    /**
+     * 部分更新相关的统计信息
+     */
+    int64_t num_rows_updated() const { return _segment_flusher.num_rows_updated(); }      // 更新的行数
+    int64_t num_rows_deleted() const { return _segment_flusher.num_rows_deleted(); }      // 删除的行数
+    int64_t num_rows_new_added() const { return _segment_flusher.num_rows_new_added(); }  // 新添加的行数
+    int64_t num_rows_filtered() const { return _segment_flusher.num_rows_filtered(); }    // 过滤的行数
 
-    // Flush a block into a single segment, with pre-allocated segment_id.
-    // Return the file size flushed to disk in "flush_size"
-    // This method is thread-safe.
+    /**
+     * 将数据块刷新到单个段中（预分配段ID）
+     * 在flush_size中返回刷新到磁盘的文件大小
+     * 此方法是线程安全的
+     * @param block 数据块
+     * @param segment_id 预分配的段ID
+     * @param flush_size 输出参数，刷新到磁盘的文件大小
+     * @return 操作状态
+     */
     Status flush_single_block(const vectorized::Block* block, int32_t segment_id,
                               int64_t* flush_size = nullptr);
 
-    // Flush a block into a single segment, without pre-allocated segment_id.
-    // This method is thread-safe.
+    /**
+     * 将数据块刷新到单个段中（自动分配段ID）
+     * 此方法是线程安全的
+     * @param block 数据块
+     * @return 操作状态
+     */
     Status flush_single_block(const vectorized::Block* block) {
         return flush_single_block(block, allocate_segment_id());
     }
 
+    /**
+     * 关闭段创建器
+     * 清理资源，确保所有数据都已写入磁盘
+     * @return 操作状态
+     */
     Status close();
 
 private:
-    std::atomic<int32_t> _next_segment_id = 0;
-    SegmentFlusher _segment_flusher;
-    std::unique_ptr<SegmentFlusher::Writer> _flush_writer;
+    std::atomic<int32_t> _next_segment_id = 0;                    // 下一个要分配的段ID（原子操作）
+    SegmentFlusher _segment_flusher;                              // 段刷新器，负责数据刷新逻辑
+    std::unique_ptr<SegmentFlusher::Writer> _flush_writer;        // 刷新写入器，用于实际的文件写入操作
 };
 
 } // namespace doris

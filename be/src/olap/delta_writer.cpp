@@ -140,23 +140,52 @@ Status BaseDeltaWriter::init() {
     return Status::OK();
 }
 
+/**
+ * DeltaWriter::write：将 Block 中的指定行写入 MemTable
+ * 
+ * 主要流程：
+ * 1. 检查行索引是否为空（如果为空，直接返回）
+ * 2. 加锁保护（防止并发写入冲突）
+ * 3. 懒初始化（如果未初始化且未取消，则初始化 DeltaWriter）
+ * 4. 等待 MemTable 刷新限制（如果正在刷新的 MemTable 数量达到上限，需要等待）
+ * 5. 调用 MemTableWriter 写入数据
+ * 
+ * @param block 输入的 Block（包含待写入的数据）
+ * @param row_idxs 需要写入的行索引列表（指定 Block 中的哪些行需要写入）
+ * @return 写入状态
+ */
 Status DeltaWriter::write(const vectorized::Block* block, const DorisVector<uint32_t>& row_idxs) {
+    // 1. 如果行索引为空，直接返回（没有数据需要写入）
     if (UNLIKELY(row_idxs.empty())) {
         return Status::OK();
     }
+    
+    // 2. 加锁保护（防止并发写入冲突）
+    // 记录锁等待时间，用于性能分析
     _lock_watch.start();
     std::lock_guard<std::mutex> l(_lock);
     _lock_watch.stop();
+    
+    // 3. 懒初始化：如果 DeltaWriter 未初始化且未取消，则初始化
+    // 初始化包括：创建 RowsetBuilder、初始化 MemTableWriter 等
     if (!_is_init && !_is_cancelled) {
         RETURN_IF_ERROR(init());
     }
+    
+    // 4. 等待 MemTable 刷新限制
+    // 如果正在刷新的 MemTable 数量达到上限（memtable_flush_running_count_limit），
+    // 需要等待，避免同时刷新过多 MemTable 导致内存压力过大
     {
         SCOPED_TIMER(_wait_flush_limit_timer);
         while (_memtable_writer->flush_running_count() >=
                config::memtable_flush_running_count_limit) {
+            // 每 10 毫秒检查一次，避免 CPU 空转
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
+    
+    // 5. 调用 MemTableWriter 写入数据
+    // MemTableWriter 会将数据写入内存中的 MemTable，当 MemTable 达到阈值时会异步刷新到磁盘
     return _memtable_writer->write(block, row_idxs);
 }
 

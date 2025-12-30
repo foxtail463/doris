@@ -116,7 +116,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
                 new LogicalOlapTableSinkExpressionRewrite().build());
     }
 
-    /** GenerateExpressionRewrite */
+    /**
+     * GenerateExpressionRewrite
+     */
     public class GenerateExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
@@ -135,7 +137,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    /** OneRowRelationExpressionRewrite */
+    /**
+     * OneRowRelationExpressionRewrite
+     */
     public class OneRowRelationExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
@@ -161,7 +165,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    /** ProjectExpressionRewrite */
+    /**
+     * ProjectExpressionRewrite
+     */
     public class ProjectExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
@@ -178,30 +184,92 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    /** FilterExpressionRewrite */
+    /**
+     * FilterExpressionRewrite：重写 LogicalFilter 中的谓词表达式。
+     * <p>
+     * 核心功能：
+     * 1. 使用表达式重写器（rewriter，如 ExpressionNormalization、ExpressionOptimization）重写谓词
+     * 2. 提取合取式（AND 连接的表达式），用于优化 Filter 的结构
+     * 3. 如果重写后没有变化，避免不必要的 Filter 重建
+     * <p>
+     * ==================== 处理流程 ====================
+     * <p>
+     * 示例：
+     * 原始 Filter: LogicalFilter(id = 5 AND score > 10)
+     * <p>
+     * 步骤1：重写谓词表达式
+     * originPredicate = id = 5 AND score > 10
+     * predicate = rewriter.rewrite(originPredicate, context)
+     * （可能被规范化、优化，例如：id = 5 AND score > 10 → id = 5 AND score > 10）
+     * <p>
+     * 步骤2：快速返回检查
+     * if (predicate == originPredicate && !(predicate instanceof And))
+     * - 如果表达式没变（引用相同）且不是 And 表达式，直接返回原 Filter
+     * - 原因：避免不必要的提取和重建
+     * <p>
+     * 步骤3：提取合取式
+     * newConjuncts = extractConjunction(predicate)
+     * - 将嵌套的 AND 结构展平：((a AND b) AND c) → [a, b, c]
+     * - 保留 OR 结构不变：(a OR b) AND c → [a OR b, c]
+     * <p>
+     * 步骤4：最终检查
+     * if (predicate.equals(originPredicate))
+     * - 如果表达式内容相同（但可能结构不同），返回原 Filter
+     * - 例如：predicate 可能是新的对象实例，但内容相同
+     * <p>
+     * 步骤5：创建新 Filter
+     * new LogicalFilter<>(newConjuncts, predicate, filter.child())
+     * - newConjuncts: 合取式列表，用于优化和后续处理
+     * - predicate: 完整的谓词表达式，用于语义表示
+     * <p>
+     * ==================== 为什么需要提取合取式 ====================
+     * <p>
+     * 1. 优化 Filter 结构：将嵌套的 AND 展平，便于后续规则处理
+     * 2. 支持谓词下推：合取式列表可以单独下推到子计划
+     * 3. 支持谓词拆分：可以将不同的合取式分配到不同的计划节点
+     * <p>
+     * 示例：
+     * 原始：LogicalFilter((a AND b) AND c)
+     * 提取后：newConjuncts = [a, b, c]
+     * 后续规则可以单独处理每个合取式
+     */
     public class FilterExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalFilter().thenApply(ctx -> {
                 LogicalFilter<Plan> filter = ctx.root;
                 ExpressionRewriteContext context = new ExpressionRewriteContext(filter, ctx.cascadesContext);
+                // 获取原始谓词表达式
                 Expression originPredicate = filter.getPredicate();
+                // 使用表达式重写器重写谓词（规范化、优化等）
                 Expression predicate = rewriter.rewrite(originPredicate, context);
+                // 快速返回：如果表达式没变且不是 And 表达式，直接返回原 Filter
+                // 原因：避免不必要的提取和重建，提高性能
                 if (predicate == originPredicate && !(predicate instanceof And)) {
                     return filter;
                 }
+                // 提取合取式（AND 连接的表达式），将嵌套结构展平
+                // 例如：((a AND b) AND c) → [a, b, c]
+                // 注意：保留 OR 结构不变，例如：(a OR b) AND c → [a OR b, c]
                 Set<Expression> newConjuncts = Utils.fastToImmutableSet(
                         ExpressionUtils.extractConjunction(predicate)
                 );
+                // 如果重写后的表达式内容相同（但可能结构不同），返回原 Filter
+                // 例如：predicate 可能是新的对象实例，但内容相同
                 if (predicate.equals(originPredicate)) {
                     return filter;
                 }
+                // 创建新的 Filter，包含提取的合取式列表和完整的谓词表达式
+                // newConjuncts: 合取式列表，用于优化和后续处理
+                // predicate: 完整的谓词表达式，用于语义表示
                 return new LogicalFilter<>(newConjuncts, predicate, filter.child());
             }).toRule(RuleType.REWRITE_FILTER_EXPRESSION);
         }
     }
 
-    /** OlapTableSinkExpressionRewrite */
+    /**
+     * OlapTableSinkExpressionRewrite
+     */
     public class LogicalOlapTableSinkExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
@@ -223,7 +291,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    /** AggExpressionRewrite */
+    /**
+     * AggExpressionRewrite
+     */
     public class AggExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
@@ -244,7 +314,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    /** JoinExpressionRewrite */
+    /**
+     * JoinExpressionRewrite
+     */
     public class JoinExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
@@ -303,9 +375,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
             for (Expression expr : conjuncts) {
                 Expression newExpr = rewriter.rewrite(expr, context);
                 newExpr = newExpr.isNullLiteral() && expr instanceof EqualPredicate
-                                ? expr.withChildren(rewriter.rewrite(expr.child(0), context),
-                                        rewriter.rewrite(expr.child(1), context))
-                                : newExpr;
+                        ? expr.withChildren(rewriter.rewrite(expr.child(0), context),
+                        rewriter.rewrite(expr.child(1), context))
+                        : newExpr;
                 isChanged = isChanged || !newExpr.equals(expr);
                 rewrittenConjuncts.addAll(ExpressionUtils.extractConjunction(newExpr));
             }
@@ -314,7 +386,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    /** SortExpressionRewrite */
+    /**
+     * SortExpressionRewrite
+     */
     public class SortExpressionRewrite extends OneRewriteRuleFactory {
 
         @Override
@@ -336,7 +410,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    /** HavingExpressionRewrite */
+    /**
+     * HavingExpressionRewrite
+     */
     public class HavingExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
@@ -357,16 +433,16 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalWindow().thenApply(ctx -> {
-                LogicalWindow<Plan> window = ctx.root;
-                List<NamedExpression> windowExpressions = window.getWindowExpressions();
-                ExpressionRewriteContext context = new ExpressionRewriteContext(window, ctx.cascadesContext);
-                RewriteResult<NamedExpression> result = rewriteAll(windowExpressions, rewriter, context);
-                if (!result.changed) {
-                    return window;
-                }
-                return window.withExpressionsAndChild(result.result, window.child());
-            })
-            .toRule(RuleType.REWRITE_WINDOW_EXPRESSION);
+                        LogicalWindow<Plan> window = ctx.root;
+                        List<NamedExpression> windowExpressions = window.getWindowExpressions();
+                        ExpressionRewriteContext context = new ExpressionRewriteContext(window, ctx.cascadesContext);
+                        RewriteResult<NamedExpression> result = rewriteAll(windowExpressions, rewriter, context);
+                        if (!result.changed) {
+                            return window;
+                        }
+                        return window.withExpressionsAndChild(result.result, window.child());
+                    })
+                    .toRule(RuleType.REWRITE_WINDOW_EXPRESSION);
         }
     }
 
@@ -374,22 +450,22 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalSetOperation().thenApply(ctx -> {
-                LogicalSetOperation setOperation = ctx.root;
-                List<List<SlotReference>> slotsList = setOperation.getRegularChildrenOutputs();
-                List<List<SlotReference>> newSlotsList = new ArrayList<>();
-                ExpressionRewriteContext context = new ExpressionRewriteContext(setOperation, ctx.cascadesContext);
-                boolean changed = false;
-                for (List<SlotReference> slots : slotsList) {
-                    RewriteResult<SlotReference> result = rewriteAll(slots, rewriter, context);
-                    changed |= result.changed;
-                    newSlotsList.add(result.result);
-                }
-                if (!changed) {
-                    return setOperation;
-                }
-                return setOperation.withChildrenAndTheirOutputs(setOperation.children(), newSlotsList);
-            })
-            .toRule(RuleType.REWRITE_SET_OPERATION_EXPRESSION);
+                        LogicalSetOperation setOperation = ctx.root;
+                        List<List<SlotReference>> slotsList = setOperation.getRegularChildrenOutputs();
+                        List<List<SlotReference>> newSlotsList = new ArrayList<>();
+                        ExpressionRewriteContext context = new ExpressionRewriteContext(setOperation, ctx.cascadesContext);
+                        boolean changed = false;
+                        for (List<SlotReference> slots : slotsList) {
+                            RewriteResult<SlotReference> result = rewriteAll(slots, rewriter, context);
+                            changed |= result.changed;
+                            newSlotsList.add(result.result);
+                        }
+                        if (!changed) {
+                            return setOperation;
+                        }
+                        return setOperation.withChildrenAndTheirOutputs(setOperation.children(), newSlotsList);
+                    })
+                    .toRule(RuleType.REWRITE_SET_OPERATION_EXPRESSION);
         }
     }
 
@@ -537,7 +613,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         return sink.withOutputExprs(result.result);
     }
 
-    /** LogicalRepeatRewrite */
+    /**
+     * LogicalRepeatRewrite
+     */
     public class LogicalRepeatRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
@@ -560,7 +638,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    /** bottomUp */
+    /**
+     * bottomUp
+     */
     public static ExpressionRewriteRule<ExpressionRewriteContext> bottomUp(
             ExpressionPatternRuleFactory... ruleFactories) {
         ImmutableList.Builder<ExpressionPatternMatchRule> rules = ImmutableList.builder();
@@ -584,7 +664,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         );
     }
 
-    /** rewriteAll */
+    /**
+     * rewriteAll
+     */
     public static <E extends Expression> RewriteResult<E> rewriteAll(
             Collection<E> exprs, ExpressionRuleExecutor rewriter, ExpressionRewriteContext context) {
         ImmutableList.Builder<E> result = ImmutableList.builderWithExpectedSize(exprs.size());
@@ -599,7 +681,9 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         return new RewriteResult<>(changed, result.build());
     }
 
-    /** RewriteResult */
+    /**
+     * RewriteResult
+     */
     public static class RewriteResult<E> {
         public final boolean changed;
         public final List<E> result;

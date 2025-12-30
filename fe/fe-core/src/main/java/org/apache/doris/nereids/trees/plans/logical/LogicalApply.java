@@ -37,14 +37,24 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Use this node to display the subquery in the relational algebra tree.
- * @param <LEFT_CHILD_TYPE> input.
- * @param <RIGHT_CHILD_TYPE> subquery.
+ * LogicalApply 表示关联型子查询（Apply Operator）。
+ * 主要用于关系代数树中显式表示 SQL 子查询（包括标量子查询、IN/EXISTS 等）。
+ *
+ * 主要设计：
+ * - 提供一种二元（左/右孩子）结构，其中：
+ *   - left (输入)：主查询
+ *   - right (subquery)：子查询部分
+ * - 子查询类型支持 IN、EXISTS、SCALAR，详见 SubQueryType
+ * - 记录关联列（correlationSlot）及关联谓词（correlationFilter），用于处理相关子查询
+ * - 支持“mark join”类型语义标记（如半连接的标记列 MarkJoinSlotReference）
+ *
+ * 实例化泛型：LEFT_CHILD_TYPE/RIGHT_CHILD_TYPE 一般为 Plan 类型。
  */
 public class LogicalApply<LEFT_CHILD_TYPE extends Plan, RIGHT_CHILD_TYPE extends Plan>
         extends LogicalBinary<LEFT_CHILD_TYPE, RIGHT_CHILD_TYPE> {
     /**
-     * SubQueryType
+     * 子查询类型，用于区分 SQL 表达式语义。
+     * IN_SUBQUERY 对应 IN 语法，EXISTS_SUBQUERY 对应 EXISTS，SCALAR_SUBQUERY 代表标量子查询。
      */
     public enum SubQueryType {
         IN_SUBQUERY,
@@ -52,31 +62,30 @@ public class LogicalApply<LEFT_CHILD_TYPE extends Plan, RIGHT_CHILD_TYPE extends
         SCALAR_SUBQUERY
     }
 
+    /** 子查询类型。如 IN/EXISTS/SCALAR。*/
     private final SubQueryType subqueryType;
+    /** SQL NOT IN/NOT EXISTS/!= 用；例如 a NOT IN (SELECT ...)。 */
     private final boolean isNot;
 
-    // only for InSubquery
+    /** 仅IN适用，对应 a IN (SELECT b...) 中的 compare 部分。*/
     private final Optional<Expression> compareExpr;
-
-    // only for InSubquery
+    /** IN适用，对应类型自动转换（如 int=double 时）。 */
     private final Optional<Expression> typeCoercionExpr;
 
-    // correlation column
+    /**
+     * 相关列集合：左表哪些字段作为相关列会被右表用到。
+     * 例如：WHERE t1.a = (SELECT max(b) FROM t2 WHERE t2.c = t1.a)
+     * 此时 t1.a 即为 correlationSlot。
+     */
     private final List<Slot> correlationSlot;
-    // correlation Conjunction
+    /** 相关filter复合条件（如 t1.x = t2.y AND ...）*/
     private final Optional<Expression> correlationFilter;
-    // The slot replaced by the subquery in MarkJoin
+    /** Mark join语义时使用，标记连接输出的Slot。 */
     private final Optional<MarkJoinSlotReference> markJoinSlotReference;
 
-    // Whether adding the subquery's output to projects
+    /** 是否需要将子查询结果列加到投影结果中（如标量相关子查询转换join时加右侧字段）。*/
     private final boolean needAddSubOutputToProjects;
-
-    /*
-    * This flag is indicate the mark join slot can be non-null or not
-    * in InApplyToJoin rule, if it's semi join with non-null mark slot
-    * we can safely change the mark conjunct to hash conjunct
-    * see SubqueryToApply rule for more info
-    */
+    /** Mark join slot可否为null，仅部分子查询消解规则中用到。 */
     private final boolean isMarkJoinSlotNotNull;
 
     private LogicalApply(Optional<GroupExpression> groupExpression,
@@ -125,22 +134,36 @@ public class LogicalApply<LEFT_CHILD_TYPE extends Plan, RIGHT_CHILD_TYPE extends
         return typeCoercionExpr.orElseGet(() -> right().getOutput().get(0));
     }
 
+    /** 获取所有相关列slot（主查询与子查询有交集字段时才有）。 */
     public List<Slot> getCorrelationSlot() {
         return correlationSlot;
     }
 
+    /**
+     * 获取相关谓词复合表达式（如 t1.a = t2.a AND t1.b > t2.c），用于在 apply->join 转换时生成 Join 条件。
+     */
     public Optional<Expression> getCorrelationFilter() {
         return correlationFilter;
     }
 
+    /**
+     * 判断是否为标量子查询。
+     * 如 WHERE ... = (SELECT ...) 这种形式
+     */
     public boolean isScalar() {
         return subqueryType == SubQueryType.SCALAR_SUBQUERY;
     }
 
+    /**
+     * 是否为 IN 子查询
+     */
     public boolean isIn() {
         return subqueryType == SubQueryType.IN_SUBQUERY;
     }
 
+    /**
+     * 是否为 EXISTS 子查询
+     */
     public boolean isExist() {
         return subqueryType == SubQueryType.EXITS_SUBQUERY;
     }
@@ -153,6 +176,10 @@ public class LogicalApply<LEFT_CHILD_TYPE extends Plan, RIGHT_CHILD_TYPE extends
         return isNot;
     }
 
+    /**
+     * 是否“相关”，判断依据为是否存在关联slot（典型如 t1.a = t2.a 这种 parent-child 相关子查询)。
+     * 用于区分相关 vs 非相关 apply。
+     */
     public boolean isCorrelated() {
         return !correlationSlot.isEmpty();
     }
@@ -180,47 +207,32 @@ public class LogicalApply<LEFT_CHILD_TYPE extends Plan, RIGHT_CHILD_TYPE extends
     @Override
     public List<Slot> computeOutput() {
         ImmutableList.Builder<Slot> builder = ImmutableList.builder();
+        // 1. 先加入左孩子的所有输出slot（主查询字段必定有）
         builder.addAll(left().getOutput());
+
+        // 2. 如果是mark join消解（如半连接/反连接判别），特殊加一个标记列
         if (markJoinSlotReference.isPresent()) {
             builder.add(markJoinSlotReference.get());
         }
-        // only scalar apply can be needAddSubOutputToProjects = true
+
+        // 3. 仅当需要加子查询输出（如标量相关子查询、apply消解左外连接等场景）
         if (needAddSubOutputToProjects) {
-            // correlated apply right child may contain multiple output slots
-            // in rule ScalarApplyToJoin, only '(isCorrelated() && correlationFilter.isPresent())'
-            // but at analyzed phase, the correlationFilter is empty, only after rule UnCorrelatedApplyAggregateFilter
-            // correlationFilter will be set, so we skip check correlationFilter here.
-            // correlated apply will change to a left outer join, then all the right child output will be nullable.
+            // 相关型apply（左/右孩子有关联字段）
             if (isCorrelated()) {
-                // for sql:
-                // `select t1.a,
-                //         (select if(sum(t2.a) > 10, count(t2.b), max(t2.c)) as k from t2 where t1.a = t2.a)
-                // from t1`,
-                // its plan is:
-                // LogicalProject(t1.a, if(sum(t2.a) > 10, count(t2.b), max(t2.c)) as k)
-                //     |-- LogicalProject(..., if(sum(t2.a > 10), ifnull(count(t2.b), 0), max(t2.c)) as k)
-                //           |-- LogicalApply(correlationSlot = [t1.a])
-                //                  |-- LogicalOlapScan(t1)
-                //                  |-- LogicalAggregate(output = [sum(t2.a), count(t2.b), max(t2.c)])
+                // 例：
+                // select t1.a, (select sum(b) from t2 where t2.a = t1.a) as k from t1
+                //         |-- LogicalApply(correlationSlot = [t1.a])
+                //                |-- LogicalOlapScan(t1)
+                //                |-- LogicalAggregate(sum(b))
+                // 相关apply右侧字段全部要加进来，且全部设为nullable（外连接时右表为null需返回null）
                 for (Slot slot : right().getOutput()) {
-                    // in fact some slots may non-nullable, like count.
-                    // but after convert correlated apply to left outer join, all the join right child's slots
-                    // will become nullable, so we let all slots be nullable, then they wouldn't change nullable
-                    // even after convert to join.
+                    // 注意：即便如count本身理论不可为null，但外连接时右表为null，需整体nullable。
                     builder.add(slot.toSlot().withNullable(true));
                 }
             } else {
-                // uncorrelated apply right child always contains one output slot.
-                // for sql:
-                // `select t1.a,
-                //         (select if(sum(t2.a) > 10, count(t2.b), max(t2.c)) as k from t2)
-                // from t1`,
-                // its plan is:
-                // LogicalProject(t1.a, k)
-                //      |--LogicalApply(correlationSlot = [])
-                //          |- LogicalOlapScan(t1)
-                //          |- LogicalProject(if(sum(t2.a) > 10, count(t2.b), max(t2.c)) as k)
-                //                 |-- LogicalAggregate(output = [sum(t2.a), count(t2.b), max(t2.c)])
+                // 非相关型apply（如标量/IN/EXISTS子查询，右孩子一般只有一个输出slot）
+                // 例：select t1.a, (select sum(b) from t2) as k from t1
+                // 输出只取一个slot，且自动判断是否nullable。
                 builder.add(ScalarSubquery.getScalarQueryOutputAdjustNullable(right(), correlationSlot));
             }
         }

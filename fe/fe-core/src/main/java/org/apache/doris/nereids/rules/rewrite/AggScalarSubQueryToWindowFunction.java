@@ -251,6 +251,7 @@ public class AggScalarSubQueryToWindowFunction extends DefaultPlanRewriter<JobCo
      * 3. the remaining table in step 2 should be correlated table for inner plan
      */
     private boolean checkRelation(List<Slot> correlatedSlots) {
+        // 外层/内层所有关系节点，用于比较两边涉及的表集合
         List<CatalogRelation> outerTables = outerPlans.stream().filter(CatalogRelation.class::isInstance)
                 .map(CatalogRelation.class::cast)
                 .collect(Collectors.toList());
@@ -272,12 +273,14 @@ public class AggScalarSubQueryToWindowFunction extends DefaultPlanRewriter<JobCo
             return false;
         }
 
+        // 基于剩余的那张“只在外层出现的表”构建 slot 映射，用作后续表达式替换
         createSlotMapping(outerTables, innerTables);
 
         Set<ExprId> correlatedRelationOutput = outerTables.stream()
                 .filter(node -> outerIds.contains(node.getTable().getId()))
                 .map(LogicalRelation.class::cast)
                 .map(LogicalRelation::getOutputExprIdSet).flatMap(Collection::stream).collect(Collectors.toSet());
+        // 校验 apply 中声明的所有相关列都来自该表，否则无法用窗口函数关联
         return correlatedSlots.stream().allMatch(e -> correlatedRelationOutput.contains(e.getExprId()));
     }
 
@@ -300,6 +303,7 @@ public class AggScalarSubQueryToWindowFunction extends DefaultPlanRewriter<JobCo
     }
 
     private Plan rewrite(LogicalFilter<? extends Plan> filter, LogicalApply<Plan, Plan> apply) {
+        // 该函数负责把 Filter+Apply+Aggregate 模式改写成 Filter+Window，前提是前置检查已通过
         Preconditions.checkArgument(apply.right() instanceof LogicalAggregate,
                 "right child of Apply should be LogicalAggregate");
         LogicalAggregate<Plan> agg = (LogicalAggregate<Plan>) apply.right();
@@ -326,6 +330,8 @@ public class AggScalarSubQueryToWindowFunction extends DefaultPlanRewriter<JobCo
         // it's a simple case, but we may meet some complex cases in ut.
         // TODO: support compound predicate and multi apply node.
 
+        // 将外层 Filter 的谓词按是否引用 inner agg 的输出拆分：
+        // false -> 关联谓词（需要窗口化），true -> 普通谓词
         Map<Boolean, Set<Expression>> conjuncts = filter.getConjuncts().stream()
                 .collect(Collectors.groupingBy(conjunct -> Sets
                         .intersection(conjunct.getInputSlotExprIds(), agg.getOutputExprIdSet())
@@ -346,6 +352,7 @@ public class AggScalarSubQueryToWindowFunction extends DefaultPlanRewriter<JobCo
             function = ((NullableAggregateFunction) function).withAlwaysNullable(false);
         }
 
+        // 将内层聚合函数“搬”到外层窗口函数：相关列作为 partition by，使用 innerOuterSlotMap 做列映射
         WindowExpression windowFunction = createWindowFunction(apply.getCorrelationSlot(),
                 (AggregateFunction) ExpressionUtils.replace(function, innerOuterSlotMap));
         NamedExpression windowFunctionAlias = new Alias(windowFunction);
@@ -359,9 +366,11 @@ public class AggScalarSubQueryToWindowFunction extends DefaultPlanRewriter<JobCo
         aggOutExpr = ExpressionUtils.replace(aggOutExpr, ImmutableMap
                 .of(functions.get(0), windowFunctionAlias.toSlot()));
 
+        // 把外层过滤条件里的 agg 输出槽替换成新的窗口表达式，得到最终的窗口过滤谓词
         windowFilterConjunct = ExpressionUtils.replace(windowFilterConjunct,
                 ImmutableMap.of(aggOut.toSlot(), aggOutExpr));
 
+        // newFilter：保留普通谓词，直接作用在 Apply 左子树；新窗口节点包住 newFilter
         LogicalFilter<Plan> newFilter = filter.withConjunctsAndChild(conjuncts.get(true), apply.left());
         LogicalWindow<Plan> newWindow = new LogicalWindow<>(ImmutableList.of(windowFunctionAlias), newFilter);
         LogicalFilter<Plan> windowFilter = new LogicalFilter<>(ImmutableSet.of(windowFilterConjunct), newWindow);

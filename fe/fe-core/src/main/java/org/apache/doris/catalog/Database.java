@@ -361,20 +361,32 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
         return Math.max(leftReplicaQuota, 0L);
     }
 
+    /**
+     * 检查数据库数据大小配额
+     * 如果已使用的数据量超过配额限制，则抛出异常
+     * @throws DdlException 当数据大小超过配额时抛出异常
+     */
     public void checkDataSizeQuota() throws DdlException {
+        // 将总配额字节数转换为可读格式（如 GB、TB 等）
         Pair<Double, String> quotaUnitPair = DebugUtil.getByteUint(dataQuotaBytes);
         String readableQuota = DebugUtil.DECIMAL_FORMAT_SCALE_3.format(quotaUnitPair.first) + " "
                 + quotaUnitPair.second;
+        
+        // 获取已使用的数据配额
         long usedDataQuota = getUsedDataQuota();
+        // 计算剩余配额，确保不为负数
         long leftDataQuota = Math.max(dataQuotaBytes - usedDataQuota, 0);
 
+        // 将剩余配额字节数转换为可读格式
         Pair<Double, String> leftQuotaUnitPair = DebugUtil.getByteUint(leftDataQuota);
         String readableLeftQuota = DebugUtil.DECIMAL_FORMAT_SCALE_3.format(leftQuotaUnitPair.first) + " "
                 + leftQuotaUnitPair.second;
 
+        // 记录配额使用情况日志
         LOG.info("database[{}] data quota: left bytes: {} / total: {}",
                 fullQualifiedName, readableLeftQuota, readableQuota);
 
+        // 如果剩余配额小于等于 0，说明已超过配额限制，抛出异常
         if (leftDataQuota <= 0L) {
             throw new DdlException("Database[" + fullQualifiedName
                     + "] data size exceeds quota[" + readableQuota + "]");
@@ -422,9 +434,12 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
     public Pair<Boolean, Boolean> createTableWithoutLock(
             Table table, boolean isReplay, boolean setIfNotExist) throws DdlException {
         boolean result = true;
-        // if a table is already exists, then edit log won't be executed
-        // some caller of this method may need to know this message
+        
+        // 如果表已存在，则不会执行编辑日志
+        // 此方法的某些调用者可能需要知道这个信息
         boolean isTableExist = false;
+        
+        // 设置表的完整数据库名称（用于全局唯一标识）
         table.setQualifiedDbName(fullQualifiedName);
         String tableName = table.getName();
         if (Env.isStoredTableNamesLowerCase()) {
@@ -437,14 +452,23 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
             table.writeLock();
             try {
                 registerTable(table);
+                
+                // ========== 临时表特殊处理 ==========
+                // 如果是临时表，需要注册到全局临时表管理器和会话中
                 if (table.isTemporary()) {
                     Env.getCurrentEnv().registerTempTableAndSession(table);
                 }
+                
+                // ========== 物化视图特殊处理 ==========
+                // 如果是物化视图（MTMV），需要创建相应的后台任务
                 if (table instanceof MTMV) {
                     Env.getCurrentEnv().getMtmvService().createJob((MTMV) table, isReplay);
                 }
+                
+                // ========== 编辑日志记录 ==========
+                // 只在非回放模式下记录编辑日志（避免重复记录）
                 if (!isReplay) {
-                    // Write edit log
+                    // 创建建表信息对象并记录到编辑日志
                     CreateTableInfo info = new CreateTableInfo(fullQualifiedName, id, table);
                     Env.getCurrentEnv().getEditLog().logCreateTable(info);
                 }
@@ -460,24 +484,43 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
 
     @Override
     public boolean registerTable(TableIf table) {
+        // 结果标识：true 表示注册成功；false 表示表名已存在不注册
         boolean result = true;
+        
+        // 将通用接口 TableIf 向下转型为内部 Table 类型（当前场景为内部表）
         Table olapTable = (Table) table;
+        
+        // 设置表的完整库名，便于后续日志与标识（dbName.tableName）
         olapTable.setQualifiedDbName(fullQualifiedName);
+        
+        // 取出表名，根据系统配置决定是否存小写
         String tableName = olapTable.getName();
         if (Env.isStoredTableNamesLowerCase()) {
             tableName = tableName.toLowerCase();
         }
+        
+        // 如果库中已存在同名表，则不进行注册
         if (isTableExist(tableName)) {
             result = false;
         } else {
+            // ========== 正式注册到库的元数据索引 ==========
+            // 1) 基于 tableId 的索引，加速通过ID定位表对象
             idToTable.put(olapTable.getId(), olapTable);
+            // 2) 基于表名的索引，支持通过名称快速查找
             nameToTable.put(olapTable.getName(), olapTable);
+            // 3) 小写表名 -> 原始表名 的映射，统一大小写处理路径
             lowerCaseToTableName.put(tableName.toLowerCase(), tableName);
+            
+            // 如果为物化视图（MTMV），需要向全局MTMV服务注册，建立库级反向索引
             if (olapTable instanceof MTMV) {
                 Env.getCurrentEnv().getMtmvService().registerMTMV((MTMV) olapTable, id);
             }
         }
+        
+        // 取消“已删除”标记：用于回放/恢复等场景，确保表处于有效状态
         olapTable.unmarkDropped();
+        
+        // 返回是否注册成功
         return result;
     }
 

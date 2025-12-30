@@ -34,37 +34,51 @@ import java.util.Set;
 import java.util.function.Supplier;
 
 /**
- * The slot range required for expression analyze.
+ * 表达式分析所需的 Slot 作用域。
  *
- * slots: The symbols used at this level are stored in slots.
- * outerScope: The scope information corresponding to the parent is stored in outerScope.
- * ownerSubquery: The subquery corresponding to ownerSubquery.
- * subqueryToOuterCorrelatedSlots: The slots correlated in the subquery,
- *                                 only the slots that cannot be resolved at this level.
+ * slots: 当前层级使用的符号（列名）存储在 slots 中。
+ * outerScope: 父级对应的作用域信息存储在 outerScope 中（用于相关子查询）。
+ * ownerSubquery: 对应的子查询。
+ * subqueryToOuterCorrelatedSlots: 子查询中相关的 Slot（相关列），
+ *                                 只包含在当前层级无法解析的 Slot（即来自外层查询的列）。
  *
- * eg:
+ * 示例：
  * t1(k1, v1) / t2(k2, v2)
  * select * from t1 where t1.k1 = (select sum(k2) from t2 where t1.v1 = t2.v2);
  *
- * When analyzing subquery:
+ * 当分析子查询时：
  *
- * slots: k2, v2;
+ * slots: k2, v2;  // 子查询中的列
  * outerScope:
- *      slots: k1, v1;
+ *      slots: k1, v1;  // 外层查询的列
  *      outerScope: Optional.empty();
  *      ownerSubquery: Optional.empty();
  *      subqueryToOuterCorrelatedSlots: empty();
- * ownerSubquery: subquery((select sum(k2) from t2 where t1.v1 = t2.v2));
- * subqueryToOuterCorrelatedSlots: (subquery, v1);
+ * ownerSubquery: subquery((select sum(k2) from t2 where t1.v1 = t2.v2));  // 当前子查询
+ * subqueryToOuterCorrelatedSlots: (subquery, v1);  // 子查询中引用的外层列 v1
  */
 public class Scope {
 
+    // 外层作用域，用于相关子查询。当子查询引用外层查询的列时，可以通过 outerScope 查找
     private final Optional<Scope> outerScope;
+    
+    // 当前作用域中的所有 Slot（列）。这些 Slot 可以直接在当前查询中使用
     private final List<Slot> slots;
+    
+    // 用于 SELECT * 展开的 Slot。当处理 SELECT * 时，会从这些 Slot 中展开所有列
     private final List<Slot> asteriskSlots;
+    
+    // 相关子查询中引用的外层 Slot。当子查询引用外层查询的列时，这些列会被添加到这个集合中
     private final Set<Slot> correlatedSlots;
+    
+    // 是否构建名称到 Slot 的映射。当 Slot 数量大于 500 时，使用映射可以提高查找性能
     private final boolean buildNameToSlot;
+    
+    // 名称到 Slot 的映射（延迟计算）。键是列名（大写），值是对应的 Slot 列表
+    // 使用 Supplier 延迟计算，只有在需要时才构建映射
     private final Supplier<ListMultimap<String, Slot>> nameToSlot;
+    
+    // 名称到 Asterisk Slot 的映射（延迟计算）。用于 SELECT * 的快速查找
     private final Supplier<ListMultimap<String, Slot>> nameToAsteriskSlot;
 
     public Scope(List<Slot> slots) {

@@ -155,9 +155,56 @@ public class SlotReference extends Slot {
         return fromColumn(exprId, table, column, column.getName(), qualifier);
     }
 
+    /**
+     * 从表的 Column 对象创建 SlotReference。
+     * 
+     * 这是 Slot 最开始创建的关键方法，将 Catalog 层的 Column 转换为 Nereids 层的 SlotReference。
+     * 该方法在 LogicalOlapScan.computeOutput() 中被调用，为表的每个列创建对应的 Slot。
+     * 
+     * 转换过程：
+     * 1. 类型转换：将 Catalog 的 Type 转换为 Nereids 的 DataType
+     * 2. 信息提取：从 Column 中提取列名、可空性等信息
+     * 3. 对象创建：创建 SlotReference 对象，包含完整的列信息
+     * 
+     * 创建的 SlotReference 包含的信息：
+     * - exprId: 唯一标识符，在整个查询中唯一标识该 Slot
+     * - name: 列名（可能与 Column 的名称不同，例如视图中的列名）
+     * - dataType: 数据类型（从 Catalog Type 转换而来）
+     * - nullable: 是否可空（从 Column.isAllowNull() 获取）
+     * - qualifier: 表的限定符（如 [catalog, db, table]），用于区分不同表的同名列
+     * - originalTable/originalColumn: 原始表和列对象（用于视图场景，可以追溯到实际的表）
+     * - oneLevelTable/oneLevelColumn: 一级表和列（不穿透视图，用于 MySQL 协议兼容）
+     * - subPath: 子路径（用于复杂类型，默认为空）
+     * 
+     * 使用场景：
+     * - LogicalOlapScan: 从表的 Schema 创建 Slot
+     * - LogicalView: 从视图的 Schema 创建 Slot
+     * - 物化视图扫描: 从物化视图的 Schema 创建 Slot
+     * 
+     * @param exprId Slot 的唯一标识符，由 StatementScopeIdGenerator 生成
+     * @param table 表对象，包含表的元数据信息
+     * @param column 列的元数据对象，包含列的类型、可空性等信息
+     * @param name Slot 的名称（可能与 column.getName() 不同，例如视图中的别名）
+     * @param qualifier 表的限定符列表，例如 [catalog, db, table]
+     * @return 创建的 SlotReference 对象，代表数据流中的一个位置
+     */
     public static SlotReference fromColumn(
             ExprId exprId, TableIf table, Column column, String name, List<String> qualifier) {
+        // 步骤 1: 类型转换
+        // 将 Catalog 层的 Type（如 org.apache.doris.catalog.Type）转换为 Nereids 层的 DataType
+        // 例如：Type.INT -> IntegerType.INSTANCE
         DataType dataType = DataType.fromCatalogType(column.getType());
+        
+        // 步骤 2: 创建 SlotReference
+        // 参数说明：
+        // - exprId: 唯一标识符
+        // - name: 列名（可能与 column.getName() 不同）
+        // - dataType: 转换后的数据类型
+        // - column.isAllowNull(): 是否可空
+        // - qualifier: 表的限定符
+        // - table, column: 原始表和列（用于视图等场景）
+        // - table, column: 一级表和列（不穿透视图）
+        // - ImmutableList.of(): 子路径（默认为空，用于复杂类型）
         return new SlotReference(exprId, name, dataType,
             column.isAllowNull(), qualifier, table, column, table, column, ImmutableList.of());
     }

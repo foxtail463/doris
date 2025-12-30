@@ -644,88 +644,112 @@ void StorageEngine::_adjust_compaction_thread_num() {
 }
 
 void StorageEngine::_compaction_tasks_producer_callback() {
+    // 压缩任务生产者回调函数 - 负责持续生成压缩任务
     LOG(INFO) << "try to start compaction producer process!";
 
+    // 获取所有数据目录
     std::vector<DataDir*> data_dirs = get_stores();
+    // 重置压缩任务提交注册表
     _compaction_submit_registry.reset(data_dirs);
 
-    int round = 0;
-    CompactionType compaction_type;
+    int round = 0;  // 轮次计数器，用于控制累积压缩和基础压缩的比例
+    CompactionType compaction_type;  // 压缩类型
 
-    // Used to record the time when the score metric was last updated.
-    // The update of the score metric is accompanied by the logic of selecting the tablet.
-    // If there is no slot available, the logic of selecting the tablet will be terminated,
-    // which causes the score metric update to be terminated.
-    // In order to avoid this situation, we need to update the score regularly.
-    int64_t last_cumulative_score_update_time = 0;
-    int64_t last_base_score_update_time = 0;
-    static const int64_t check_score_interval_ms = 5000; // 5 secs
+    // 用于记录分数指标最后更新的时间
+    // 分数指标的更新伴随着选择tablet的逻辑
+    // 如果没有可用的槽位，选择tablet的逻辑会被终止，
+    // 这会导致分数指标更新被终止
+    // 为了避免这种情况，我们需要定期更新分数
+    int64_t last_cumulative_score_update_time = 0;  // 累积压缩分数最后更新时间
+    int64_t last_base_score_update_time = 0;        // 基础压缩分数最后更新时间
+    static const int64_t check_score_interval_ms = 5000; // 5秒检查一次分数
 
+    // 设置压缩任务生成间隔
     int64_t interval = config::generate_compaction_tasks_interval_ms;
     do {
         int64_t cur_time = UnixMillis();
+        
+        // 检查是否启用自动压缩且内存未超限
         if (!config::disable_auto_compaction &&
             (!config::enable_compaction_pause_on_high_memory ||
              !GlobalMemoryArbitrator::is_exceed_soft_mem_limit(GB_EXCHANGE_BYTE))) {
+            
+            // 调整压缩线程数量
             _adjust_compaction_thread_num();
 
-            bool check_score = false;
+            bool check_score = false;  // 是否需要检查分数
+            
+            // 根据轮次决定压缩类型：累积压缩 vs 基础压缩
             if (round < config::cumulative_compaction_rounds_for_each_base_compaction_round) {
+                // 执行累积压缩
                 compaction_type = CompactionType::CUMULATIVE_COMPACTION;
                 round++;
+                // 检查是否需要更新累积压缩分数
                 if (cur_time - last_cumulative_score_update_time >= check_score_interval_ms) {
                     check_score = true;
                     last_cumulative_score_update_time = cur_time;
                 }
             } else {
+                // 执行基础压缩
                 compaction_type = CompactionType::BASE_COMPACTION;
-                round = 0;
+                round = 0;  // 重置轮次
+                // 检查是否需要更新基础压缩分数
                 if (cur_time - last_base_score_update_time >= check_score_interval_ms) {
                     check_score = true;
                     last_base_score_update_time = cur_time;
                 }
             }
+            
+            // 根据压缩类型选择对应的线程池
             std::unique_ptr<ThreadPool>& thread_pool =
                     (compaction_type == CompactionType::CUMULATIVE_COMPACTION)
-                            ? _cumu_compaction_thread_pool
-                            : _base_compaction_thread_pool;
+                            ? _cumu_compaction_thread_pool      // 累积压缩线程池
+                            : _base_compaction_thread_pool;     // 基础压缩线程池
+            
+            // 根据压缩类型选择对应的每轮任务数指标
             bvar::Status<int64_t>& g_compaction_task_num_per_round =
                     (compaction_type == CompactionType::CUMULATIVE_COMPACTION)
                             ? g_cumu_compaction_task_num_per_round
                             : g_base_compaction_task_num_per_round;
+            
+            // 动态调整每轮压缩任务数量
             if (config::compaction_num_per_round != -1) {
+                // 如果配置了固定值，直接使用
                 _compaction_num_per_round = config::compaction_num_per_round;
             } else if (thread_pool->get_queue_size() == 0) {
-                // If all tasks in the thread pool queue are executed,
-                // double the number of tasks generated each time,
-                // with a maximum of config::max_automatic_compaction_num_per_round tasks per generation.
+                // 如果线程池队列为空（所有任务都执行完了），
+                // 将每轮生成的任务数翻倍，最大不超过配置的最大值
                 if (_compaction_num_per_round < config::max_automatic_compaction_num_per_round) {
                     _compaction_num_per_round *= 2;
                     g_compaction_task_num_per_round.set_value(_compaction_num_per_round);
                 }
             } else if (thread_pool->get_queue_size() > _compaction_num_per_round / 2) {
-                // If all tasks in the thread pool is greater than
-                // half of the tasks submitted in the previous round,
-                // reduce the number of tasks generated each time by half, with a minimum of 1.
+                // 如果线程池队列中的任务数大于上一轮提交任务数的一半，
+                // 将每轮生成的任务数减半，最小为1
                 if (_compaction_num_per_round > 1) {
                     _compaction_num_per_round /= 2;
                     g_compaction_task_num_per_round.set_value(_compaction_num_per_round);
                 }
             }
+            
+            // 生成压缩任务，返回需要压缩的tablet列表
             std::vector<TabletSharedPtr> tablets_compaction =
                     _generate_compaction_tasks(compaction_type, data_dirs, check_score);
+            
             if (tablets_compaction.size() == 0) {
+                // 如果没有找到需要压缩的tablet，进入等待状态
                 std::unique_lock<std::mutex> lock(_compaction_producer_sleep_mutex);
                 _wakeup_producer_flag = 0;
-                // It is necessary to wake up the thread on timeout to prevent deadlock
-                // in case of no running compaction task.
+                // 必须在超时时唤醒线程以防止死锁（在没有运行压缩任务的情况下）
                 _compaction_producer_sleep_cv.wait_for(
                         lock, std::chrono::milliseconds(2000),
                         [this] { return _wakeup_producer_flag == 1; });
                 continue;
             }
 
+            // 遍历所有需要压缩的tablet，提交压缩任务
             for (const auto& tablet : tablets_compaction) {
+                // 根据压缩类型设置对应的调度时间
                 if (compaction_type == CompactionType::BASE_COMPACTION) {
                     tablet->set_last_base_compaction_schedule_time(UnixMillis());
                 } else if (compaction_type == CompactionType::CUMULATIVE_COMPACTION) {
@@ -733,6 +757,8 @@ void StorageEngine::_compaction_tasks_producer_callback() {
                 } else if (compaction_type == CompactionType::FULL_COMPACTION) {
                     tablet->set_last_full_compaction_schedule_time(UnixMillis());
                 }
+                
+                // 提交压缩任务到线程池
                 Status st = _submit_compaction_task(tablet, compaction_type, false);
                 if (!st.ok()) {
                     LOG(WARNING) << "failed to submit compaction task for tablet: "
@@ -741,16 +767,19 @@ void StorageEngine::_compaction_tasks_producer_callback() {
             }
             interval = config::generate_compaction_tasks_interval_ms;
         } else {
+            // 如果禁用了自动压缩或内存超限，等待5秒后重新检查
             interval = 5000; // 5s to check disable_auto_compaction
         }
 
-        // wait some seconds for ut test
+        // 单元测试用的同步点，等待一些秒数
         {
             std ::vector<std ::any> args {};
             args.emplace_back(1);
             doris ::SyncPoint ::get_instance()->process(
                     "StorageEngine::_compaction_tasks_producer_callback", std ::move(args));
         }
+        
+        // 记录本轮执行时间到指标
         int64_t end_time = UnixMillis();
         DorisMetrics::instance()->compaction_producer_callback_a_round_time->set_value(end_time -
                                                                                        cur_time);
@@ -970,14 +999,24 @@ bool has_free_compaction_slot(CompactionSubmitRegistry* registry, DataDir* dir,
             !registry->has_compaction_task(dir, CompactionType::CUMULATIVE_COMPACTION));
 }
 
+// 生成本轮需要执行压缩（compaction）的tablet列表。
+// 整体流程：
+// 1) 刷新/初始化累积压缩策略缓存
+// 2) 打乱数据目录顺序，避免热点磁盘
+// 3) 针对每个数据目录，判断是否还有可用的压缩并发槽位
+// 4) 从该目录挑选按分数排序的前N个tablet（即使没有槽位也要挑选，用于更新指标）
+// 5) 计算每个磁盘允许的并发度并决定是否真正入队
+// 6) 统计最大分数用于指标上报，并返回最终选择的tablet
 std::vector<TabletSharedPtr> StorageEngine::_generate_compaction_tasks(
         CompactionType compaction_type, std::vector<DataDir*>& data_dirs, bool check_score) {
     TEST_SYNC_POINT_RETURN_WITH_VALUE("olap_server::_generate_compaction_tasks.return_empty",
                                       std::vector<TabletSharedPtr> {});
+    // 确保累积压缩策略已初始化（惰性初始化）
     _update_cumulative_compaction_policy();
     std::vector<TabletSharedPtr> tablets_compaction;
     uint32_t max_compaction_score = 0;
 
+    // 打乱数据目录，使选择更均匀分布到不同磁盘
     std::random_device rd;
     std::mt19937 g(rd());
     std::shuffle(data_dirs.begin(), data_dirs.end(), g);
@@ -986,11 +1025,13 @@ std::vector<TabletSharedPtr> StorageEngine::_generate_compaction_tasks(
     // when traversing the data dir
     auto compaction_registry_snapshot = _compaction_submit_registry.create_snapshot();
     for (auto* data_dir : data_dirs) {
+        // 判断该磁盘是否还有可用于新压缩任务的并发槽位
         bool need_pick_tablet = true;
         uint32_t executing_task_num =
                 compaction_registry_snapshot.count_executing_cumu_and_base(data_dir);
         need_pick_tablet = has_free_compaction_slot(&compaction_registry_snapshot, data_dir,
                                                     compaction_type, executing_task_num);
+        // 若没有槽位且无需强制更新分数指标，则跳过该目录
         if (!need_pick_tablet && !check_score) {
             continue;
         }
@@ -998,18 +1039,22 @@ std::vector<TabletSharedPtr> StorageEngine::_generate_compaction_tasks(
         // Even if need_pick_tablet is false, we still need to call find_best_tablet_to_compaction(),
         // So that we can update the max_compaction_score metric.
         if (!data_dir->reach_capacity_limit(0)) {
+            // 按策略从该磁盘中挑选分数最高的前N个tablet
             uint32_t disk_max_score = 0;
             auto tablets = compaction_registry_snapshot.pick_topn_tablets_for_compaction(
                     _tablet_manager.get(), data_dir, compaction_type,
                     _cumulative_compaction_policies, &disk_max_score);
+            // 基于分数与配置的槽位数，计算每个磁盘允许的并发数量
             int concurrent_num =
                     get_concurrent_per_disk(disk_max_score, disk_compaction_slot_num(*data_dir));
+            // 判断本轮是否实际需要将任务入队
             need_pick_tablet = need_generate_compaction_tasks(
                     executing_task_num, concurrent_num, compaction_type,
                     !compaction_registry_snapshot.has_compaction_task(
                             data_dir, CompactionType::CUMULATIVE_COMPACTION));
             for (const auto& tablet : tablets) {
                 if (tablet != nullptr) {
+                    // 仅在有容量时入队；无论是否入队都要更新最大分数指标
                     if (need_pick_tablet) {
                         tablets_compaction.emplace_back(tablet);
                     }
@@ -1019,6 +1064,7 @@ std::vector<TabletSharedPtr> StorageEngine::_generate_compaction_tasks(
         }
     }
 
+    // 上报最大压缩分数指标
     if (max_compaction_score > 0) {
         if (compaction_type == CompactionType::BASE_COMPACTION) {
             DorisMetrics::instance()->tablet_base_max_compaction_score->set_value(

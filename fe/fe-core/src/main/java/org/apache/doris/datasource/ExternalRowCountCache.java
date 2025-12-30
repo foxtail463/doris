@@ -39,6 +39,8 @@ public class ExternalRowCountCache {
     private static final Logger LOG = LogManager.getLogger(ExternalRowCountCache.class);
     private final AsyncLoadingCache<RowCountKey, Optional<Long>> rowCountCache;
 
+    // 用途：缓存外部表（含 Hive 等）的行数，降低频繁访问外部元数据源的开销。
+    // 策略：使用 Caffeine AsyncLoadingCache，支持过期与刷新策略，行数缺失时异步加载。
     public ExternalRowCountCache(ExecutorService executor) {
         // 1. set expireAfterWrite to 1 day, avoid too many entries
         // 2. set refreshAfterWrite to 10min(default), so that the cache will be refreshed after 10min
@@ -71,11 +73,14 @@ public class ExternalRowCountCache {
             if (!(obj instanceof RowCountKey)) {
                 return false;
             }
+            // 仅基于 tableId 判等/哈希：意味着同一 tableId 在不同 catalog/db 下会被视为同一个键。
+            // 注意：这依赖 tableId 在全局唯一（通常满足）。
             return ((RowCountKey) obj).tableId == this.tableId;
         }
 
         @Override
         public int hashCode() {
+            // 与 equals 一致，仅基于 tableId。
             return (int) tableId;
         }
     }
@@ -84,6 +89,7 @@ public class ExternalRowCountCache {
         @Override
         protected Optional<Long> doLoad(RowCountKey rowCountKey) {
             try {
+                // 通过 catalogId/dbId/tableId 定位表并获取行数，包装为 Optional
                 TableIf table = StatisticsUtil.findTable(rowCountKey.catalogId, rowCountKey.dbId, rowCountKey.tableId);
                 return Optional.of(table.fetchRowCount());
             } catch (Exception e) {
@@ -103,6 +109,7 @@ public class ExternalRowCountCache {
                 // Null may raise NPE in caller, but that is expected.
                 // We catch that NPE and return a default value -1 without keep the value in cache,
                 // so we can trigger the load function to fetch row count again next time in this exception case.
+                // 中文补充：返回 null（而非 Optional.empty）可避免错误结果被缓存，允许下次再次尝试加载。
                 return null;
             }
         }
@@ -120,8 +127,10 @@ public class ExternalRowCountCache {
             // Get row count synchronously by default.
             if (ConnectContext.get() == null
                     || ConnectContext.get().getSessionVariable().fetchHiveRowCountSync) {
+                // 同步模式：阻塞等待结果，未命中则触发异步加载并等待其完成
                 return f.get().orElse(TableIf.UNKNOWN_ROW_COUNT);
             } else {
+                // 异步模式：如果已完成则返回，否则不阻塞，返回默认值
                 if (f.isDone()) {
                     return f.get().orElse(TableIf.UNKNOWN_ROW_COUNT);
                 }
@@ -143,13 +152,16 @@ public class ExternalRowCountCache {
         try {
             CompletableFuture<Optional<Long>> f = rowCountCache.getIfPresent(key);
             if (f == null) {
+                // 缓存不存在：不触发加载，直接返回 -1 表示未知
                 return -1;
             } else if (f.isDone()) {
+                // 已计算完成：返回值（缺失则为 -1）
                 return f.get().orElse(-1L);
             }
         } catch (Exception e) {
             LOG.warn("Unexpected exception while returning row count if present", e);
         }
+        // 仍在计算中或异常：返回 -1 表示当前不可用
         return -1;
     }
 

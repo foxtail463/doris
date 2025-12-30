@@ -171,61 +171,213 @@ HashJoinProbeOperatorX::HashJoinProbeOperatorX(ObjectPool* pool, const TPlanNode
                                    ? tnode.distribute_expr_lists[0]
                                    : std::vector<TExpr> {}) {}
 
+/**
+ * 从 Hash 表中拉取 Join 结果
+ * 
+ * 【功能说明】
+ * 这是 Hash Join Probe 算子的核心方法，负责：
+ * 1. 处理 Probe 数据与 Build 表的 Hash Join
+ * 2. 处理右表未匹配的数据（RIGHT_SEMI_ANTI、OUTER JOIN）
+ * 3. 应用过滤条件并构建输出数据块
+ * 
+ * 【工作流程】
+ * 1. 检查短路策略（short_circuit_for_probe）：如果启用，直接返回空结果
+ * 2. 检查空右表短路（empty_right_table_shortcut）：如果右表为空且是特定 Join 类型，直接返回 Probe 数据 + NULL 列
+ * 3. 处理 Probe 数据：
+ *    - 如果还有未处理的 Probe 数据：调用 process() 进行 Hash Join
+ *    - 如果 Probe 数据已处理完：调用 finish_probing() 处理右表未匹配的数据
+ * 4. 过滤和构建输出：应用其他 Join 条件和过滤条件，构建最终输出
+ * 
+ * 【关键设计】
+ * - 短路优化：当 Build 表为空或满足特定条件时，跳过 Hash Join 计算
+ * - 分阶段处理：先处理 Probe 数据，再处理右表未匹配数据
+ * - 多态 Hash 表：使用 std::visit 支持不同类型的 Hash 表
+ * 
+ * 【示例】
+ * 假设 INNER JOIN，Probe 表有 1000 行，Build 表有 500 行：
+ * 
+ * 1. 处理 Probe 数据：
+ *    - 对每行 Probe 数据，在 Hash 表中查找匹配的 Build 数据
+ *    - 如果匹配，生成 Join 结果行
+ *    - 结果存储在 temp_block 中
+ * 
+ * 2. 处理右表未匹配数据（如果是 RIGHT_OUTER_JOIN）：
+ *    - 查找 Build 表中未被匹配的行
+ *    - 生成 NULL + Build 数据的行
+ * 
+ * 3. 过滤和输出：
+ *    - 应用其他 Join 条件（如 WHERE 子句）
+ *    - 构建最终输出数据块
+ * 
+ * @param state RuntimeState
+ * @param output_block 输出数据块（存储 Join 结果）
+ * @param eos 是否数据流结束（输出参数）
+ * @return Status
+ */
 Status HashJoinProbeOperatorX::pull(doris::RuntimeState* state, vectorized::Block* output_block,
                                     bool* eos) const {
     auto& local_state = get_local_state(state);
+    
+    // ===== 阶段 1：检查短路策略 =====
+    // short_circuit_for_probe：当 Build 表为空且是特定 Join 类型时，直接返回空结果
+    // 例如：INNER JOIN 且 Build 表为空 → 结果为空，无需处理 Probe 数据
     if (local_state._shared_state->short_circuit_for_probe) {
-        // If we use a short-circuit strategy, should return empty block directly.
+        // 如果使用短路策略，直接返回空块
         *eos = true;
         return Status::OK();
     }
 
+    // ===== 阶段 2：检查空右表短路 =====
+    // empty_right_table_shortcut：当 Build 表为空且是特定 Join 类型时，返回 Probe 数据 + NULL 列
+    // 例如：LEFT_OUTER_JOIN 且 Build 表为空 → 返回 Probe 数据 + Build 表的 NULL 列
     //TODO: this short circuit maybe could refactor, no need to check at here.
     if (local_state.empty_right_table_shortcut()) {
-        // when build table rows is 0 and not have other_join_conjunct and join type is one of LEFT_OUTER_JOIN/FULL_OUTER_JOIN/LEFT_ANTI_JOIN
-        // we could get the result is probe table + null-column(if need output)
-        // If we use a short-circuit strategy, should return block directly by add additional null data.
+        // 当 Build 表行数为 0 且没有其他 Join 条件，且 Join 类型是以下之一：
+        // LEFT_OUTER_JOIN/FULL_OUTER_JOIN/LEFT_ANTI_JOIN
+        // 我们可以直接返回 Probe 表 + NULL 列（如果需要输出）
+        // 如果使用短路策略，直接返回块，添加额外的 NULL 数据
+        
         auto block_rows = local_state._probe_block.rows();
+        // 如果 Probe 数据已结束且块为空，返回 EOS
         if (local_state._probe_eos && block_rows == 0) {
             *eos = true;
             return Status::OK();
         }
 
-        //create build side null column, if need output
+        // ===== 创建 Build 侧的 NULL 列（如果需要输出） =====
+        // 对于 LEFT_OUTER_JOIN/FULL_OUTER_JOIN，需要输出 Build 表的列（填充 NULL）
+        // 对于 LEFT_ANTI_JOIN，不需要输出 Build 表的列
         for (int i = 0;
              (_join_op != TJoinOp::LEFT_ANTI_JOIN) && i < _right_output_slot_flags.size(); ++i) {
+            // 创建非 NULL 类型的列
             auto type = remove_nullable(_right_table_data_types[i]);
             auto column = type->create_column();
             column->resize(block_rows);
+            
+            // 创建 NULL Map（所有行都是 NULL）
             auto null_map_column = vectorized::ColumnUInt8::create(block_rows, 1);
+            // 创建可 NULL 列
             auto nullable_column = vectorized::ColumnNullable::create(std::move(column),
                                                                       std::move(null_map_column));
+            // 插入到 Probe 块中
             local_state._probe_block.insert({std::move(nullable_column), make_nullable(type),
                                              _right_table_column_names[i]});
         }
 
-        /// No need to check the block size in `_filter_data_and_build_output` because here dose not
-        /// increase the output rows count(just same as `_probe_block`'s rows count).
+        // 不需要在 `filter_data_and_build_output` 中检查块大小，因为这里不会增加输出行数
+        // （输出行数等于 `_probe_block` 的行数）
         RETURN_IF_ERROR(local_state.filter_data_and_build_output(state, output_block, eos,
                                                                  &local_state._probe_block, false));
+        // 清空 Probe 块的数据（保留列结构）
         local_state._probe_block.clear_column_data(_child->row_desc().num_materialized_slots());
         return Status::OK();
     }
 
+    // ===== 阶段 3：正常的 Hash Join 处理 =====
+    // 清空 Join 块（用于存储 Join 结果）
     local_state._join_block.clear_column_data();
 
+    // 创建可变的 Join 块（用于写入 Join 结果）
     vectorized::MutableBlock mutable_join_block(&local_state._join_block);
+    // 临时块（用于存储过滤后的结果）
     vectorized::Block temp_block;
 
     Status st;
+    
+    // ===== 情况 A：还有未处理的 Probe 数据 =====
+    // _probe_index：当前处理的 Probe 数据行索引
+    // 如果 _probe_index < _probe_block.rows()，说明还有数据未处理
     if (local_state._probe_index < local_state._probe_block.rows()) {
+        // 确保已经设置了 NULL Map（用于处理 NULL 值）
         DCHECK(local_state._has_set_need_null_map_for_probe);
+        
+        // ===== 使用 std::visit 处理不同类型的 Hash 表 =====
+        // 
+        // 【为什么 std::visit 有三个参数？】
+        // std::visit 可以接受多个 variant 参数，当有多个 variant 时，它会遍历所有 variant 的组合。
+        // 
+        // 这里有两个独立的 variant：
+        // 1. Hash 表类型 variant（method_variant）：
+        //    - 可能的值：UInt8、UInt16、UInt32、UInt64、UInt128、UInt256、String、FixedKey 等
+        //    - 决定了如何查找：不同的键类型有不同的 Hash 计算和查找方法
+        //    - 例如：UInt64 键使用 CRC32 Hash，String 键使用字符串 Hash
+        // 
+        // 2. Join 操作类型 variant（_process_hashtable_ctx_variants）：
+        //    - 可能的值：INNER_JOIN、LEFT_OUTER_JOIN、RIGHT_OUTER_JOIN、LEFT_SEMI_JOIN 等
+        //    - 决定了如何处理匹配结果：不同的 Join 类型有不同的输出逻辑
+        //    - 例如：INNER JOIN 只输出匹配的行，LEFT OUTER JOIN 还要输出未匹配的左表行
+        // 
+        // 【为什么需要两个 variant？】
+        // Hash 表类型和 Join 操作类型是两个独立的维度，需要组合才能确定最终的处理逻辑。
+        // 例如：
+        // - UInt64 Hash 表 + INNER JOIN → 使用 UInt64 的查找方法 + INNER JOIN 的输出逻辑
+        // - String Hash 表 + LEFT OUTER JOIN → 使用 String 的查找方法 + LEFT OUTER JOIN 的输出逻辑
+        // 
+        // 【std::visit 的工作原理】
+        // 1. std::visit 会检查两个 variant 中实际存储的类型
+        // 2. 根据实际类型组合，调用 Lambda 函数
+        // 3. Lambda 函数中的 arg 和 process_hashtable_ctx 会被设置为对应的实际类型
+        // 4. 编译器会根据这两个类型，选择对应的 process() 方法实现（通过模板特化）
+        // 
+        // 【示例】
+        // 假设：
+        // - method_variant 存储的是 PrimaryTypeHashTableContext<UInt64>
+        // - _process_hashtable_ctx_variants 存储的是 ProcessHashTableProbe<TJoinOp::INNER_JOIN>
+        // 
+        // 那么：
+        // - arg 的类型是 PrimaryTypeHashTableContext<UInt64>&
+        // - process_hashtable_ctx 的类型是 ProcessHashTableProbe<TJoinOp::INNER_JOIN>&
+        // - 编译器会选择 ProcessHashTableProbe<TJoinOp::INNER_JOIN>::process(PrimaryTypeHashTableContext<UInt64>&, ...) 的实现
+        // 
         std::visit(
+                // ===== Lambda 函数：处理 Hash Join =====
+                // [&]：捕获所有外部变量（按引用）
+                // auto&& arg：第一个 variant 的实际类型（Hash 表类型，如 PrimaryTypeHashTableContext<UInt64>）
+                // auto&& process_hashtable_ctx：第二个 variant 的实际类型（Join 操作类型，如 ProcessHashTableProbe<TJoinOp::INNER_JOIN>）
                 [&](auto&& arg, auto&& process_hashtable_ctx) {
+                    // ===== 步骤 1：获取处理上下文的类型 =====
+                    // std::decay_t：去除引用和 const 修饰符，获取核心类型
+                    // 例如：const PrimaryTypeHashTableContext<UInt64>& → PrimaryTypeHashTableContext<UInt64>
                     using HashTableProbeType = std::decay_t<decltype(process_hashtable_ctx)>;
+                    
+                    // ===== 步骤 2：检查处理上下文是否已初始化 =====
+                    // if constexpr：编译时条件判断（不是运行时判断）
+                    // std::monostate：表示 variant 未初始化（空状态）
+                    // 如果处理上下文未初始化，说明 Hash Join 还未准备好
                     if constexpr (!std::is_same_v<HashTableProbeType, std::monostate>) {
+                        // ===== 步骤 3：获取 Hash 表的类型 =====
                         using HashTableCtxType = std::decay_t<decltype(arg)>;
+                        
+                        // ===== 步骤 4：检查 Hash 表是否已初始化 =====
                         if constexpr (!std::is_same_v<HashTableCtxType, std::monostate>) {
+                            // ===== 步骤 5：调用 process() 方法进行 Hash Join =====
+                            // 
+                            // 【类型组合决定方法选择】
+                            // 编译器会根据 arg 和 process_hashtable_ctx 的实际类型组合，
+                            // 选择对应的 process() 方法实现（通过模板特化）。
+                            // 
+                            // 【示例】
+                            // 假设：
+                            // - arg 是 PrimaryTypeHashTableContext<UInt64>（UInt64 键的 Hash 表）
+                            // - process_hashtable_ctx 是 ProcessHashTableProbe<TJoinOp::INNER_JOIN>（INNER JOIN 处理逻辑）
+                            // 
+                            // 那么编译器会选择：
+                            // ProcessHashTableProbe<TJoinOp::INNER_JOIN>::process(
+                            //     PrimaryTypeHashTableContext<UInt64>& hash_table_ctx,
+                            //     ...)
+                            // 
+                            // 这个方法会：
+                            // 1. 使用 UInt64 的 Hash 计算方法查找匹配的行
+                            // 2. 使用 INNER JOIN 的输出逻辑处理匹配结果（只输出匹配的行）
+                            // 
+                            // 【参数说明】
+                            // - arg：Hash 表上下文（包含 Hash 表实例），决定了如何查找
+                            // - process_hashtable_ctx：Join 处理上下文，决定了如何处理匹配结果
+                            // - _null_map_column：NULL Map 列（用于处理 NULL 值）
+                            // - mutable_join_block：可变的 Join 块（写入 Join 结果）
+                            // - temp_block：临时块（存储 Join 结果）
+                            // - _probe_block.rows()：Probe 块的行数
+                            // - _is_mark_join：是否是 Mark Join
                             st = process_hashtable_ctx.process(
                                     arg,
                                     local_state._null_map_column
@@ -235,26 +387,53 @@ Status HashJoinProbeOperatorX::pull(doris::RuntimeState* state, vectorized::Bloc
                                     cast_set<uint32_t>(local_state._probe_block.rows()),
                                     _is_mark_join);
                         } else {
+                            // Hash 表未初始化，返回错误
                             st = Status::InternalError("uninited hash table");
                         }
                     } else {
+                        // 处理上下文未初始化，返回错误
                         st = Status::InternalError("uninited hash table probe");
                     }
                 },
+                // ===== std::visit 的第二个参数：Hash 表类型 variant =====
+                // 类型：HashTableVariants（std::variant）
+                // 可能的值：PrimaryTypeHashTableContext<UInt8/16/32/64/128/256>、String、FixedKey 等
+                // 作用：决定如何查找（Hash 计算、桶定位、键比较等）
+                // 
+                // 根据任务数量选择对应的 Hash 表：
+                // - Broadcast Join（size == 1）：所有任务共享 hash_table_variant_vector[0]
+                // - Partitioned Join（size > 1）：每个任务使用 hash_table_variant_vector[task_idx]
+                // 
+                // 这个 variant 对应 Lambda 函数中的 arg 参数
                 local_state._shared_state->hash_table_variant_vector.size() == 1
                         ? local_state._shared_state->hash_table_variant_vector[0]->method_variant
                         : local_state._shared_state
                                   ->hash_table_variant_vector[local_state._task_idx]
                                   ->method_variant,
+                // ===== std::visit 的第三个参数：Join 操作类型 variant =====
+                // 类型：HashTableCtxVariants（std::variant）
+                // 可能的值：ProcessHashTableProbe<TJoinOp::INNER_JOIN>、ProcessHashTableProbe<TJoinOp::LEFT_OUTER_JOIN> 等
+                // 作用：决定如何处理匹配结果（输出逻辑、未匹配行的处理等）
+                // 
+                // 这个 variant 对应 Lambda 函数中的 process_hashtable_ctx 参数
+                // 它包含了对应 Join 类型的 process() 方法实现
                 *local_state._process_hashtable_ctx_variants);
-    } else if (local_state._probe_eos) {
+    } 
+    // ===== 情况 B：Probe 数据已处理完，处理右表未匹配数据 =====
+    // 如果 Probe 数据已结束（_probe_eos == true），需要处理右表未匹配的数据
+    // 这适用于 RIGHT_SEMI_ANTI、RIGHT_OUTER_JOIN、FULL_OUTER_JOIN 等 Join 类型
+    else if (local_state._probe_eos) {
+        // 如果是 RIGHT_SEMI_ANTI 或 OUTER JOIN（除了 LEFT_OUTER_JOIN），需要处理右表未匹配数据
         if (_is_right_semi_anti || (_is_outer_join && _join_op != TJoinOp::LEFT_OUTER_JOIN)) {
+            // 调用 finish_probing() 方法处理右表未匹配的数据
             std::visit(
                     [&](auto&& arg, auto&& process_hashtable_ctx) {
                         using HashTableProbeType = std::decay_t<decltype(process_hashtable_ctx)>;
                         if constexpr (!std::is_same_v<HashTableProbeType, std::monostate>) {
                             using HashTableCtxType = std::decay_t<decltype(arg)>;
                             if constexpr (!std::is_same_v<HashTableCtxType, std::monostate>) {
+                                // finish_probing()：处理右表未匹配的数据
+                                // 例如：RIGHT_OUTER_JOIN 中，查找 Build 表中未被匹配的行
                                 st = process_hashtable_ctx.finish_probing(
                                         arg, mutable_join_block, &temp_block, eos, _is_mark_join);
                             } else {
@@ -264,6 +443,7 @@ Status HashJoinProbeOperatorX::pull(doris::RuntimeState* state, vectorized::Bloc
                             st = Status::InternalError("uninited hash table probe");
                         }
                     },
+                    // 选择 Hash 表变体（同上）
                     local_state._shared_state->hash_table_variant_vector.size() == 1
                             ? local_state._shared_state->hash_table_variant_vector[0]
                                       ->method_variant
@@ -272,21 +452,37 @@ Status HashJoinProbeOperatorX::pull(doris::RuntimeState* state, vectorized::Bloc
                                       ->method_variant,
                     *local_state._process_hashtable_ctx_variants);
         } else {
+            // 其他 Join 类型（如 LEFT_OUTER_JOIN），不需要处理右表未匹配数据
             *eos = true;
             return Status::OK();
         }
     } else {
+        // ===== 情况 C：Probe 数据未结束，但当前块已处理完 =====
+        // 等待更多 Probe 数据
         return Status::OK();
     }
+    
+    // ===== 阶段 4：检查处理结果 =====
+    // 如果处理失败，返回错误
     if (!st) {
         return st;
     }
 
+    // ===== 阶段 5：过滤和构建输出 =====
+    // 更新内存使用估计（加上临时块的内存）
     local_state._estimate_memory_usage += temp_block.allocated_bytes();
+    
+    // 应用过滤条件并构建输出数据块
+    // filter_data_and_build_output() 会：
+    // 1. 应用其他 Join 条件（如 WHERE 子句）
+    // 2. 构建最终输出数据块（选择需要的列）
     RETURN_IF_ERROR(
             local_state.filter_data_and_build_output(state, output_block, eos, &temp_block));
-    // Here make _join_block release the columns' ptr
+    
+    // ===== 阶段 6：清理资源 =====
+    // 释放 _join_block 中的列指针（避免内存泄漏）
     local_state._join_block.set_columns(local_state._join_block.clone_empty_columns());
+    // 清空可变块
     mutable_join_block.clear();
     return Status::OK();
 }
@@ -402,31 +598,114 @@ Status HashJoinProbeOperatorX::_do_evaluate(vectorized::Block& block,
     return Status::OK();
 }
 
+/**
+ * 接收 Probe 侧的输入数据块，并进行预处理
+ * 
+ * 【功能说明】
+ * 这是 Hash Join Probe 算子的输入接口，负责接收来自上游算子的 Probe 数据块。
+ * 主要完成以下工作：
+ * 1. 重置 Probe 状态，准备处理新的数据块
+ * 2. 执行 Probe 侧的表达式，计算 Join 键的值
+ * 3. 对于 RIGHT/FULL OUTER JOIN，将 Probe 侧列转换为 Nullable
+ * 4. 提取 Join 键列，准备用于 Hash 表查找
+ * 5. 统计内存使用情况
+ * 
+ * 【处理流程】
+ * 1. 状态重置：
+ *    - 调用 `prepare_for_next()` 重置 `_probe_index`、`_build_index`、`_ready_probe` 等状态
+ *    - 设置 `_probe_eos` 标志，表示 Probe 数据是否结束
+ * 
+ * 2. 表达式计算（如果数据块非空）：
+ *    - 调用 `_do_evaluate()` 执行 `_probe_expr_ctxs` 中的表达式
+ *    - 这些表达式通常是 Join 键的计算表达式（如 `a + b`、`func(c)` 等）
+ *    - 结果存储在 `res_col_ids` 中，表示计算出的列在 Block 中的索引
+ *    - 例如：如果 Join 键是 `t1.a = t2.b`，则 `_probe_expr_ctxs[0]` 计算 `t1.a` 的值
+ * 
+ * 3. NULL 值处理（仅 RIGHT/FULL OUTER JOIN）：
+ *    - 对于 RIGHT OUTER JOIN 和 FULL OUTER JOIN，需要输出未匹配的 Build 侧行
+ *    - 当 Probe 侧行未匹配时，Probe 侧的列需要填充为 NULL
+ *    - 调用 `_convert_block_to_null()` 将 Probe 侧的所有列转换为 Nullable 类型
+ *    - 例如：RIGHT JOIN 中，如果 Build 侧行未匹配，Probe 侧列需要输出 NULL
+ * 
+ * 4. Join 键列提取：
+ *    - 调用 `_extract_join_column()` 从 Block 中提取 Join 键列
+ *    - 根据 NULL 值处理策略（`_serialize_null_into_key`）进行列转换：
+ *      * 如果 `serialize_null_into_key = true`：将 NULL 序列化到键中（用于 NULL Safe Equal Join <=>）
+ *      * 如果 `serialize_null_into_key = false`：使用外部 NULL Map 表示 NULL（用于普通 Join =）
+ *    - 提取的列存储在 `_probe_columns` 中，后续用于 Hash 表查找
+ * 
+ * 5. 内存管理：
+ *    - 统计表达式计算和列转换后的内存增长
+ *    - 如果 `input_block` 和 `_probe_block` 不是同一个对象，则交换数据
+ *    - 更新内存使用计数器
+ * 
+ * 【参数说明】
+ * @param state 运行时状态
+ * @param input_block Probe 侧的输入数据块（可能为空）
+ * @param eos 是否表示 Probe 数据结束（End of Stream）
+ * @return Status
+ * 
+ * 【使用示例】
+ * 假设有一个 Hash Join：`SELECT * FROM t1 JOIN t2 ON t1.a = t2.b`
+ * 1. 上游算子（如 Scan）调用 `push(state, block, false)` 推送 `t1` 的数据块
+ * 2. `push` 方法执行表达式 `t1.a`，得到 Join 键列
+ * 3. 提取 Join 键列到 `_probe_columns`，准备用于 Hash 表查找
+ * 4. 后续 `pull` 方法会使用 `_probe_columns` 在 Hash 表中查找匹配的 Build 侧行
+ * 
+ * 【注意事项】
+ * - 如果 `input_block` 为空（`rows == 0`），只更新 `_probe_eos` 标志，不进行其他处理
+ * - `_probe_block` 是 Probe 算子的内部缓冲区，用于存储预处理后的 Probe 数据
+ * - 对于 Broadcast Join，所有 Probe 算子共享同一个 Hash 表，但每个算子有独立的 `_probe_block`
+ */
 Status HashJoinProbeOperatorX::push(RuntimeState* state, vectorized::Block* input_block,
                                     bool eos) const {
     auto& local_state = get_local_state(state);
+    // ===== 步骤 1：重置 Probe 状态，准备处理新的数据块 =====
+    // 重置 _probe_index、_build_index、_ready_probe 等状态变量
     local_state.prepare_for_next();
+    // 设置 Probe 数据结束标志
     local_state._probe_eos = eos;
 
     const auto rows = input_block->rows();
     size_t origin_size = input_block->allocated_bytes();
 
     if (rows > 0) {
+        // ===== 步骤 2：统计 Probe 行数 =====
         COUNTER_UPDATE(local_state._probe_rows_counter, rows);
+        
+        // ===== 步骤 3：执行 Probe 侧的表达式，计算 Join 键的值 =====
+        // res_col_ids 存储表达式计算结果的列索引
+        // 例如：如果 Join 键是 t1.a，则 _probe_expr_ctxs[0] 计算 t1.a 的值
         std::vector<int> res_col_ids(local_state._probe_expr_ctxs.size());
         RETURN_IF_ERROR(_do_evaluate(*input_block, local_state._probe_expr_ctxs,
                                      *local_state._probe_expr_call_timer, res_col_ids));
+        
+        // ===== 步骤 4：对于 RIGHT/FULL OUTER JOIN，将 Probe 侧列转换为 Nullable =====
+        // 原因：当 Build 侧行未匹配时，Probe 侧列需要输出 NULL
+        // 例如：RIGHT JOIN 中，如果 Build 侧行未匹配，Probe 侧列需要填充为 NULL
         if (_join_op == TJoinOp::RIGHT_OUTER_JOIN || _join_op == TJoinOp::FULL_OUTER_JOIN) {
+            // _probe_column_convert_to_null 记录哪些列被转换了（用于后续输出）
             local_state._probe_column_convert_to_null =
                     local_state._convert_block_to_null(*input_block);
         }
 
+        // ===== 步骤 5：提取 Join 键列，准备用于 Hash 表查找 =====
+        // 根据 NULL 值处理策略（_serialize_null_into_key）进行列转换：
+        // - serialize_null_into_key = true：将 NULL 序列化到键中（用于 NULL Safe Equal Join <=>）
+        // - serialize_null_into_key = false：使用外部 NULL Map 表示 NULL（用于普通 Join =）
+        // 提取的列存储在 _probe_columns 中，后续用于 Hash 表查找
         RETURN_IF_ERROR(local_state._extract_join_column(*input_block, res_col_ids));
 
+        // ===== 步骤 6：统计内存使用情况 =====
+        // 计算表达式计算和列转换后的内存增长
         local_state._estimate_memory_usage += (input_block->allocated_bytes() - origin_size);
 
+        // ===== 步骤 7：交换数据到内部缓冲区 =====
+        // 如果 input_block 和 _probe_block 不是同一个对象，则交换数据
+        // _probe_block 是 Probe 算子的内部缓冲区，用于存储预处理后的 Probe 数据
         if (&local_state._probe_block != input_block) {
             input_block->swap(local_state._probe_block);
+            // 更新内存使用计数器
             COUNTER_SET(local_state._memory_used_counter,
                         (int64_t)local_state._probe_block.allocated_bytes());
         }

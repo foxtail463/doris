@@ -145,50 +145,59 @@ Status FileHandleCache::init() {
                           &FileHandleCache::_evict_handles_loop, this, &_eviction_thread);
 }
 
+// 从文件句柄缓存中获取/创建 HDFS 文件句柄：
+// - 先按 (fname, mtime) 做分区与查找；
+// - 非强制新建时若命中可用句柄则直接返回（提升并发复用效率）；
+// - 未命中或强制新建则 emplace 新句柄并初始化（需要与 NameNode 通信，可能耗时）；
+// - 若初始化失败，需将占位条目从缓存移除，避免脏条目；
+// - 最终通过 accessor 返回占用的缓存条目，并设置 cache_hit 指示命中情况。
 Status FileHandleCache::get_file_handle(const hdfsFS& fs, const std::string& fname, int64_t mtime,
                                         int64_t file_size, bool require_new_handle,
                                         FileHandleCache::Accessor* accessor, bool* cache_hit) {
     DCHECK_GE(mtime, 0);
-    // Hash the key and get appropriate partition
+    // 计算分区：对 (fname) 取哈希并按分区数取模，降低锁粒度
     int index =
             HashUtil::hash(fname.data(), cast_set<int>(fname.size()), 0) % _cache_partitions.size();
     FileHandleCachePartition& p = _cache_partitions[index];
 
     auto cache_key = std::make_pair(fname, mtime);
 
-    // If this requires a new handle, skip to the creation codepath. Otherwise,
-    // find an unused entry with the same mtime
+    // 非强制新建：尝试从缓存获取一个未被占用的同 mtime 句柄
     if (!require_new_handle) {
         auto cache_accessor = p.cache.get(cache_key);
 
         if (cache_accessor.get()) {
-            // Found a handler in cache and reserved it
+            // 命中缓存并成功保留（占用）
             *cache_hit = true;
             accessor->set(std::move(cache_accessor));
             return Status::OK();
         }
     }
 
-    // There was no entry that was free or caller asked for a new handle
+    // 未命中可用条目，或调用方要求强制新建
     *cache_hit = false;
 
-    // Emplace a new file handle and get access
+    // 在分区缓存中插入占位并获取访问器（后续需初始化底层句柄）
     auto accessor_tmp = p.cache.emplace_and_get(cache_key, fs, fname, mtime);
 
-    // Opening a file handle requires talking to the NameNode so it can take some time.
+    // 初始化底层 HDFS 文件句柄（涉及 NameNode 通信，可能较慢）
     Status status = accessor_tmp.get()->init(file_size);
     if (UNLIKELY(!status.ok())) {
-        // Removing the handler from the cache after failed initialization.
+        // 初始化失败：从缓存移除占位，避免污染缓存
         accessor_tmp.destroy();
         return status;
     }
 
-    // Moving the cache accessor to the in/out parameter
+    // 初始化成功：转移访问器给调用方
     accessor->set(std::move(accessor_tmp));
 
     return Status::OK();
 }
 
+// 后台淘汰线程：按“未使用超时”驱逐各分区中过期的文件句柄
+// - _unused_handle_timeout_secs == 0 时关闭淘汰
+// - 计算允许的最老时间戳 oldest_allowed_timestamp，驱逐 last_use_time 更早的条目
+// - 周期：1s 轮询一次，直到 _is_shut_down 置位
 void FileHandleCache::_evict_handles_loop() {
     while (!_is_shut_down.load()) {
         if (_unused_handle_timeout_secs) {
@@ -196,6 +205,7 @@ void FileHandleCache::_evict_handles_loop() {
                 uint64_t now = MonotonicSeconds();
                 uint64_t oldest_allowed_timestamp =
                         now > _unused_handle_timeout_secs ? now - _unused_handle_timeout_secs : 0;
+                // LruMultiCache 提供的按时间阈值驱逐接口
                 p.cache.evict_older_than(oldest_allowed_timestamp);
             }
         }

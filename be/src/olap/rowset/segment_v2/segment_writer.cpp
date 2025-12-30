@@ -670,15 +670,25 @@ Status SegmentWriter::append_block_with_partial_content(const vectorized::Block*
     return Status::OK();
 }
 
+/**
+ * 向Segment中追加一个数据块
+ * @param block 要追加的数据块指针
+ * @param row_pos 在数据块中的起始行位置
+ * @param num_rows 要追加的行数
+ * @return 操作状态
+ */
 Status SegmentWriter::append_block(const vectorized::Block* block, size_t row_pos,
                                    size_t num_rows) {
+    // 处理部分更新场景
     if (_opts.rowset_ctx->partial_update_info &&
         _opts.rowset_ctx->partial_update_info->is_partial_update() &&
         _opts.write_type == DataWriteType::TYPE_DIRECT &&
         !_opts.rowset_ctx->is_transient_rowset_writer) {
         if (_opts.rowset_ctx->partial_update_info->is_fixed_partial_update()) {
+            // 固定部分更新：直接调用部分内容追加方法
             RETURN_IF_ERROR(append_block_with_partial_content(block, row_pos, num_rows));
         } else {
+            // 灵活部分更新：SegmentWriter不支持，需要启用VerticalSegmentWriter
             return Status::NotSupported<false>(
                     "SegmentWriter doesn't support flexible partial update, please set "
                     "enable_vertical_segment_writer=true in be.conf on all BEs to use "
@@ -686,6 +696,8 @@ Status SegmentWriter::append_block(const vectorized::Block* block, size_t row_po
         }
         return Status::OK();
     }
+    
+    // 验证数据块列数与列写入器数量是否匹配
     if (block->columns() < _column_writers.size()) {
         return Status::InternalError(
                 "block->columns() < _column_writers.size(), block->columns()=" +
@@ -697,22 +709,23 @@ Status SegmentWriter::append_block(const vectorized::Block* block, size_t row_po
             << ", block->columns()=" << block->columns()
             << ", _column_writers.size()=" << _column_writers.size()
             << ", _tablet_schema->dump_structure()=" << _tablet_schema->dump_structure();
-    // Row column should be filled here when it's a directly write from memtable
-    // or it's schema change write(since column data type maybe changed, so we should reubild)
+    
+    // 对于直接写入（从memtable）或schema变更写入，需要序列化Block到行列
+    // 因为列数据类型可能发生变化，需要重新构建
     if (_opts.write_type == DataWriteType::TYPE_DIRECT ||
         _opts.write_type == DataWriteType::TYPE_SCHEMA_CHANGE) {
         _serialize_block_to_row_column(*block);
     }
 
+    // 设置OLAP数据转换器的源内容
     _olap_data_convertor->set_source_content(block, row_pos, num_rows);
 
-    // find all row pos for short key indexes
+    // 查找所有短键索引的行位置
     std::vector<size_t> short_key_pos;
     if (_has_key) {
-        // We build a short key index every `_opts.num_rows_per_block` rows. Specifically, we
-        // build a short key index using 1st rows for first block and `_short_key_row_pos - _row_count`
-        // for next blocks.
-        // Ensure we build a short key index using 1st rows only for the first block (ISSUE-9766).
+        // 每 `_opts.num_rows_per_block` 行构建一个短键索引
+        // 具体来说，第一个块使用第1行构建短键索引，后续块使用 `_short_key_row_pos - _row_count` 行
+        // 确保第一个块只使用第1行构建短键索引（ISSUE-9766）
         if (UNLIKELY(_short_key_row_pos == 0 && _num_rows_written == 0)) {
             short_key_pos.push_back(0);
         }
@@ -722,40 +735,47 @@ Status SegmentWriter::append_block(const vectorized::Block* block, size_t row_po
         }
     }
 
-    // convert column data from engine format to storage layer format
+    // 将列数据从引擎格式转换为存储层格式
     std::vector<vectorized::IOlapColumnDataAccessor*> key_columns;
     vectorized::IOlapColumnDataAccessor* seq_column = nullptr;
     for (size_t id = 0; id < _column_writers.size(); ++id) {
-        // olap data convertor alway start from id = 0
+        // OLAP数据转换器总是从id=0开始
         auto converted_result = _olap_data_convertor->convert_column_data(id);
         if (!converted_result.first.ok()) {
             return converted_result.first;
         }
         auto cid = _column_ids[id];
+        // 收集键列数据
         if (_has_key && cid < _tablet_schema->num_key_columns()) {
             key_columns.push_back(converted_result.second);
         } else if (_has_key && _tablet_schema->has_sequence_col() &&
                    cid == _tablet_schema->sequence_col_idx()) {
+            // 收集序列列数据
             seq_column = converted_result.second;
         }
+        // 将转换后的列数据追加到列写入器
         RETURN_IF_ERROR(_column_writers[id]->append(converted_result.second->get_nullmap(),
                                                     converted_result.second->get_data(), num_rows));
     }
+    
+    // 如果是压缩写入类型，计算变体统计信息
     if (_opts.write_type == DataWriteType::TYPE_COMPACTION) {
         RETURN_IF_ERROR(
                 _variant_stats_calculator->calculate_variant_stats(block, row_pos, num_rows));
     }
+    
+    // 如果有键，生成相应的索引
     if (_has_key) {
         if (_is_mow_with_cluster_key()) {
-            // for now we don't need to query short key index for CLUSTER BY feature,
-            // but we still write the index for future usage.
-            // 1. generate primary key index, the key_columns is primary_key_columns
+            // 带集群键的MOW（Merge-on-Write）模式
+            // 目前不需要为CLUSTER BY功能查询短键索引，但仍写入索引以供将来使用
+            // 1. 生成主键索引，key_columns是主键列
             RETURN_IF_ERROR(_generate_primary_key_index(_primary_key_coders, key_columns,
                                                         seq_column, num_rows, true));
-            // 2. generate short key index (use cluster key)
+            // 2. 生成短键索引（使用集群键）
             key_columns.clear();
             for (const auto& cid : _tablet_schema->cluster_key_uids()) {
-                // find cluster key index in tablet schema
+                // 在tablet schema中查找集群键索引
                 auto cluster_key_index = _tablet_schema->field_index(cid);
                 if (cluster_key_index == -1) {
                     return Status::InternalError(
@@ -783,13 +803,16 @@ Status SegmentWriter::append_block(const vectorized::Block* block, size_t row_po
             }
             RETURN_IF_ERROR(_generate_short_key_index(key_columns, num_rows, short_key_pos));
         } else if (_is_mow()) {
+            // 普通MOW模式：生成主键索引
             RETURN_IF_ERROR(_generate_primary_key_index(_key_coders, key_columns, seq_column,
                                                         num_rows, false));
         } else {
+            // 普通模式：生成短键索引
             RETURN_IF_ERROR(_generate_short_key_index(key_columns, num_rows, short_key_pos));
         }
     }
 
+    // 更新已写入行数并清理数据转换器的源内容
     _num_rows_written += num_rows;
     _olap_data_convertor->clear_source_content();
     return Status::OK();

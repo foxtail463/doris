@@ -127,16 +127,18 @@ class SubExprAnalyzer<T> extends DefaultExpressionRewriter<T> {
         if (!scalar.getCorrelateSlots().isEmpty()) {
             return scalar;
         }
+        // 对标量子查询进行独立分析：产出规范化后的子查询逻辑计划与相关列
         AnalyzedResult analyzedResult = analyzeSubquery(scalar);
         boolean isCorrelated = analyzedResult.isCorrelated();
         LogicalPlan analyzedSubqueryPlan = analyzedResult.logicalPlan;
+        // 标量子查询必须只返回一列
         checkOutputColumn(analyzedSubqueryPlan);
-        // use limitOneIsEliminated to indicate if subquery has limit 1 clause
-        // because limit 1 clause will ensure subquery output at most 1 row
-        // we eliminate limit 1 clause and pass this info to later SubqueryToApply rule
-        // so when creating LogicalApply node, we don't need to add AssertTrue function
+        // 用 limitOneIsEliminated 标记是否存在 "LIMIT 1"（且偏移为 0）
+        // 若存在，该约束可保证“至多一行”，这里将其消除并把标记传递给后续规则
+        // 后续在构造 LogicalApply 时可据此避免再插入行数断言
         boolean limitOneIsEliminated = false;
         if (isCorrelated) {
+            // 相关子查询上的 LIMIT 仅支持 offset=0 且 limit=1，其他场景直接报错
             if (analyzedSubqueryPlan instanceof LogicalLimit) {
                 LogicalLimit limit = (LogicalLimit) analyzedSubqueryPlan;
                 if (limit.getOffset() == 0 && limit.getLimit() == 1) {
@@ -149,11 +151,13 @@ class SubExprAnalyzer<T> extends DefaultExpressionRewriter<T> {
                             + analyzedResult.getLogicalPlan());
                 }
             }
+            // 顶层 Sort 对标量语义无影响，可直接消除
             if (analyzedSubqueryPlan instanceof LogicalSort) {
                 // skip useless sort node
                 analyzedResult = new AnalyzedResult((LogicalPlan) analyzedSubqueryPlan.child(0),
                         analyzedResult.correlatedSlots);
             }
+            // 校验：相关列不能出现在非法位置（如聚合、Join、Window 等敏感节点之前）
             CorrelatedSlotsValidator validator =
                     new CorrelatedSlotsValidator(ImmutableSet.copyOf(analyzedResult.correlatedSlots));
             List<PlanNodeCorrelatedInfo> nodeInfoList = new ArrayList<>(16);
@@ -166,6 +170,7 @@ class SubExprAnalyzer<T> extends DefaultExpressionRewriter<T> {
             if (oneRowRelation.getProjects().size() == 1 && oneRowRelation.getProjects().get(0) instanceof Alias) {
                 // if scalar subquery is like select '2024-02-02 00:00:00'
                 // we can just return the constant expr '2024-02-02 00:00:00'
+                // 常量标量子查询：直接折叠为常量表达式
                 Alias alias = (Alias) oneRowRelation.getProjects().get(0);
                 if (alias.isConstant()) {
                     return alias.child();
@@ -178,11 +183,13 @@ class SubExprAnalyzer<T> extends DefaultExpressionRewriter<T> {
                     && project.getProjects().get(0) instanceof Alias) {
                 // if scalar subquery is like select '2024-02-02 00:00:00'
                 // we can just return the constant expr '2024-02-02 00:00:00'
+                // 仍属于常量折叠场景
                 Alias alias = (Alias) project.getProjects().get(0);
                 if (alias.isConstant()) {
                     return alias.child();
                 }
             } else if (isCorrelated) {
+                // 校验：相关列不能泄露到子查询的输出列中
                 Set<Slot> correlatedSlots = new HashSet<>(analyzedResult.getCorrelatedSlots());
                 if (!Sets.intersection(ExpressionUtils.getInputSlotSet(project.getProjects()),
                         correlatedSlots).isEmpty()) {
@@ -193,6 +200,7 @@ class SubExprAnalyzer<T> extends DefaultExpressionRewriter<T> {
             }
         }
 
+        // 返回新的 ScalarSubquery，携带分析后的子查询计划、相关槽位，以及是否消除了 LIMIT 1 的标记
         return new ScalarSubquery(analyzedResult.getLogicalPlan(), analyzedResult.getCorrelatedSlots(),
                 limitOneIsEliminated);
     }
@@ -226,14 +234,22 @@ class SubExprAnalyzer<T> extends DefaultExpressionRewriter<T> {
         if (cascadesContext == null) {
             throw new IllegalStateException("Missing CascadesContext");
         }
+        // 为子查询创建独立的 CascadesContext：
+        // - 以当前表达式携带的 queryPlan 作为子查询的根计划
+        // - 复用外层的 CTE 上下文，保证子查询能解析/引用同一批 CTE 定义
         CascadesContext subqueryContext = CascadesContext.newContextWithCteContext(
                 cascadesContext, expr.getQueryPlan(), cascadesContext.getCteContext());
-        // don't use `getScope()` because we only need `getScope().getOuterScope()` and `getScope().getSlots()`
-        // otherwise unexpected errors may occur
+        // 注意：不要直接使用当前 getScope()，这里只需要外层作用域与已知槽位集合，
+        // 以便在子查询内识别并收集“相关列”（来自外层查询的列引用），避免引入不必要的上下文状态
         Scope subqueryScope = new Scope(getScope().getOuterScope(),
                 getScope().getSlots(), getScope().getAsteriskSlots());
+        // 设置子查询的外部作用域，允许在分析阶段做相关性检测与规则校验
         subqueryContext.setOuterScope(subqueryScope);
+        // 运行分析器：对该子查询进行名称解析、类型推导、规则重写等，得到规范化的子查询计划
         subqueryContext.newAnalyzer().analyze();
+        // 返回规范化后的子查询逻辑计划与“相关列”集合：
+        // - 逻辑计划用于后续改写（如 SubqueryToApply）
+        // - 相关列用于后续的相关子查询校验与 Join 改写前提判断
         return new AnalyzedResult((LogicalPlan) subqueryContext.getRewritePlan(),
                 subqueryScope.getCorrelatedSlots());
     }
@@ -457,18 +473,129 @@ class SubExprAnalyzer<T> extends DefaultExpressionRewriter<T> {
         return topAggregate;
     }
 
+    /**
+     * 递归验证子查询 plan 树的结构，检查相关列（correlated slots）的使用是否符合限制。
+     *
+     * 验证逻辑：
+     * 1. 使用回溯法（DFS）遍历整个 plan 树，从根到叶子节点收集每个节点的 PlanNodeCorrelatedInfo；
+     * 2. 当到达叶子节点时，调用 validateNodeInfoList 验证从根到该叶子的整条路径是否符合规则；
+     * 3. 如果路径上存在聚合节点，将其记录到 topAgg 集合中，供后续使用。
+     *
+     * 限制规则（详见 validateNodeInfoList）：
+     * 
+     * 关于"之前"和"之后"的定义：
+     * - "之前" = 在 plan 树中更靠近根节点（上层），执行时先执行
+     * - "之后" = 在 plan 树中更靠近叶子节点（下层），执行时后执行
+     * 
+     * 例如 plan 树结构（从上到下执行）：
+     *     LogicalProject (根节点，先执行)
+     *         |
+     *     LogicalAggregate (中间层)
+     *         |
+     *     LogicalFilter (相关列在这里，t1.c = t2.c)
+     *         |
+     *     LogicalOlapScan (叶子节点，后执行)
+     * 
+     * 在这个例子中：
+     * - Filter 在 Aggregate "之后"（更靠近叶子，后执行）
+     * - Project 在 Aggregate "之前"（更靠近根，先执行）
+     *
+     * 具体限制：
+     * - 如果相关列出现在聚合节点"之后"（如 WHERE 子句），则必须有一个 scalar aggregate（无 GROUP BY）；
+     * - 聚合节点"之后"只能有 PROJECT、SORT、SUBQUERY_ALIAS 节点；
+     * - 相关列不能出现在聚合、Join、Window 等敏感节点的表达式中。
+     *
+     * 具体例子：
+     *
+     * ✅ 允许的情况：
+     *   1) SELECT (SELECT MAX(t2.b) FROM t2 WHERE t2.c = t1.c) FROM t1;
+     *      Plan 树结构（从上到下）：
+     *        LogicalProject
+     *            |
+     *        LogicalAggregate(MAX)  ← 聚合节点
+     *            |
+     *        LogicalFilter(WHERE t2.c = t1.c)  ← 相关列在这里（在聚合"之后"）
+     *            |
+     *        LogicalOlapScan(t2)
+     *      相关列 t1.c 在 WHERE（Filter）中，Filter 在聚合节点"之后"（下层），符合规则。
+     *
+     *   2) SELECT (SELECT COUNT(*) FROM t2 WHERE t2.d = t1.d) FROM t1;
+     *      相关列 t1.d 在 WHERE 中（在聚合"之后"），之后有聚合 COUNT，符合规则。
+     *
+     *   3) SELECT (SELECT t2.x FROM t2 WHERE t2.y = t1.y LIMIT 1) FROM t1;
+     *      相关列 t1.y 在 WHERE 中，但子查询有 LIMIT 1（会被消除），
+     *      后续在 SubqueryToApply 中会自动添加 ANY_VALUE 聚合，符合规则。
+     *
+     * ❌ 不允许的情况：
+     *   1) SELECT (SELECT t2.b FROM t2 WHERE t2.c = t1.c) FROM t1;
+     *      Plan 树结构：
+     *        LogicalProject
+     *            |
+     *        LogicalFilter(WHERE t2.c = t1.c)  ← 相关列在这里
+     *            |
+     *        LogicalOlapScan(t2)  ← 没有聚合节点
+     *      相关列 t1.c 在 WHERE 中，但整个路径上没有聚合节点，会抛异常：
+     *      "only project, sort and subquery alias node is allowed after agg node"
+     *      （因为相关列出现在 plan 树中，但路径上没有聚合节点来"消化"相关列）
+     *
+     *   2) SELECT (SELECT MAX(t2.b) FROM t2 WHERE t2.c = t1.c GROUP BY t2.d) FROM t1;
+     *      相关列 t1.c 在 WHERE 中，但聚合有 GROUP BY，会抛异常：
+     *      "access outer query's column before agg with group by is not supported"
+     *
+     *   3) SELECT (SELECT t2.b FROM t2 JOIN t3 ON t2.id = t3.id WHERE t3.c = t1.c) FROM t1;
+     *      Plan 树结构（从上到下）：
+     *        LogicalProject
+     *            |
+     *        LogicalFilter(WHERE t3.c = t1.c)  ← 相关列在这里（在 JOIN "之后"）
+     *            |
+     *        LogicalJoin(t2 JOIN t3)  ← JOIN 节点（在相关列"之前"）
+     *            /              \
+     *      LogicalOlapScan(t2)  LogicalOlapScan(t3)
+     *      相关列 t1.c 出现在 JOIN 之后（WHERE 子句中），会抛异常：
+     *      "access outer query's column before join is not supported"
+     *      
+     *      原因：
+     *      - 相关列的解相关需要将相关谓词（t3.c = t1.c）提取到 Apply 的 correlationFilter 中
+     *      - 但相关列在 JOIN 之后使用，意味着相关性跨越了 JOIN 节点，使得解相关变得复杂：
+     *        * JOIN 会改变数据的形状和分布（两表 join 后的行数、列数都变了）
+     *        * 相关列 t1.c 需要与 JOIN 后的结果（t3.c）进行比较，这需要特殊的处理逻辑
+     *        * 当前的解相关算法（CorrelateApplyToUnCorrelateApply）假设相关列直接出现在
+     *          聚合节点之前（如 WHERE 子句），然后通过聚合来"消化"相关性
+     *      - 如果允许这种情况，需要在 JOIN 之后、聚合之前处理相关性，这会大大增加
+     *        解相关和 Apply→Join 转换的复杂度，目前暂不支持
+     *
+     *   4) SELECT (SELECT MAX(t2.b) FROM t2 WHERE t2.c = t1.c) FROM t1
+     *      UNION ALL
+     *      SELECT (SELECT t2.x FROM t2 WHERE t2.y = t1.y) FROM t1;
+     *      如果子查询中有两个地方使用相关列，会抛异常：
+     *      "access outer query's column in two places is not supported"
+     *
+     * @param plan 当前要验证的 plan 节点
+     * @param validator 用于检查节点是否包含相关列的访问器
+     * @param nodeInfoList 当前路径上所有节点的 PlanNodeCorrelatedInfo 列表（用于回溯）
+     * @param topAgg 收集到的顶层聚合节点集合（用于后续处理）
+     */
     private void validateSubquery(Plan plan, CorrelatedSlotsValidator validator,
             List<PlanNodeCorrelatedInfo> nodeInfoList, Set<LogicalAggregate> topAgg) {
+        // 将当前节点的 PlanNodeCorrelatedInfo 加入路径列表
+        // PlanNodeCorrelatedInfo 包含：节点类型、是否包含相关列、是否有聚合等信息
         nodeInfoList.add(plan.accept(validator, null));
+        // 递归处理所有子节点
         for (Plan child : plan.children()) {
             validateSubquery(child, validator, nodeInfoList, topAgg);
         }
+        // 当到达叶子节点时（没有子节点），验证从根到该叶子的整条路径
         if (plan.children().isEmpty()) {
+            // validateNodeInfoList 会检查路径上相关列的使用是否符合限制，
+            // 并返回路径上的顶层聚合节点（如果存在）
             LogicalAggregate topAggNode = validateNodeInfoList(nodeInfoList);
             if (topAggNode != null) {
+                // 将找到的顶层聚合节点加入集合，供后续规则使用
                 topAgg.add(topAggNode);
             }
         }
+        // 回溯：移除当前节点，恢复 nodeInfoList 到进入当前节点前的状态
+        // 这样在返回到父节点时，nodeInfoList 只包含从根到父节点的路径信息
         nodeInfoList.remove(nodeInfoList.size() - 1);
     }
 }

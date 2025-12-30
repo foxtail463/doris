@@ -51,33 +51,38 @@ import java.util.stream.Collectors;
  * Representation for group expression in cascades optimizer.
  */
 public class GroupExpression {
+    // 代价状态更新事件，用于调试/追踪代价变化
     private static final EventProducer COST_STATE_TRACER = new EventProducer(CostStateUpdateEvent.class,
             EventChannel.getDefaultChannel().addConsumers(new LogConsumer(CostStateUpdateEvent.class,
                     EventChannel.LOG)));
+    // 当前节点（含子树）的总代价
     private Cost cost;
+    // 所属的 Group（等价类容器）
     private Group ownerGroup;
+    // 子节点所在的 Group 列表（与 plan.children 对齐，指向 Group 而非具体 plan）
     private final List<Group> children;
+    // 该 GroupExpression 对应的具体算子节点（Logical 或 Physical）
     private final Plan plan;
+    // 规则应用掩码：记录已作用的规则，防止重复
     private final BitSet ruleMasks;
+    // 是否已完成统计推导（避免重复推导）
     private boolean statDerived;
 
+    // 估算输出行数缓存（默认 -1 表示未计算）
     private double estOutputRowCount = -1;
 
-    // Record the rule that generate this plan. It's used for debugging
+    // 生成该表达式的规则（用于调试追踪）
     private Rule fromRule;
 
-    // Mapping from output properties to the corresponding best cost, statistics, and child properties.
-    // key is the physical properties the group expression support for its parent
-    // and value is cost and request physical properties to its children.
+    // 最优代价表：key 为满足父节点的输出物理属性，value 为 (总代价, 对子节点的请求属性列表)
     private final Map<PhysicalProperties, Pair<Cost, List<PhysicalProperties>>> lowestCostTable;
-    // Each physical group expression maintains mapping incoming requests to the corresponding child requests.
-    // key is the output physical properties satisfying the incoming request properties
-    // value is the request physical properties
+    // 记录“父请求属性 -> 需要的子请求属性”的映射（每种输出属性对应一套子属性请求）
     private final Map<PhysicalProperties, PhysicalProperties> requestPropertiesMap;
 
-    // After mergeGroup(), source Group was cleaned up, but it may be in the Job Stack. So use this to mark and skip it.
+    // mergeGroup 后源 Group 可能还在任务栈里，用标记跳过已失效的表达式
     private boolean isUnused = false;
 
+    // 全局唯一 ID（语句作用域），用于标识 GroupExpression
     private final ObjectId id = StatementScopeIdGenerator.newObjectId();
 
     /**

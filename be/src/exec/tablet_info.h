@@ -203,55 +203,86 @@ public:
     int64_t table_id() const { return _t_param.table_id; }
     int64_t version() const { return _t_param.version; }
 
-    // return true if we found this block_row in partition
+    // 在分区中查找指定行数据，如果找到则返回true
+    // 这是分区查找的核心方法，支持列表分区和范围分区两种模式
     ALWAYS_INLINE bool find_partition(vectorized::Block* block, int row,
                                       VOlapTablePartition*& partition) const {
+        // 根据分区类型选择不同的查找策略
         auto it = _is_in_partition ? _partitions_map->find(std::tuple {block, row, true})
                                    : _partitions_map->upper_bound(std::tuple {block, row, true});
+        
+        // 调试日志：输出查找的行信息、数据块内容和分区块内容
+        // 帮助开发者理解分区查找的过程和结果
         VLOG_TRACE << "find row " << row << " of\n"
                    << block->dump_data() << "in:\n"
                    << _partition_block.dump_data() << "result line row: " << std::get<1>(it->first);
 
-        // for list partition it might result in default partition
+        // 列表分区的特殊处理：可能返回默认分区
+        // 当_is_in_partition为true时，表示这是列表分区模式
         if (_is_in_partition) {
+            // 如果找到匹配的分区，使用找到的分区；否则使用默认分区
+            // 默认分区用于处理不在任何预定义分区中的数据
             partition = (it != _partitions_map->end()) ? it->second : _default_partition;
+            // 将迭代器设置为结束位置，避免后续的范围检查
             it = _partitions_map->end();
         }
+        
+        // 范围分区的处理：检查找到的分区是否真正包含该行数据
+        // 这一步确保数据确实属于找到的分区，而不是仅仅在边界上
         if (it != _partitions_map->end() &&
             _part_contains(it->second, std::tuple {block, row, true})) {
             partition = it->second;
         }
+        
+        // 返回查找结果：如果partition不为nullptr，说明找到了匹配的分区
         return (partition != nullptr);
     }
 
+    // 为指定的行数据查找对应的tablet索引
+    // 这是tablet路由的核心方法，支持哈希分布和随机分布两种策略
     ALWAYS_INLINE void find_tablets(
             vectorized::Block* block, const std::vector<uint32_t>& indexes,
             const std::vector<VOlapTablePartition*>& partitions,
             std::vector<uint32_t>& tablet_indexes /*result*/,
             /*TODO: check if flat hash map will be better*/
             std::map<VOlapTablePartition*, int64_t>* partition_tablets_buffer = nullptr) const {
+        
+        // 定义计算tablet索引的函数类型
+        // 函数签名：接收数据块、行索引、分区对象，返回tablet索引
         std::function<uint32_t(vectorized::Block*, uint32_t, const VOlapTablePartition&)>
                 compute_function;
+        
+        // 根据是否配置了分布列来选择不同的分布策略
         if (!_distributed_slot_locs.empty()) {
             //TODO: refactor by saving the hash values. then we can calculate in columnwise.
+            
+            // 哈希分布策略：基于分布列的值计算哈希，然后取模得到tablet索引
+            // 这种策略确保相同分布列值的数据总是路由到同一个tablet
             compute_function = [this](vectorized::Block* block, uint32_t row,
                                       const VOlapTablePartition& partition) -> uint32_t {
-                uint32_t hash_val = 0;
+                uint32_t hash_val = 0;  // 初始化哈希值
+                
+                // 遍历所有分布列，计算组合哈希值
                 for (unsigned short _distributed_slot_loc : _distributed_slot_locs) {
-                    auto* slot_desc = _slots[_distributed_slot_loc];
-                    auto& column = block->get_by_position(_distributed_slot_loc).column;
-                    auto val = column->get_data_at(row);
+                    auto* slot_desc = _slots[_distributed_slot_loc];  // 获取列描述符
+                    auto& column = block->get_by_position(_distributed_slot_loc).column;  // 获取列数据
+                    auto val = column->get_data_at(row);  // 获取指定行的值
+                    
                     if (val.data != nullptr) {
+                        // 非空值：使用CRC32算法计算哈希值
+                        // 考虑列的数据类型，确保哈希计算的准确性
                         hash_val = RawValue::zlib_crc32(val.data, val.size,
                                                         slot_desc->type()->get_primitive_type(),
                                                         hash_val);
                     } else {
+                        // 空值：使用专门的空值哈希函数
                         hash_val = HashUtil::zlib_crc_hash_null(hash_val);
                     }
                 }
                 return cast_set<uint32_t>(hash_val % partition.num_buckets);
             };
-        } else { // random distribution
+        } else { 
+            // 随机分布策略：当没有配置分布列时使用
             compute_function = [](vectorized::Block* block, uint32_t row,
                                   const VOlapTablePartition& partition) -> uint32_t {
                 if (partition.load_tablet_idx == -1) {
@@ -262,18 +293,25 @@ public:
             };
         }
 
+        // 根据是否使用缓冲区选择不同的处理方式
         if (partition_tablets_buffer == nullptr) {
+            // 无缓冲区模式：直接计算每行的tablet索引
             for (auto index : indexes) {
+                // 为每一行调用计算函数，获取对应的tablet索引
                 tablet_indexes[index] = compute_function(block, index, *partitions[index]);
             }
-        } else { // use buffer
+        } else { 
+            // 使用缓冲区模式：缓存已计算的分区到tablet的映射，避免重复计算
             for (auto index : indexes) {
-                auto* partition = partitions[index];
+                auto* partition = partitions[index];  // 获取当前行对应的分区
+                
+                // 检查缓冲区中是否已有该分区的tablet映射
                 if (auto it = partition_tablets_buffer->find(partition);
                     it != partition_tablets_buffer->end()) {
                     tablet_indexes[index] = cast_set<uint32_t>(it->second); // tablet
                 } else {
-                    // compute and save in buffer
+                    // 缓存未命中：计算tablet索引并保存到缓冲区
+                    // 同时更新结果数组和缓冲区
                     (*partition_tablets_buffer)[partition] = tablet_indexes[index] =
                             compute_function(block, index, *partitions[index]);
                 }

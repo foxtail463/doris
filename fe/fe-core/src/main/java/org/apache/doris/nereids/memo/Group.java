@@ -53,31 +53,200 @@ import java.util.stream.Collectors;
  * Representation for group in cascades optimizer.
  */
 public class Group {
+    /** 
+     * Group 的唯一标识符
+     * 用于在 Memo 中唯一标识一个 Group，便于查找和引用
+     */
     private final GroupId groupId;
-    // Save all parent GroupExpression to avoid traversing whole Memo.
+    
+    /** 
+     * 保存所有父 GroupExpression 的映射
+     * 
+     * 作用：
+     * - 记录所有将当前 Group 作为子节点的父 GroupExpression
+     * - 避免在需要查找父节点时遍历整个 Memo，提高性能
+     * 
+     * 使用场景：
+     * - Group 合并时，需要更新所有父 GroupExpression 的子节点引用
+     * - 自底向上优化时，需要知道哪些父节点使用了当前 Group
+     * - 统计信息更新时，需要通知所有父节点
+     * 
+     * 为什么使用 IdentityHashMap？
+     * - 使用对象身份（==）而不是 equals() 进行比较
+     * - 因为同一个 GroupExpression 对象可能被多次引用，需要区分不同的引用
+     */
     private final IdentityHashMap<GroupExpression, Void> parentExpressions = new IdentityHashMap<>();
 
+    /** 
+     * 逻辑表达式列表
+     * 存储所有逻辑等价的逻辑计划表达式（LogicalPlan）
+     * 例如：LogicalJoin、LogicalFilter、LogicalProject 等
+     */
     private final List<GroupExpression> logicalExpressions = Lists.newArrayList();
+    
+    /** 
+     * 物理表达式列表
+     * 存储所有物理实现表达式（PhysicalPlan）
+     * 例如：PhysicalHashJoin、PhysicalNestedLoopJoin、PhysicalOlapScan 等
+     * 这些是逻辑计划的具体物理实现，用于执行
+     */
     private final List<GroupExpression> physicalExpressions = Lists.newArrayList();
+    
+    /** 
+     * 强制器（Enforcer）映射
+     * 
+     * 作用：
+     * - 存储用于强制物理属性的特殊 GroupExpression
+     * - 当计划不满足所需的物理属性时，需要添加 Enforcer 来强制属性
+     * 
+     * 示例：
+     * - 如果需要数据分布（Distribution），但计划没有，可以添加 Exchange 节点
+     * - 如果需要排序（Order），但计划没有，可以添加 Sort 节点
+     * 
+     * Key: 需要强制属性的 GroupExpression
+     * Value: 对应的 Enforcer GroupExpression
+     */
     private final Map<GroupExpression, GroupExpression> enforcers = Maps.newHashMap();
+    
+    /** 
+     * 统计信息是否可靠
+     * 
+     * 作用：
+     * - 标记当前 Group 的统计信息是否准确可靠
+     * - 如果统计信息不可靠，优化器可能需要重新计算或使用保守估计
+     * 
+     * 何时设置为 false：
+     * - 当 Group 被合并时，统计信息可能需要重新计算
+     * - 当应用了某些规则后，统计信息可能不再准确
+     */
     private boolean isStatsReliable = true;
+    
+    /** 
+     * 逻辑属性
+     * 
+     * 包含：
+     * - 输出列（Output slots）
+     * - 统计信息（Statistics）
+     * - 等价类（Equivalence classes）
+     * - 函数依赖（Functional dependencies）
+     * 
+     * 作用：
+     * - 描述 Group 中所有计划的逻辑特征
+     * - 用于等价性检测：同一个 Group 中的所有计划必须有相同的逻辑属性
+     * - 用于规则匹配：规则需要检查逻辑属性是否匹配
+     */
     private LogicalProperties logicalProperties;
 
-    // Map of cost lower bounds
-    // Map required plan props to cost lower bound of corresponding plan
+    /** 
+     * 代价下界映射
+     * 
+     * 作用：
+     * - 存储不同物理属性要求下的最低代价计划
+     * - Key: 所需的物理属性（PhysicalProperties），如数据分布、排序等
+     * - Value: Pair<代价, GroupExpression>，包含最低代价和对应的 GroupExpression
+     * 
+     * 用途：
+     * - CBO（基于代价的优化）：根据物理属性要求选择代价最低的计划
+     * - 剪枝优化：如果某个计划的代价已经超过下界，可以剪枝
+     * - 计划选择：最终选择代价最低的计划作为执行计划
+     * 
+     * 示例：
+     * - PhysicalProperties.GATHER -> (Cost: 100, PhysicalHashJoin)
+     * - PhysicalProperties.REPLICATED -> (Cost: 200, PhysicalBroadcastJoin)
+     */
     private final Map<PhysicalProperties, Pair<Cost, GroupExpression>> lowestCostPlans = Maps.newLinkedHashMap();
 
+    /** 
+     * 是否已探索
+     * 
+     * 作用：
+     * - 标记当前 Group 是否已经被完全探索（所有规则都已应用）
+     * - 用于优化器的探索阶段，避免重复探索
+     * 
+     * 何时设置为 true：
+     * - 当所有适用的规则都已应用到当前 Group 时
+     * - 表示当前 Group 已经探索完毕，不需要再次探索
+     */
     private boolean isExplored = false;
 
+    /** 
+     * 统计信息
+     * 
+     * 包含：
+     * - 行数（Row count）
+     * - 列统计信息（Column statistics）
+     * - 数据分布信息（Data distribution）
+     * 
+     * 作用：
+     * - 用于代价估算：计算计划的执行代价
+     * - 用于规则匹配：某些规则需要统计信息来判断是否适用
+     * - 用于优化决策：根据统计信息选择最优计划
+     */
     private Statistics statistics;
 
+    /** 
+     * 选择的物理属性
+     * 
+     * 作用：
+     * - 记录最终选择的物理计划的物理属性
+     * - 用于计划生成：根据选择的物理属性生成最终的执行计划
+     * 
+     * 包含：
+     * - 数据分布（Distribution）：如 GATHER、HASH、BROADCAST 等
+     * - 排序（Order）：如按某列排序
+     * - 分区（Partition）：如按某列分区
+     */
     private PhysicalProperties chosenProperties;
 
+    /** 
+     * 选择的 GroupExpression ID
+     * 
+     * 作用：
+     * - 记录最终选择的 GroupExpression 的索引
+     * - 用于计划生成：根据 ID 找到对应的 GroupExpression
+     * 
+     * 值：
+     * - -1: 尚未选择
+     * - >= 0: 选择的 GroupExpression 在列表中的索引
+     */
     private int chosenGroupExpressionId = -1;
 
+    /** 
+     * 选择的强制器属性列表
+     * 
+     * 作用：
+     * - 记录最终选择的执行计划中使用的强制器（Enforcer）的物理属性
+     * - 用于计划生成：知道需要哪些强制器来满足物理属性要求
+     * 
+     * 示例：
+     * - 如果需要在某个节点强制排序，这里会记录排序属性
+     * - 如果需要在某个节点强制数据分布，这里会记录分布属性
+     */
     private List<PhysicalProperties> chosenEnforcerPropertiesList = new ArrayList<>();
+    
+    /** 
+     * 选择的强制器 ID 列表
+     * 
+     * 作用：
+     * - 记录最终选择的执行计划中使用的强制器（Enforcer）的 ID
+     * - 与 chosenEnforcerPropertiesList 一一对应
+     * - 用于计划生成：知道在哪些位置需要添加哪些强制器
+     */
     private List<Integer> chosenEnforcerIdList = new ArrayList<>();
 
+    /** 
+     * 结构信息映射
+     * 
+     * 作用：
+     * - 存储物化视图重写相关的结构信息（StructInfo）
+     * - Key: 表 ID 集合（BitSet），表示使用了哪些表
+     * - Value: 对应的结构信息，包含计划的图结构、谓词、等价类等
+     * 
+     * 用途：
+     * - 物化视图匹配：用于判断物化视图是否可以匹配查询
+     * - 结构信息缓存：避免重复计算结构信息，提高性能
+     * - 嵌套重写：支持物化视图的嵌套重写
+     */
     private StructInfoMap structInfoMap = new StructInfoMap();
 
     /**

@@ -82,33 +82,28 @@ public:
             : HdfsFileHandle(fs, fname, mtime) {}
 };
 
-/// The FileHandleCache is a data structure that owns HdfsFileHandles to share between
-/// threads. The HdfsFileHandles are hash partitioned across NUM_PARTITIONS partitions.
-/// Each partition operates independently with its own locks, reducing contention
-/// between concurrent threads. The `capacity` is split between the partitions and is
-/// enforced independently.
+/// FileHandleCache 是一个数据结构，用于在线程间共享 HdfsFileHandle 的所有权。
+/// HdfsFileHandles 通过哈希分区分布在 NUM_PARTITIONS 个分区中。
+/// 每个分区独立运行，拥有自己的锁，减少了并发线程之间的竞争。
+/// `capacity` 在分区之间分配，并独立执行。
 ///
-/// Threads check out a file handle for exclusive access, released automatically by RAII
-/// accessor. If the file handle is not already present in the cache or all file handles
-/// for this file are checked out, the file handle is emplaced in the cache. The cache can
-/// contain multiple file handles for the same file. If a file handle is checked out, it
-/// cannot be evicted from the cache. In this case, a cache can exceed the specified
-/// capacity.
+/// 线程通过 RAII 访问器签出文件句柄以获得独占访问权限，访问器会自动释放。
+/// 如果文件句柄在缓存中不存在，或者该文件的所有文件句柄都已被签出，
+/// 则会在缓存中构造文件句柄。缓存可以包含同一文件的多个文件句柄。
+/// 如果文件句柄被签出，它就不能从缓存中驱逐。在这种情况下，缓存可能会超过指定的容量。
 ///
-/// Remote file systems could keep a connection as part of the file handle without support
-/// for unbuffering. The file handle cache is not suitable for those systems, as the cache
-/// size can exceed the limit on the number of concurrent connections. HDFS does not
-/// maintain a connection in the file handle, S3A client supports unbuffering since
-/// IMPALA-8428, so those do not have this restriction.
+/// 远程文件系统可能会将连接作为文件句柄的一部分，而不支持解缓冲。
+/// 文件句柄缓存不适用于这些系统，因为缓存大小可能会超过并发连接数的限制。
+/// HDFS 不在文件句柄中维护连接，S3A 客户端自 IMPALA-8428 以来支持解缓冲，
+/// 所以这些系统没有这个限制。
 ///
-/// If there is a file handle in the cache and the underlying file is deleted,
-/// the file handle might keep the file from being deleted at the OS level. This can
-/// take up disk space and impact correctness. To avoid this, the cache will evict any
-/// file handle that has been unused for longer than threshold specified by
-/// `unused_handle_timeout_secs`. Eviction is disabled when the threshold is 0.
+/// 如果缓存中有文件句柄，而底层文件被删除，文件句柄可能会阻止文件在操作系统级别被删除。
+/// 这可能会占用磁盘空间并影响正确性。为了避免这种情况，缓存将驱逐任何
+/// 未使用时间超过 `unused_handle_timeout_secs` 指定阈值的文件句柄。
+/// 当阈值为 0 时，驱逐被禁用。
 ///
-/// TODO: The cache should also evict file handles more aggressively if the file handle's
-/// mtime is older than the file's current mtime.
+/// TODO: 如果文件句柄的 mtime 比文件的当前 mtime 更旧，
+/// 缓存还应该更积极地驱逐文件句柄。
 class FileHandleCache {
 private:
     /// Each partition operates independently, and thus has its own thread-safe cache.

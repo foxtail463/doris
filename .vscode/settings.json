@@ -1,0 +1,15 @@
+{
+    "java.compile.nullAnalysis.mode": "automatic",
+    "cmake.sourceDirectory": "/home/yangtao555/code/doris/be",
+    "cmake.cmakePath": "/home/yangtao555/local/ldb-toolchain-0.27/bin/cmake",
+    "clangd.path": "/home/yangtao555/local/ldb-toolchain-0.27/bin/clangd",
+    "clangd.arguments": [
+        "--clang-tidy"
+    ],
+    "cmake.configureSettings": {
+        "CMAKE_C_COMPILER": "/home/yangtao555/local/ldb-toolchain-0.27/bin/clang",
+        "CMAKE_CXX_COMPILER": "/home/yangtao555/local/ldb-toolchain-0.27/bin/clang++"
+    },
+    "java.jdt.ls.vmargs": "-XX:+UseParallelGC -XX:GCTimeRatio=4 -XX:AdaptiveSizePolicyWeight=90 -Dsun.zip.disableMemoryMapping=true -Xmx4G -Xms100m -Xlog:disable",
+    "java.configuration.updateBuildConfiguration": "interactive"
+}

@@ -46,6 +46,7 @@ Status MessageBodyFileSink::open() {
 }
 
 Status MessageBodyFileSink::append(const char* data, size_t size) {
+    // 将数据写入文件，用于非chunked模式下的数据接收
     auto written = ::write(_fd, data, size);
     if (written == size) {
         return Status::OK();
@@ -56,6 +57,7 @@ Status MessageBodyFileSink::append(const char* data, size_t size) {
 }
 
 Status MessageBodyFileSink::finish() {
+    // 完成文件写入，关闭文件描述符
     if (::close(_fd) < 0) {
         std::stringstream ss;
         char errmsg[64];
@@ -69,6 +71,7 @@ Status MessageBodyFileSink::finish() {
 }
 
 void MessageBodyFileSink::cancel(const std::string& reason) {
+    // 取消操作：删除临时文件，清理资源
     unlink(_path.data());
 }
 

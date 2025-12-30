@@ -120,19 +120,44 @@ public:
         return false;
     }
 
+    /**
+     * 将一个 JsonbValue 对象写入到 JSONB 输出流中
+     * 
+     * 这个函数用于将已存在的 JsonbValue 对象（可能是从另一个 JSONB 文档中提取的）
+     * 直接写入到当前正在构建的 JSONB 文档中。由于 JsonbValue 已经是打包好的二进制格式，
+     * 可以直接按字节拷贝，无需重新序列化。
+     * 
+     * @param value 要写入的 JsonbValue 指针，可以为 nullptr（表示写入 NULL 值）
+     * @return 成功返回 true，失败返回 false
+     * 
+     * 写入条件：
+     * 1. 如果是第一个值且不在任何容器中（first_ && stack_.empty()）
+     * 2. 或者在容器中且状态正确（verifyValueState() 返回 true）
+     *    - 在对象中：必须是刚写完 key，现在可以写 value（WS_Key -> WS_Value）
+     *    - 在数组中：必须是刚写完上一个 value，现在可以写下一个 value（WS_Value -> WS_Value）
+     */
     bool writeValue(const JsonbValue* value) {
+        // 如果 value 为 nullptr，写入 NULL 值
         if (!value) {
             return writeNull();
         }
 
+        // 检查是否满足写入条件：
+        // 1. 第一个值且不在容器中（写入根值）
+        // 2. 或者在容器中且状态正确（在对象中刚写完 key，或在数组中刚写完上一个 value）
         if ((first_ && stack_.empty()) || (!stack_.empty() && verifyValueState())) {
+            // 如果是第一个值，需要写入 JSONB 头部（包含版本号等信息）
             if (!writeFirstHeader()) {
                 return false;
             }
+            // 直接将 JsonbValue 的打包字节写入输出流
+            // JsonbValue 已经是二进制格式，包含类型信息和数据，可以直接拷贝
             os_->write((char*)value, value->numPackedBytes());
+            // 更新状态：刚写完一个 value
             kvState_ = WS_Value;
             return true;
         }
+        // 不满足写入条件（状态错误），返回失败
         return false;
     }
 
@@ -530,22 +555,55 @@ public:
         return false;
     }
 
-    // finish writing an array val
+    /**
+     * 完成数组的写入，回填数组大小字段
+     * 
+     * 这个函数必须在调用 writeStartArray() 后，写入完所有数组元素后调用。
+     * 它使用"预留空间，后填大小"的模式：
+     * 1. writeStartArray() 时：写入数组类型标记，预留 4 字节用于存储大小（初始为 0）
+     * 2. 写入数组元素...
+     * 3. writeEndArray() 时：计算实际大小，回填到预留的位置
+     * 
+     * @return 成功返回 true，失败返回 false
+     * 
+     * 写入条件：
+     * - 必须在数组中（stack_.top().state == WS_Array）
+     * - 必须刚写完一个 value（kvState_ == WS_Value）
+     * 
+     * 工作流程：
+     * 1. 计算数组的实际大小（当前写入位置 - 大小字段位置 - 大小字段本身 4 字节）
+     * 2. 回到大小字段的位置，写入实际大小
+     * 3. 恢复写入位置，继续后续写入
+     * 4. 从栈中弹出数组信息，表示数组写入完成
+     */
     bool writeEndArray() {
+        // 检查是否满足结束数组的条件：
+        // 1. 栈不为空（有正在写入的数组）
+        // 2. 栈顶是数组状态
+        // 3. 当前状态是刚写完一个 value（可以结束数组）
         if (!stack_.empty() && stack_.top().state == WS_Array && kvState_ == WS_Value) {
             WriteInfo& ci = stack_.top();
+            // 记录当前写入位置（数组结束位置）
             std::streampos cur_pos = os_->tellp();
+            // 计算数组的实际大小：
+            // 大小 = 当前位置 - 大小字段位置 - 大小字段本身（4 字节）
+            // 这样计算出来的大小只包含数组元素的数据，不包括大小字段本身
             auto size = (int32_t)(cur_pos - ci.sz_pos - sizeof(uint32_t));
             assert(size >= 0);
 
+            // 步骤1: 回到大小字段的位置（writeStartArray 时预留的位置）
             os_->seekp(ci.sz_pos);
+            // 步骤2: 写入实际大小（覆盖之前预留的 0）
             os_->write((char*)&size, sizeof(uint32_t));
+            // 步骤3: 恢复写入位置，继续后续写入
             os_->seekp(cur_pos);
+            // 步骤4: 从栈中弹出数组信息，表示数组写入完成
             stack_.pop();
 
             return true;
         }
 
+        // 不满足结束数组的条件（状态错误），返回失败
         return false;
     }
 

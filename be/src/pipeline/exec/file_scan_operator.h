@@ -60,6 +60,8 @@ public:
 
 private:
     friend class vectorized::FileScanner;
+    // _split_source 是用于表示本地或远程的分片(split)来源的连接器对象，封装了扫描任务的数据分片来源（如查询需要扫描哪些文件或分区），
+    // 并负责下发及管理这些分片的分配和调度。
     std::shared_ptr<vectorized::SplitSourceConnector> _split_source = nullptr;
     int _max_scanners;
     // A in memory cache to save some common components

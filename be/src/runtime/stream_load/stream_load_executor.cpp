@@ -65,33 +65,58 @@ bvar::LatencyRecorder g_stream_load_begin_txn_latency("stream_load", "begin_txn"
 bvar::LatencyRecorder g_stream_load_precommit_txn_latency("stream_load", "precommit_txn");
 bvar::LatencyRecorder g_stream_load_commit_txn_latency("stream_load", "commit_txn");
 
+/**
+ * 执行流式加载的执行计划片段
+ * 
+ * 该函数负责提交并执行流式加载的执行计划，包括：
+ * 1. 设置查询选项（如禁用严格类型转换）
+ * 2. 定义执行完成后的回调函数，用于收集执行结果和统计数据
+ * 3. 调用 FragmentManager 执行计划
+ * 4. 处理执行结果（成功时更新指标，失败时取消数据源并回滚事务）
+ * 
+ * @param ctx 流式加载上下文，包含加载参数、状态信息等
+ * @param parent 父级管道片段参数列表
+ * @return 执行状态
+ */
 Status StreamLoadExecutor::execute_plan_fragment(std::shared_ptr<StreamLoadContext> ctx,
                                                  const TPipelineFragmentParamsList& parent) {
-// submit this params
 #ifndef BE_TEST
+    // 设置查询选项：禁用严格类型转换，允许更宽松的数据类型转换
     ctx->put_result.pipeline_params.query_options.__set_enable_strict_cast(false);
+    // 记录开始写入数据的时间戳，用于计算写入耗时
     ctx->start_write_data_nanos = MonotonicNanos();
     LOG(INFO) << "begin to execute stream load. label=" << ctx->label << ", txn_id=" << ctx->txn_id
               << ", query_id=" << ctx->id;
     Status st;
+    
+    // 定义执行完成后的回调函数，在计划执行完成后被调用
     auto exec_fragment = [ctx, this](RuntimeState* state, Status* status) {
+        // 如果是组提交模式，从 RuntimeState 中获取 label 和 txn_id
         if (ctx->group_commit) {
             ctx->label = state->import_label();
             ctx->txn_id = state->wal_id();
         }
+        
+        // 从流式加载管理器中移除当前上下文
         ctx->exec_env()->new_load_stream_mgr()->remove(ctx->id);
-        ctx->commit_infos = state->tablet_commit_infos();
-        ctx->number_total_rows = state->num_rows_load_total();
-        ctx->number_loaded_rows = state->num_rows_load_success();
-        ctx->number_filtered_rows = state->num_rows_load_filtered();
-        ctx->number_unselected_rows = state->num_rows_load_unselected();
-        ctx->loaded_bytes = state->num_bytes_load_total();
+        
+        // 收集执行结果和统计数据
+        ctx->commit_infos = state->tablet_commit_infos();              // Tablet 提交信息
+        ctx->number_total_rows = state->num_rows_load_total();        // 总行数
+        ctx->number_loaded_rows = state->num_rows_load_success();     // 成功加载的行数
+        ctx->number_filtered_rows = state->num_rows_load_filtered();  // 过滤掉的行数
+        ctx->number_unselected_rows = state->num_rows_load_unselected(); // 未选中的行数
+        ctx->loaded_bytes = state->num_bytes_load_total();            // 加载的字节数
+        
+        // 计算选中的行数（总行数 - 未选中的行数）
         int64_t num_selected_rows = ctx->number_total_rows - ctx->number_unselected_rows;
+        // 获取错误日志文件的 HTTP 访问路径
         ctx->error_url = to_load_error_http_path(state->get_error_log_file_path());
+        
+        // 检查过滤行数是否超过最大过滤比例
+        // 注意：不要修改这里的错误消息，因为历史原因，一些用户可能依赖这个错误消息
         if (status->ok() && !ctx->group_commit && num_selected_rows > 0 &&
             (double)ctx->number_filtered_rows / num_selected_rows > ctx->max_filter_ratio) {
-            // NOTE: Do not modify the error message here, for historical reasons,
-            // some users may rely on this error message.
             if (ctx->need_commit_self) {
                 *status =
                         Status::DataQualityError("too many filtered rows, url: {}", ctx->error_url);
@@ -100,21 +125,26 @@ Status StreamLoadExecutor::execute_plan_fragment(std::shared_ptr<StreamLoadConte
             }
         }
 
+        // 根据执行结果进行不同处理
         if (status->ok()) {
+            // 执行成功：更新监控指标
             DorisMetrics::instance()->stream_receive_bytes_total->increment(ctx->receive_bytes);
             DorisMetrics::instance()->stream_load_rows_total->increment(ctx->number_loaded_rows);
         } else {
+            // 执行失败：记录错误信息并清理资源
             LOG(WARNING) << "fragment execute failed"
                          << ", err_msg=" << status->to_string() << ", " << ctx->brief();
             ctx->number_loaded_rows = 0;
             ctx->first_error_msg = state->get_first_error_msg();
-            // cancel body_sink, make sender known it
+            
+            // 取消 body_sink，通知发送方停止发送数据
             if (ctx->body_sink != nullptr) {
                 ctx->body_sink->cancel(status->to_string());
             }
 
+            // 根据数据源类型进行特殊处理
             switch (ctx->load_src_type) {
-            // reset the stream load ctx's kafka commit offset
+            // 对于 Kafka 数据源，重置提交偏移量，避免重复消费
             case TLoadSourceType::KAFKA:
                 ctx->kafka_info->reset_offset();
                 break;
@@ -122,36 +152,45 @@ Status StreamLoadExecutor::execute_plan_fragment(std::shared_ptr<StreamLoadConte
                 break;
             }
         }
+        
+        // 计算写入数据的总耗时
         ctx->write_data_cost_nanos = MonotonicNanos() - ctx->start_write_data_nanos;
+        // 设置 promise 的值，通知等待的线程执行完成
         ctx->promise.set_value(*status);
 
+        // 如果执行失败且 body_sink 存在，需要主动取消
+        // 在某些情况下，加载执行会提前退出（例如当 max_filter_ratio 为 0 且遇到非法数据时）
+        // 此时整个加载过程会提前终止，但 HTTP 连接可能仍在向 stream_load_pipe 发送数据并等待消费
+        // 因此需要主动取消以结束管道
         if (!status->ok() && ctx->body_sink != nullptr) {
-            // In some cases, the load execution is exited early.
-            // For example, when max_filter_ratio is 0 and illegal data is encountered
-            // during stream loading, the entire load process is terminated early.
-            // However, the http connection may still be sending data to stream_load_pipe
-            // and waiting for it to be consumed.
-            // Therefore, we need to actively cancel to end the pipe.
             ctx->body_sink->cancel(status->to_string());
         }
 
+        // 如果需要自己提交事务，根据执行结果决定提交或回滚
         if (ctx->need_commit_self && ctx->body_sink != nullptr) {
             if (ctx->body_sink->cancelled() || !status->ok()) {
+                // body_sink 已取消或执行失败：回滚事务
                 ctx->status = *status;
                 this->rollback_txn(ctx.get());
             } else {
+                // 执行成功：提交事务
                 static_cast<void>(this->commit_txn(ctx.get()));
             }
         }
     };
+    
+    // 调用 FragmentManager 执行计划片段
+    // exec_fragment 回调函数会在执行完成后被调用
     st = _exec_env->fragment_mgr()->exec_plan_fragment(
             ctx->put_result.pipeline_params, QuerySource::STREAM_LOAD, exec_fragment, parent);
 
     if (!st.ok()) {
-        // no need to check unref's return value
+        // 如果提交执行计划失败，直接返回错误状态
+        // 注意：不需要检查 unref 的返回值
         return st;
     }
 #else
+    // 测试模式下，直接设置 promise 的值
     ctx->promise.set_value(k_stream_load_plan_status);
 #endif
     return Status::OK();

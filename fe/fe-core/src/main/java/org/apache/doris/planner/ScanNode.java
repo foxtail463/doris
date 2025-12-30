@@ -559,31 +559,54 @@ public abstract class ScanNode extends PlanNode implements SplitGenerator {
         return Integer.MAX_VALUE;
     }
 
+    /**
+     * 判断是否应该只使用一个实例来执行扫描操作
+     * 当查询有 LIMIT 且数据量较小时，使用单个实例可以节省 CPU 和内存资源
+     * 例如：SELECT * FROM tbl LIMIT 10 这种查询只需要一个实例即可
+     * 
+     * @param ctx 连接上下文，可能为 null（如 broker load 场景）
+     * @return true 表示应该只使用一个实例，false 表示可以使用多个实例并行执行
+     */
     public boolean shouldUseOneInstance(ConnectContext ctx) {
+        // 默认的自适应流水线任务串行读取限制阈值（10000 行）
         int adaptivePipelineTaskSerialReadOnLimit = 10000;
 
+        // ==================== 第一步：检查连接上下文和配置 ====================
         if (ctx != null) {
+            // 如果启用了自适应流水线任务串行读取限制功能
             if (ctx.getSessionVariable().enableAdaptivePipelineTaskSerialReadOnLimit) {
+                // 使用会话变量中配置的阈值
                 adaptivePipelineTaskSerialReadOnLimit = ctx.getSessionVariable().adaptivePipelineTaskSerialReadOnLimit;
             } else {
+                // 如果未启用该功能，直接返回 false，使用多实例并行执行
                 return false;
             }
         } else {
+            // 没有连接上下文，通常是 broker load 场景，使用默认阈值
             // No connection context, typically for broker load.
         }
 
+        // ==================== 第二步：检查是否满足使用单实例的条件 ====================
+        // 如果查询有 LIMIT 且 LIMIT 值小于等于阈值
         if (hasLimit() && getLimit() <= adaptivePipelineTaskSerialReadOnLimit) {
+            // 如果没有谓词（conjuncts），可以直接使用单实例
+            // 例如：SELECT * FROM tbl LIMIT 10
             if (conjuncts.isEmpty()) {
                 return true;
             } else {
+                // 如果有谓词，需要进一步检查
                 if (this instanceof OlapScanNode) {
                     OlapScanNode olapScanNode = (OlapScanNode) this;
+                    // 如果是 UNIQUE_KEYS 类型的表，可以检查谓词是否只包含删除标记
                     if (olapScanNode.getOlapTable() != null
                             && olapScanNode.getOlapTable().getKeysType() == KeysType.UNIQUE_KEYS) {
                         // If the table is unique keys, we can check if the conjuncts only contains
                         // delete sign
+                        // 如果只有一个谓词且是二元谓词
                         if (conjuncts.size() == 1 && conjuncts.get(0) instanceof BinaryPredicate) {
                             BinaryPredicate binaryPredicate = (BinaryPredicate) conjuncts.get(0);
+                            // 检查是否是删除标记的等值判断：__DORIS_DELETE_SIGN__ = 0
+                            // 这种谓词不会影响数据分布，可以使用单实例
                             if (binaryPredicate.getOp() == BinaryPredicate.Operator.EQ
                                     && binaryPredicate.getChild(0) instanceof SlotRef
                                     && ((SlotRef) binaryPredicate.getChild(0)).getDesc().getColumn().getName()
@@ -595,6 +618,7 @@ public abstract class ScanNode extends PlanNode implements SplitGenerator {
                 }
             }
         }
+        // 不满足条件，使用多实例并行执行
         return false;
     }
 

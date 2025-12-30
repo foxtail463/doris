@@ -60,28 +60,64 @@ SegmentFlusher::SegmentFlusher(RowsetWriterContext& context, SegmentFileCollecti
 
 SegmentFlusher::~SegmentFlusher() = default;
 
+/**
+ * 将单个数据块刷新到指定的段中
+ * 根据配置选择垂直或水平段写入器，处理变长列，并应用压缩策略
+ * @param block 要刷新的数据块指针
+ * @param segment_id 目标段的ID
+ * @param flush_size 输出参数，刷新到磁盘的文件大小（字节）
+ * @return 操作结果状态
+ */
 Status SegmentFlusher::flush_single_block(const vectorized::Block* block, int32_t segment_id,
                                           int64_t* flush_size) {
+    // 如果数据块为空，直接返回成功（避免不必要的处理）
     if (block->rows() == 0) {
         return Status::OK();
     }
+    
+    // 创建数据块的副本，避免修改原始数据
     vectorized::Block flush_block(*block);
+    
+    // 处理变长列：如果不是压缩操作且存在变长列，需要先解析变长列数据
+    // 变长列（如VARCHAR、JSON等）在写入前需要特殊处理以确保数据完整性
     if (_context.write_type != DataWriteType::TYPE_COMPACTION &&
         _context.tablet_schema->num_variant_columns() > 0) {
         RETURN_IF_ERROR(_parse_variant_columns(flush_block));
     }
+    
+    // 判断是否启用压缩：根据数据块大小和配置阈值决定
+    // 小数据块（小于阈值）通常不压缩，因为压缩开销可能超过收益
     bool no_compression = flush_block.bytes() <= config::segment_compression_threshold_kb * 1024;
+    
+    // 根据配置选择段写入器类型：垂直写入器或水平写入器
     if (config::enable_vertical_segment_writer) {
+        // 使用垂直段写入器：按列组织数据，适合列式存储和查询优化
         std::unique_ptr<segment_v2::VerticalSegmentWriter> writer;
+        
+        // 创建垂直段写入器，传入段ID和压缩策略
         RETURN_IF_ERROR(_create_segment_writer(writer, segment_id, no_compression));
+        
+        // 将数据行添加到段写入器中，使用异常安全的方式处理
+        // 从第0行开始，添加所有行数据
         RETURN_IF_ERROR_OR_CATCH_EXCEPTION(_add_rows(writer, &flush_block, 0, flush_block.rows()));
+        
+        // 刷新段写入器，将数据写入磁盘并获取文件大小
         RETURN_IF_ERROR(_flush_segment_writer(writer, flush_size));
     } else {
+        // 使用水平段写入器：按行组织数据，适合传统的行式存储
         std::unique_ptr<segment_v2::SegmentWriter> writer;
+        
+        // 创建水平段写入器，传入段ID和压缩策略
         RETURN_IF_ERROR(_create_segment_writer(writer, segment_id, no_compression));
+        
+        // 将数据行添加到段写入器中，使用异常安全的方式处理
+        // 从第0行开始，添加所有行数据
         RETURN_IF_ERROR_OR_CATCH_EXCEPTION(_add_rows(writer, &flush_block, 0, flush_block.rows()));
+        
+        // 刷新段写入器，将数据写入磁盘并获取文件大小
         RETURN_IF_ERROR(_flush_segment_writer(writer, flush_size));
     }
+    
     return Status::OK();
 }
 
@@ -209,6 +245,13 @@ Status SegmentFlusher::_create_segment_writer(
     return Status::OK();
 }
 
+/**
+ * 刷新垂直段写入器，完成段文件的最终写入和统计信息收集
+ * 负责段文件的最终化、倒排索引关闭、统计信息收集和资源清理
+ * @param writer 垂直段写入器的智能指针引用
+ * @param flush_size 输出参数，刷新到磁盘的段文件大小（字节）
+ * @return 操作结果状态
+ */
 Status SegmentFlusher::_flush_segment_writer(
         std::unique_ptr<segment_v2::VerticalSegmentWriter>& writer, int64_t* flush_size) {
     MonotonicStopWatch total_timer;
@@ -228,6 +271,9 @@ Status SegmentFlusher::_flush_segment_writer(
     finalize_timer.start();
     uint64_t segment_file_size;
     uint64_t common_index_size;
+    
+    // 最终化段写入器：完成所有数据写入，生成最终的段文件
+    // 这一步会确保所有缓冲数据都写入磁盘，并生成必要的索引结构
     Status s = writer->finalize(&segment_file_size, &common_index_size);
     finalize_timer.stop();
 
@@ -241,17 +287,24 @@ Status SegmentFlusher::_flush_segment_writer(
     RETURN_IF_ERROR(writer->close_inverted_index(&inverted_index_file_size));
     inverted_index_timer.stop();
 
+    // 记录调试日志：输出正在刷新的段文件信息
     VLOG_DEBUG << "tablet_id:" << _context.tablet_id
                << " flushing filename: " << writer->data_dir_path()
                << " rowset_id:" << _context.rowset_id;
 
+    // 收集键边界信息：用于段级别的查询优化和范围过滤
     KeyBoundsPB key_bounds;
-    Slice min_key = writer->min_encoded_key();
-    Slice max_key = writer->max_encoded_key();
+    Slice min_key = writer->min_encoded_key();    // 获取最小编码键
+    Slice max_key = writer->max_encoded_key();    // 获取最大编码键
+    
+    // 断言检查：确保最小键小于等于最大键（数据完整性验证）
     DCHECK_LE(min_key.compare(max_key), 0);
+    
+    // 设置键边界信息到protobuf对象中
     key_bounds.set_min_key(min_key.to_string());
     key_bounds.set_max_key(max_key.to_string());
 
+    // 获取段ID并创建段统计信息对象
     uint32_t segment_id = writer->segment_id();
     SegmentStatistics segstat;
     segstat.row_num = row_num;
@@ -278,12 +331,21 @@ Status SegmentFlusher::_flush_segment_writer(
               << ", inverted_index=" << inverted_index_timer.elapsed_time_milliseconds() << "ms"
               << ", collector=" << collector_timer.elapsed_time_milliseconds() << "ms";
 
+    // 如果调用方需要知道刷新大小，设置输出参数
     if (flush_size) {
         *flush_size = segment_file_size;
     }
+    
     return Status::OK();
 }
 
+/**
+ * 刷新水平段写入器，完成段文件的最终写入和统计信息收集
+ * 负责段文件的最终化、倒排索引关闭、统计信息收集和资源清理
+ * @param writer 水平段写入器的智能指针引用
+ * @param flush_size 输出参数，刷新到磁盘的段文件大小（字节）
+ * @return 操作结果状态
+ */
 Status SegmentFlusher::_flush_segment_writer(std::unique_ptr<segment_v2::SegmentWriter>& writer,
                                              int64_t* flush_size) {
     MonotonicStopWatch total_timer;
@@ -303,6 +365,9 @@ Status SegmentFlusher::_flush_segment_writer(std::unique_ptr<segment_v2::Segment
     finalize_timer.start();
     uint64_t segment_file_size;
     uint64_t common_index_size;
+    
+    // 最终化段写入器：完成所有数据写入，生成最终的段文件
+    // 这一步会确保所有缓冲数据都写入磁盘，并生成必要的索引结构
     Status s = writer->finalize(&segment_file_size, &common_index_size);
     finalize_timer.stop();
 
@@ -320,13 +385,20 @@ Status SegmentFlusher::_flush_segment_writer(std::unique_ptr<segment_v2::Segment
                << " flushing rowset_dir: " << _context.tablet_path
                << " rowset_id:" << _context.rowset_id;
 
+    // 收集键边界信息：用于段级别的查询优化和范围过滤
     KeyBoundsPB key_bounds;
-    Slice min_key = writer->min_encoded_key();
-    Slice max_key = writer->max_encoded_key();
+    Slice min_key = writer->min_encoded_key();    // 获取最小编码键
+    Slice max_key = writer->max_encoded_key();    // 获取最大编码键
+    
+    // 断言检查：确保最小键小于等于最大键（数据完整性验证）
     DCHECK_LE(min_key.compare(max_key), 0);
+    
+    // 设置键边界信息到protobuf对象中
     key_bounds.set_min_key(min_key.to_string());
     key_bounds.set_max_key(max_key.to_string());
 
+    // 获取段ID并创建段统计信息对象
+    // 注意：水平段写入器使用get_segment_id()方法，而垂直段写入器使用segment_id()方法
     uint32_t segment_id = writer->get_segment_id();
     SegmentStatistics segstat;
     segstat.row_num = row_num;
@@ -334,6 +406,8 @@ Status SegmentFlusher::_flush_segment_writer(std::unique_ptr<segment_v2::Segment
     segstat.index_size = inverted_index_file_size;
     segstat.key_bounds = key_bounds;
 
+    // 释放段写入器：调用析构函数清理资源
+    // 注意：这里使用reset()而不是直接赋值，确保智能指针正确管理内存
     writer.reset();
 
     MonotonicStopWatch collector_timer;
@@ -356,6 +430,7 @@ Status SegmentFlusher::_flush_segment_writer(std::unique_ptr<segment_v2::Segment
     if (flush_size) {
         *flush_size = segment_file_size;
     }
+    
     return Status::OK();
 }
 

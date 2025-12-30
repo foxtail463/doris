@@ -173,38 +173,59 @@ bool need_replace_null_data_to_default(FunctionContext* context, const DataTypeP
 WrapperType prepare_remove_nullable(FunctionContext* context, const DataTypePtr& from_type,
                                     const DataTypePtr& to_type) {
     /// Determine whether pre-processing and/or post-processing must take place during conversion.
+    /// 这个函数的核心作用：
+    /// 1. 如果目标类型是 Nullable，则先把「外层 Nullable 包装」拆掉，在内部完成真正的类型转换；
+    /// 2. 转换完成后，再把结果重新按需要包回 Nullable。
+    ///
+    /// 这样做的原因：
+    /// - CAST 本身只关心「非 Nullable 的 from/to 类型」，Nullable 的空值处理逻辑在这一层统一封装；
+    /// - 便于复用同一套转换实现，避免为 Nullable 再实现一套完全相同的逻辑。
     bool result_is_nullable = to_type->is_nullable();
 
     if (result_is_nullable) {
+        // 如果目标类型是 Nullable，这里返回一个「闭包包装器」：
+        // - 闭包内部会：
+        //   1）把 result / source 的 Nullable 外壳拆掉（unnest_nullable）；
+        //   2）调用 prepare_impl 得到真正的 CAST 实现（针对非 Nullable 类型）；
+        //   3）再把结果重新包回 Nullable。
         return [from_type, to_type](FunctionContext* context, Block& block,
                                     const ColumnNumbers& arguments, uint32_t result,
                                     size_t input_rows_count,
                                     const NullMap::value_type* null_map = nullptr) {
+            // 取得非 Nullable 的 from / to 类型（只处理其内部实际类型）
             auto from_type_not_nullable = remove_nullable(from_type);
             auto to_type_not_nullable = remove_nullable(to_type);
 
+            // 判断是否需要把 NULL 数据替换成默认值（主要是数值/日期类在严格模式下的精度与溢出检查）
             bool replace_null_data_to_default = need_replace_null_data_to_default(
                     context, from_type_not_nullable, to_type_not_nullable);
 
+            // nested_result_index：用于暂存「去掉 Nullable 外壳的结果列」的临时列位置
             auto nested_result_index = block.columns();
             block.insert(block.get_by_position(result).unnest_nullable());
+            // nested_source_index：用于暂存「去掉 Nullable 外壳的源列」的临时列位置
             auto nested_source_index = block.columns();
             block.insert(block.get_by_position(arguments[0])
                                  .unnest_nullable(replace_null_data_to_default));
 
+            // 如果原始源列本身是 Nullable，这里获取它的 NullMap 指针，传给内部真实 CAST，
+            // 方便内部在需要时参考原 NullMap（例如严格模式下的额外校验）。
             const auto& arg_col = block.get_by_position(arguments[0]);
             const NullMap::value_type* arg_null_map = nullptr;
             if (const auto* nullable = check_and_get_column<ColumnNullable>(*arg_col.column)) {
                 arg_null_map = nullable->get_null_map_data().data();
             }
+            // 调用真正的非 Nullable CAST 实现（prepare_impl 返回的是一个 WrapperType 函数对象）
             RETURN_IF_ERROR(prepare_impl(context, from_type_not_nullable, to_type_not_nullable)(
                     context, block, {nested_source_index}, nested_result_index, input_rows_count,
                     arg_null_map));
 
+            // 将内部结果重新包成 Nullable（合并原 NullMap 与新产生的 NullMap）
             block.get_by_position(result).column =
                     wrap_in_nullable(block.get_by_position(nested_result_index).column, block,
                                      arguments, input_rows_count);
 
+            // 清理刚才插入到 Block 中的两个临时列，避免长期占用内存
             block.erase(nested_source_index);
             block.erase(nested_result_index);
             return Status::OK();

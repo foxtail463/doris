@@ -238,29 +238,37 @@ void PipelineFragmentContext::cancel(const Status reason) {
 }
 
 PipelinePtr PipelineFragmentContext::add_pipeline(PipelinePtr parent, int idx) {
+    // 每次新增 pipeline 都需要分配一个唯一的 PipelineId
     PipelineId id = _next_pipeline_id++;
+    // 需要根据父 pipeline 的任务数和当前实例数决定新 pipeline 的任务数/并发度
     auto pipeline = std::make_shared<Pipeline>(
             id, parent ? std::min(parent->num_tasks(), _num_instances) : _num_instances,
             parent ? parent->num_tasks() : _num_instances);
     if (idx >= 0) {
+        // 指定插入位置时，将 pipeline 插入到对应下标
         _pipelines.insert(_pipelines.begin() + idx, pipeline);
     } else {
+        // 未指定位置，默认插入到末尾
         _pipelines.emplace_back(pipeline);
     }
     if (parent) {
+        // 建立父子 pipeline 的拓扑关系
         parent->set_children(pipeline);
     }
     return pipeline;
 }
 
 Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
+    // 已经执行过 prepare 的上下文无需重复执行，直接返回错误
     if (_prepared) {
         return Status::InternalError("Already prepared");
     }
+    // 读取查询级别的超时配置，后续调度需要用到
     if (_params.__isset.query_options && _params.query_options.__isset.execution_timeout) {
         _timeout = _params.query_options.execution_timeout;
     }
 
+    // 构建片段级 profile，并挂载准备阶段需要的计时器，便于排查性能
     _fragment_level_profile = std::make_unique<RuntimeProfile>("PipelineContext");
     _prepare_timer = ADD_TIMER(_fragment_level_profile, "PrepareTime");
     SCOPED_TIMER(_prepare_timer);
@@ -270,6 +278,7 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
     _build_tasks_timer = ADD_TIMER(_fragment_level_profile, "BuildTasksTime");
     _prepare_all_pipelines_timer = ADD_TIMER(_fragment_level_profile, "PrepareAllPipelinesTime");
     {
+        // ===== 阶段 1：初始化全局运行时状态 =====
         SCOPED_TIMER(_init_context_timer);
         cast_set(_num_instances, _params.local_params.size());
         _total_instances =
@@ -281,7 +290,7 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
             fragment_context->set_is_report_success(_params.query_options.is_report_success);
         }
 
-        // 1. Set up the global runtime state.
+        // 创建 RuntimeState，并将 query 级别的各种属性注入进去
         _runtime_state = RuntimeState::create_unique(
                 _params.query_id, _params.fragment_id, _params.query_options,
                 _query_ctx->query_globals, _exec_env, _query_ctx.get());
@@ -313,7 +322,7 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
         _runtime_state->set_total_load_streams(_params.total_load_streams);
         _runtime_state->set_num_local_sink(_params.num_local_sink);
 
-        // init fragment_instance_ids
+        // 初始化 fragment_instance_ids，后续调度/汇报需要
         const auto target_size = _params.local_params.size();
         _fragment_instance_ids.resize(target_size);
         for (size_t i = 0; i < _params.local_params.size(); i++) {
@@ -323,6 +332,7 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
     }
 
     {
+        // ===== 阶段 2：构建算子 Pipeline 并创建 Sink =====
         SCOPED_TIMER(_build_pipelines_timer);
         // 2. Build pipelines with operators in this fragment.
         auto root_pipeline = add_pipeline();
@@ -345,7 +355,8 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
             RETURN_IF_ERROR(pipeline->sink()->set_child(pipeline->operators().back()));
         }
     }
-    // 4. Build local exchanger
+    // ===== 阶段 3：根据需要规划本地交换器 =====
+    // 仅当开启 local shuffle 时才需要构建 local exchanger
     if (_runtime_state->enable_local_shuffle()) {
         SCOPED_TIMER(_plan_local_exchanger_timer);
         RETURN_IF_ERROR(_plan_local_exchange(_params.num_buckets,
@@ -353,7 +364,7 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
                                              _params.shuffle_idx_to_instance_idx));
     }
 
-    // 5. Initialize global states in pipelines.
+    // ===== 阶段 4：prepare 所有 pipeline，并清理 children 关系 =====
     for (PipelinePtr& pipeline : _pipelines) {
         SCOPED_TIMER(_prepare_all_pipelines_timer);
         pipeline->children().clear();
@@ -361,11 +372,13 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
     }
 
     {
+        // ===== 阶段 5：创建 pipeline task，并做任务级初始化 =====
         SCOPED_TIMER(_build_tasks_timer);
         // 6. Build pipeline tasks and initialize local state.
         RETURN_IF_ERROR(_build_pipeline_tasks(thread_pool));
     }
 
+    // 初始化下一次状态上报时间，确保心跳/汇报机制可用
     _init_next_report_time();
 
     _prepared = true;
@@ -373,26 +386,46 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
 }
 
 Status PipelineFragmentContext::_build_pipeline_tasks(ThreadPool* thread_pool) {
+    // ===== 阶段 1：初始化任务相关的数据结构 =====
+    // 重置任务计数器，准备开始创建任务
     _total_tasks = 0;
+    // target_size 表示该 fragment 需要创建的实例数量（通常对应多个 BE 节点或并发实例）
     const auto target_size = _params.local_params.size();
+    // 为每个实例预留任务存储空间：_tasks[i] 存储第 i 个实例的所有 PipelineTask
     _tasks.resize(target_size);
+    // 为每个实例预留运行时过滤器管理器存储空间
     _runtime_filter_mgr_map.resize(target_size);
+    // 构建 Pipeline ID 到 Pipeline 指针的映射，方便后续快速查找
     for (size_t pip_idx = 0; pip_idx < _pipelines.size(); pip_idx++) {
         _pip_id_to_pipeline[_pipelines[pip_idx]->id()] = _pipelines[pip_idx].get();
     }
+    // 为每个 Pipeline 创建性能监控 Profile，用于记录执行统计信息
     auto pipeline_id_to_profile = _runtime_state->build_pipeline_profile(_pipelines.size());
 
+    // ===== 阶段 2：定义 lambda 函数，用于为每个 fragment instance 创建和准备 tasks =====
+    // pre_and_submit 函数负责：
+    // 1. 为第 i 个实例创建所有 PipelineTask
+    // 2. 建立 Pipeline 之间的依赖关系（DAG）
+    // 3. 准备每个 task（初始化本地状态、设置扫描范围等）
     auto pre_and_submit = [&](int i, PipelineFragmentContext* ctx) {
+        // 获取第 i 个实例的本地参数（包含 fragment_instance_id、sender_id、scan_ranges 等）
         const auto& local_params = _params.local_params[i];
         auto fragment_instance_id = local_params.fragment_instance_id;
+        // 为当前实例创建运行时过滤器管理器，用于处理运行时过滤器的推送和接收
         auto runtime_filter_mgr = std::make_unique<RuntimeFilterMgr>(false);
+        // Pipeline ID 到 PipelineTask 指针的映射，用于后续建立依赖关系
         std::map<PipelineId, PipelineTask*> pipeline_id_to_task;
+        
+        // 定义 lambda 函数：获取指定 Pipeline 的共享状态映射
+        // 共享状态用于在不同 Pipeline 之间共享数据（如 Hash Join 的 Build 端数据）
         auto get_shared_state = [&](PipelinePtr pipeline)
                 -> std::map<int, std::pair<std::shared_ptr<BasicSharedState>,
                                            std::vector<std::shared_ptr<Dependency>>>> {
             std::map<int, std::pair<std::shared_ptr<BasicSharedState>,
                                     std::vector<std::shared_ptr<Dependency>>>>
                     shared_state_map;
+            // 遍历 Pipeline 中的所有算子，查找需要共享状态的 Source 算子
+            // Source 算子（如 JoinProbeSource）需要从上游 Pipeline 的 Sink（如 JoinBuildSink）获取共享状态
             for (auto& op : pipeline->operators()) {
                 auto source_id = op->operator_id();
                 if (auto iter = _op_id_to_shared_state.find(source_id);
@@ -400,6 +433,8 @@ Status PipelineFragmentContext::_build_pipeline_tasks(ThreadPool* thread_pool) {
                     shared_state_map.insert({source_id, iter->second});
                 }
             }
+            // 遍历 Pipeline 的 Sink，查找需要共享状态的 Sink 算子
+            // Sink 算子（如 JoinBuildSink）会创建共享状态，供下游 Pipeline 的 Source 使用
             for (auto sink_to_source_id : pipeline->sink()->dests_id()) {
                 if (auto iter = _op_id_to_shared_state.find(sink_to_source_id);
                     iter != _op_id_to_shared_state.end()) {
@@ -409,20 +444,39 @@ Status PipelineFragmentContext::_build_pipeline_tasks(ThreadPool* thread_pool) {
             return shared_state_map;
         };
 
+        // ===== 阶段 2.1：为每个 Pipeline 创建对应的 PipelineTask =====
+        // 注意：这个循环是在 pre_and_submit lambda 内部，而 pre_and_submit 会被调用 target_size 次
+        // （每个 fragment instance 一次，见下面的 621-630 行或 653-655 行）
+        // 因此，一个 Pipeline 创建多个 Task 的逻辑是：
+        // - 如果 pipeline->num_tasks() > 1：每个 fragment instance (i) 都会创建一个 Task
+        //   例如：target_size=8, num_tasks=8，则总共创建 8 个 Task（每个 instance 一个）
+        // - 如果 pipeline->num_tasks() == 1：只有第一个 fragment instance (i==0) 创建 Task
+        //   例如：target_size=8, num_tasks=1，则总共创建 1 个 Task（只有 instance 0）
         for (size_t pip_idx = 0; pip_idx < _pipelines.size(); pip_idx++) {
             auto& pipeline = _pipelines[pip_idx];
+            // 判断是否需要为当前实例（第 i 个 fragment instance）创建该 Pipeline 的 Task：
+            // - pipeline->num_tasks() > 1：该 Pipeline 需要多个并发任务（如并行扫描）
+            //   此时每个 fragment instance 都会创建一个 Task，实现并行执行
+            // - i == 0：第一个实例总是需要创建（即使 num_tasks == 1）
+            //   这样可以确保至少有一个实例执行该 Pipeline（串行算子场景）
             if (pipeline->num_tasks() > 1 || i == 0) {
+                // 创建该 Task 的运行时状态（RuntimeState）
+                // RuntimeState 包含查询执行所需的所有上下文信息（如内存追踪器、描述符表等）
                 auto task_runtime_state = RuntimeState::create_unique(
                         local_params.fragment_instance_id, _params.query_id, _params.fragment_id,
                         _params.query_options, _query_ctx->query_globals, _exec_env,
                         _query_ctx.get());
                 {
-                    // Initialize runtime state for this task
+                    // 初始化运行时状态的各种属性
+                    // 设置查询级别的内存追踪器，用于监控和限制该 Task 的内存使用
                     task_runtime_state->set_query_mem_tracker(_query_ctx->query_mem_tracker());
 
+                    // 设置任务执行上下文，让 Task 可以访问 FragmentContext
                     task_runtime_state->set_task_execution_context(shared_from_this());
+                    // 设置后端节点编号，用于标识该 Task 运行在哪个 BE 节点上
                     task_runtime_state->set_be_number(local_params.backend_num);
 
+                    // 以下为可选参数的设置（根据 Thrift 参数是否设置来决定）
                     if (_params.__isset.backend_id) {
                         task_runtime_state->set_backend_id(_params.backend_id);
                     }
@@ -442,32 +496,46 @@ Status PipelineFragmentContext::_build_pipeline_tasks(ThreadPool* thread_pool) {
                         task_runtime_state->set_content_length(_params.content_length);
                     }
 
+                    // 设置描述符表（包含表结构、列信息等），算子需要用它来解析数据
                     task_runtime_state->set_desc_tbl(_desc_tbl);
+                    // 设置当前实例在 fragment 中的索引和总数，用于数据分布和 shuffle
                     task_runtime_state->set_per_fragment_instance_idx(local_params.sender_id);
                     task_runtime_state->set_num_per_fragment_instances(_params.num_senders);
+                    // 为所有算子预留本地状态的存储空间
                     task_runtime_state->resize_op_id_to_local_state(max_operator_id());
                     task_runtime_state->set_max_operator_id(max_operator_id());
+                    // 设置 Load 相关的流参数（用于 Stream Load 场景）
                     task_runtime_state->set_load_stream_per_node(_params.load_stream_per_node);
                     task_runtime_state->set_total_load_streams(_params.total_load_streams);
                     task_runtime_state->set_num_local_sink(_params.num_local_sink);
 
+                    // 设置运行时过滤器管理器，用于接收和推送运行时过滤器
                     task_runtime_state->set_runtime_filter_mgr(runtime_filter_mgr.get());
                 }
+                // 分配全局唯一的 Task ID，用于标识和追踪该 Task
                 auto cur_task_id = _total_tasks++;
                 task_runtime_state->set_task_id(cur_task_id);
+                // 设置该 Pipeline 的总任务数（用于并发控制）
                 task_runtime_state->set_task_num(pipeline->num_tasks());
+                // 创建 PipelineTask 对象
+                // PipelineTask 是 Pipeline 执行的最小单元，封装了算子的执行逻辑
                 auto task = std::make_shared<PipelineTask>(
                         pipeline, cur_task_id, task_runtime_state.get(),
                         std::dynamic_pointer_cast<PipelineFragmentContext>(shared_from_this()),
                         pipeline_id_to_profile[pip_idx].get(), get_shared_state(pipeline), i);
+                // 通知 Pipeline 已创建了一个 Task，更新 Pipeline 的任务计数
                 pipeline->incr_created_tasks(i, task.get());
+                // 记录 Pipeline ID 到 Task 的映射，用于后续建立依赖关系
                 pipeline_id_to_task.insert({pipeline->id(), task.get()});
+                // 将 Task 和对应的 RuntimeState 存储到 _tasks 容器中
+                // 注意：Task 和 RuntimeState 的生命周期绑定在一起
                 _tasks[i].emplace_back(
                         std::pair<std::shared_ptr<PipelineTask>, std::unique_ptr<RuntimeState>> {
                                 std::move(task), std::move(task_runtime_state)});
             }
         }
 
+        // ===== 阶段 2.2：构建 Pipeline 之间的依赖关系（DAG） =====
         /**
          * Build DAG for pipeline tasks.
          * For example, we have
@@ -485,20 +553,31 @@ Status PipelineFragmentContext::_build_pipeline_tasks(ThreadPool* thread_pool) {
          * Finally, we have two upstream dependencies in Pipeline1 corresponding to JoinProbeOperator1
          * and JoinProbeOperator2.
          */
+        // 遍历所有 Pipeline，建立它们之间的依赖关系
+        // 依赖关系表示：下游 Pipeline（如 JoinProbe）需要等待上游 Pipeline（如 JoinBuild）完成
         for (auto& _pipeline : _pipelines) {
             if (pipeline_id_to_task.contains(_pipeline->id())) {
                 auto* task = pipeline_id_to_task[_pipeline->id()];
                 DCHECK(task != nullptr);
 
-                // If this task has upstream dependency, then inject it into this task.
+                // 如果当前 Pipeline 有上游依赖（在 _dag 中记录），则注入共享状态
+                // 共享状态是上游 Pipeline 的 Sink 创建，供下游 Pipeline 的 Source 使用
                 if (_dag.contains(_pipeline->id())) {
                     auto& deps = _dag[_pipeline->id()];
+                    // 遍历所有依赖的上游 Pipeline
                     for (auto& dep : deps) {
                         if (pipeline_id_to_task.contains(dep)) {
+                            // 尝试从上游 Pipeline 的 Sink 获取共享状态
+                            // 例如：JoinBuildSink 创建的 HashTable 共享状态
                             auto ss = pipeline_id_to_task[dep]->get_sink_shared_state();
                             if (ss) {
+                                // 如果上游有 Sink 共享状态，注入到当前 Task
+                                // 这样当前 Task 的 Source（如 JoinProbeSource）就可以访问上游的数据
                                 task->inject_shared_state(ss);
                             } else {
+                                // 如果上游没有 Sink 共享状态，可能是反向依赖
+                                // 将当前 Task 的 Source 共享状态注入到上游 Task
+                                // 这种情况较少见，通常用于特殊的数据交换场景
                                 pipeline_id_to_task[dep]->inject_shared_state(
                                         task->get_source_shared_state());
                             }
@@ -507,60 +586,87 @@ Status PipelineFragmentContext::_build_pipeline_tasks(ThreadPool* thread_pool) {
                 }
             }
         }
+        // ===== 阶段 2.3：准备每个 Task（初始化本地状态、设置扫描范围等） =====
         for (size_t pip_idx = 0; pip_idx < _pipelines.size(); pip_idx++) {
             if (pipeline_id_to_task.contains(_pipelines[pip_idx]->id())) {
                 auto* task = pipeline_id_to_task[_pipelines[pip_idx]->id()];
                 DCHECK(pipeline_id_to_profile[pip_idx]);
+                // 获取该 Pipeline 的扫描范围（ScanRange）
+                // ScanRange 定义了需要扫描的数据范围（如表的分区、文件块等）
                 std::vector<TScanRangeParams> scan_ranges;
+                // 获取 Pipeline 的第一个算子（通常是 Source 算子，如 ScanOperator）的节点 ID
                 auto node_id = _pipelines[pip_idx]->operators().front()->node_id();
+                // 从本地参数中查找该节点对应的扫描范围
                 if (local_params.per_node_scan_ranges.contains(node_id)) {
                     scan_ranges = local_params.per_node_scan_ranges.find(node_id)->second;
                 }
+                // 准备 Task：初始化算子的本地状态、设置扫描范围、初始化 Sink 等
+                // 这是 Task 执行前的最后一步准备工作
                 RETURN_IF_ERROR_OR_CATCH_EXCEPTION(task->prepare(
                         scan_ranges, local_params.sender_id, _params.fragment.output_sink));
             }
         }
+        // 将运行时过滤器管理器存储到映射中，供后续使用
         {
             std::lock_guard<std::mutex> l(_state_map_lock);
             _runtime_filter_mgr_map[i] = std::move(runtime_filter_mgr);
         }
         return Status::OK();
     };
+    
+    // ===== 阶段 3：根据实例数量决定并行准备还是串行准备 =====
+    // 如果实例数量足够大（超过 parallel_prepare_threshold），使用多线程并行准备
+    // 这样可以加快大量实例的准备工作，提高查询启动速度
     if (target_size > 1 &&
         (_runtime_state->query_options().__isset.parallel_prepare_threshold &&
          target_size > _runtime_state->query_options().parallel_prepare_threshold)) {
-        // If instances parallelism is big enough ( > parallel_prepare_threshold), we will prepare all tasks by multi-threads
+        // 并行准备模式：使用线程池并行执行 pre_and_submit
         std::vector<Status> prepare_status(target_size);
         int submitted_tasks = 0;
         Status submit_status;
+        // 使用 CountDownLatch 等待所有并行任务完成
         CountDownLatch latch((int)target_size);
         for (int i = 0; i < target_size; i++) {
+            // 将每个实例的准备工作提交到线程池
             submit_status = thread_pool->submit_func([&, i]() {
+                // 附加查询上下文，确保内存追踪和线程本地存储正确
                 SCOPED_ATTACH_TASK(_query_ctx.get());
+                // 执行准备工作
                 prepare_status[i] = pre_and_submit(i, this);
+                // 计数减一，表示该任务完成
                 latch.count_down();
             });
             if (LIKELY(submit_status.ok())) {
                 submitted_tasks++;
             } else {
+                // 如果提交失败，停止提交更多任务
                 break;
             }
         }
+        // 等待所有已提交的任务完成（包括失败的任务）
         latch.arrive_and_wait(target_size - submitted_tasks);
+        // 检查提交状态
         if (UNLIKELY(!submit_status.ok())) {
             return submit_status;
         }
+        // 检查所有任务的执行状态，如果有失败则返回错误
         for (int i = 0; i < submitted_tasks; i++) {
             if (!prepare_status[i].ok()) {
                 return prepare_status[i];
             }
         }
     } else {
+        // 串行准备模式：顺序执行每个实例的准备工作
+        // 适用于实例数量较少的情况，避免线程切换开销
         for (int i = 0; i < target_size; i++) {
             RETURN_IF_ERROR(pre_and_submit(i, this));
         }
     }
+    
+    // ===== 阶段 4：清理临时数据结构 =====
+    // 清理 Pipeline 父子关系映射（仅在构建阶段需要）
     _pipeline_parent_map.clear();
+    // 清理算子 ID 到共享状态的映射（已注入到 Task 中，不再需要）
     _op_id_to_shared_state.clear();
 
     return Status::OK();
@@ -655,6 +761,7 @@ Status PipelineFragmentContext::_create_tree_helper(ObjectPool* pool,
                                                     int* node_idx, OperatorPtr* root,
                                                     PipelinePtr& cur_pipe, int child_idx,
                                                     const bool followed_by_shuffled_operator) {
+    // 遍历 tnodes 时需要保证 node_idx 没越界，否则说明 Thrift 计划树有问题
     // propagate error case
     if (*node_idx >= tnodes.size()) {
         return Status::InternalError(
@@ -669,6 +776,7 @@ Status PipelineFragmentContext::_create_tree_helper(ObjectPool* pool,
     RETURN_IF_ERROR(_create_operator(pool, tnodes[*node_idx], descs, op, cur_pipe,
                                      parent == nullptr ? -1 : parent->node_id(), child_idx,
                                      followed_by_shuffled_operator));
+    // 某些算子在 init 阶段会读取表达式/参数（例如聚合的 group by 列），用于后续局部 shuffle 规划
     // Initialization must be done here. For example, group by expressions in agg will be used to
     // decide if a local shuffle should be planed, so it must be initialized here.
     RETURN_IF_ERROR(op->init(tnode, _runtime_state.get()));
@@ -689,6 +797,9 @@ Status PipelineFragmentContext::_create_tree_helper(ObjectPool* pool,
      *
      * If an operator's is followed by a local exchange without shuffle (e.g. passthrough), a
      * shuffled local exchanger will be used before join so it is not followed by shuffle join.
+     *
+     * 上述注释强调：如果当前算子后面接的是需要 shuffle 的算子（比如 Shuffle Hash Join），
+     * 就需要保证本地 LocalExchange 的数据分布与远端 Exchange 一致。
      */
     auto require_shuffled_data_distribution =
             cur_pipe->operators().empty()
@@ -698,6 +809,7 @@ Status PipelineFragmentContext::_create_tree_helper(ObjectPool* pool,
             (followed_by_shuffled_operator || op->is_shuffled_operator()) &&
             require_shuffled_data_distribution;
 
+    // 如果是叶子节点，需要记录该算子是否串行，后续在构建 Source 时避免并发
     if (num_children == 0) {
         _use_serial_source = op->is_serial_operator();
     }
@@ -707,6 +819,7 @@ Status PipelineFragmentContext::_create_tree_helper(ObjectPool* pool,
         RETURN_IF_ERROR(_create_tree_helper(pool, tnodes, descs, op, node_idx, nullptr, cur_pipe, i,
                                             current_followed_by_shuffled_operator));
 
+        // 遍历完子节点后立即检查越界，避免访问非法节点
         // we are expecting a child, but have used all nodes
         // this means we have been given a bad tree and must fail
         if (*node_idx >= tnodes.size()) {
@@ -934,24 +1047,55 @@ Status PipelineFragmentContext::_add_local_exchange(
     return Status::OK();
 }
 
+/**
+ * 规划本地数据交换（Local Exchange）
+ * 
+ * 本地交换用于在同一个 BE 节点内的不同 Pipeline 之间重新分布数据，主要场景包括：
+ * 1. 数据重新分区：当后续算子需要不同的数据分布时（如 Hash Join 需要按 join key 分区）
+ * 2. 并行度调整：调整 Pipeline 的并行度，提高执行效率
+ * 3. 数据倾斜处理：通过重新分区缓解数据倾斜问题
+ * 
+ * 该函数是规划本地交换的入口函数，遍历所有 Pipeline 并为每个 Pipeline 规划本地交换节点。
+ * 采用从后往前的遍历顺序，确保在规划当前 Pipeline 时，其子 Pipeline 的数据分布已经确定。
+ * 
+ * @param num_buckets 分桶数量，用于 BUCKET_HASH_SHUFFLE 类型的数据分布
+ * @param bucket_seq_to_instance_idx bucket 序列号到实例索引的映射，用于确定数据路由
+ * @param shuffle_idx_to_instance_idx shuffle 索引到实例索引的映射，用于全局 shuffle
+ * @return Status 返回规划状态，成功返回 OK
+ */
 Status PipelineFragmentContext::_plan_local_exchange(
         int num_buckets, const std::map<int, int>& bucket_seq_to_instance_idx,
         const std::map<int, int>& shuffle_idx_to_instance_idx) {
+    // 从后往前遍历所有 Pipeline（从最后一个到第一个）
+    // 这样在规划当前 Pipeline 时，其子 Pipeline 的数据分布已经确定，可以正确继承
     for (int pip_idx = cast_set<int>(_pipelines.size()) - 1; pip_idx >= 0; pip_idx--) {
+        // 1. 初始化当前 Pipeline 的数据分布属性
+        // 数据分布描述了数据在 Pipeline 中的分布方式（如哈希分区、轮询、广播等）
         _pipelines[pip_idx]->init_data_distribution(_runtime_state.get());
-        // Set property if child pipeline is not join operator's child.
+        
+        // 2. 从子 Pipeline 继承数据分布（如果适用）
+        // 如果当前 Pipeline 有子 Pipeline，并且子 Pipeline 的 sink 节点 ID 等于
+        // 当前 Pipeline 的第一个 operator 节点 ID，说明它们是直接连接的（不是 Join 的子节点），
+        // 此时可以继承子 Pipeline 的数据分布，避免不必要的本地交换
         if (!_pipelines[pip_idx]->children().empty()) {
             for (auto& child : _pipelines[pip_idx]->children()) {
+                // 检查子 Pipeline 的 sink 节点是否直接连接到当前 Pipeline 的第一个 operator
+                // 如果是，说明数据流是连续的，可以继承数据分布
                 if (child->sink()->node_id() ==
                     _pipelines[pip_idx]->operators().front()->node_id()) {
+                    // 继承子 Pipeline 的数据分布，避免重复的本地交换
                     _pipelines[pip_idx]->set_data_distribution(child->data_distribution());
                 }
             }
         }
 
-        // if 'num_buckets == 0' means the fragment is colocated by exchange node not the
-        // scan node. so here use `_num_instance` to replace the `num_buckets` to prevent dividing 0
-        // still keep colocate plan after local shuffle
+        // 3. 为当前 Pipeline 规划本地交换节点
+        // 调用重载版本的 _plan_local_exchange，它会检查 Pipeline 中的每个 operator 和 sink
+        // 是否需要本地交换，并在需要时插入 LocalExchangeSink 和 LocalExchangeSource
+        // 
+        // 注意：如果 num_buckets == 0，说明 Fragment 是通过 Exchange 节点进行 co-located 的，
+        // 而不是通过 Scan 节点。此时使用 _num_instance 替代 num_buckets 以避免除零错误，
+        // 同时保持 co-locate 计划在本地 shuffle 之后仍然有效
         RETURN_IF_ERROR(_plan_local_exchange(num_buckets, pip_idx, _pipelines[pip_idx],
                                              bucket_seq_to_instance_idx,
                                              shuffle_idx_to_instance_idx));
@@ -959,35 +1103,81 @@ Status PipelineFragmentContext::_plan_local_exchange(
     return Status::OK();
 }
 
+/**
+ * 为单个 Pipeline 规划本地数据交换（Local Exchange）
+ *
+ * 该函数负责在 Pipeline 内部规划本地数据交换，用于在同一个 BE 节点内的多个 Task 之间重新分布数据。
+ * Local Exchange 主要用于：
+ * 1. 满足下游 Operator 的数据分布要求（如 Hash Join Build 需要按 Join Key 分桶）
+ * 2. 实现数据广播（Broadcast）或重新分区（Shuffle）
+ * 3. 调整 Pipeline 的并行度或处理数据倾斜
+ *
+ * 工作原理：
+ * - 遍历 Pipeline 中的每个 Operator，检查其数据分布要求
+ * - 如果某个 Operator 需要特定的数据分布（如 HASH_SHUFFLE、BROADCAST），
+ *   则在该 Operator 之前插入 LocalExchangeSink 和 LocalExchangeSource
+ * - 插入 Local Exchange 后，Pipeline 会被分割成两个 Pipeline：
+ *   * 原 Pipeline：在 LocalExchangeSink 处结束
+ *   * 新 Pipeline：从 LocalExchangeSource 开始，包含剩余的 Operator
+ * - 使用 do-while 循环确保所有需要 Local Exchange 的位置都被处理
+ *
+ * @param num_buckets 分桶数量，用于哈希分区
+ * @param pip_idx Pipeline 索引
+ * @param pip 当前 Pipeline 指针
+ * @param bucket_seq_to_instance_idx 桶序列到实例索引的映射
+ * @param shuffle_idx_to_instance_idx shuffle 索引到实例索引的映射
+ * @return Status 返回执行状态
+ */
 Status PipelineFragmentContext::_plan_local_exchange(
         int num_buckets, int pip_idx, PipelinePtr pip,
         const std::map<int, int>& bucket_seq_to_instance_idx,
         const std::map<int, int>& shuffle_idx_to_instance_idx) {
+    // 从索引 1 开始遍历 Operator（索引 0 通常是 Source Operator，不需要 Local Exchange）
     int idx = 1;
     bool do_local_exchange = false;
+    
+    // 使用 do-while 循环处理 Pipeline 分割后的情况
+    // 当添加 Local Exchange 后，Pipeline 会被分割，需要重新处理新 Pipeline 中的剩余 Operator
     do {
         auto& ops = pip->operators();
         do_local_exchange = false;
-        // Plan local exchange for each operator.
+        
+        // 遍历 Pipeline 中的每个 Operator，检查是否需要 Local Exchange
         for (; idx < ops.size();) {
+            // 检查当前 Operator 是否需要特定的数据分布（如 HASH_SHUFFLE、BROADCAST）
             if (ops[idx]->required_data_distribution(_runtime_state.get()).need_local_exchange()) {
+                // 在当前 Operator 之前添加 LocalExchangeSink 和 LocalExchangeSource
+                // 这会将 Pipeline 分割成两个 Pipeline：
+                // - 原 Pipeline：在 LocalExchangeSink 处结束
+                // - 新 Pipeline：从 LocalExchangeSource 开始，包含当前 Operator 及后续 Operator
                 RETURN_IF_ERROR(_add_local_exchange(
                         pip_idx, idx, ops[idx]->node_id(), _runtime_state->obj_pool(), pip,
                         ops[idx]->required_data_distribution(_runtime_state.get()),
                         &do_local_exchange, num_buckets, bucket_seq_to_instance_idx,
                         shuffle_idx_to_instance_idx));
             }
+            
+            // 如果添加了 Local Exchange，Pipeline 已被分割
             if (do_local_exchange) {
-                // If local exchange is needed for current operator, we will split this pipeline to
-                // two pipelines by local exchange sink/source. And then we need to process remaining
-                // operators in this pipeline so we set idx to 2 (0 is local exchange source and 1
-                // is current operator was already processed) and continue to plan local exchange.
+                // Pipeline 分割后的结构：
+                // [原 Pipeline: ... Operator(idx-1) -> LocalExchangeSink]
+                // [新 Pipeline: LocalExchangeSource -> Operator(idx) -> ...]
+                // 
+                // 设置 idx = 2，因为：
+                // - 索引 0：新 Pipeline 中的 LocalExchangeSource（已添加）
+                // - 索引 1：当前 Operator（已处理，但需要在新 Pipeline 中重新检查）
+                // - 索引 2：下一个需要检查的 Operator
+                // 
+                // 跳出当前循环，重新进入 do-while 循环处理新 Pipeline
                 idx = 2;
                 break;
             }
             idx++;
         }
     } while (do_local_exchange);
+    
+    // 最后检查 Sink Operator 是否需要 Local Exchange
+    // Sink 通常需要特定的数据分布（如按分桶写入、广播结果等）
     if (pip->sink()->required_data_distribution(_runtime_state.get()).need_local_exchange()) {
         RETURN_IF_ERROR(_add_local_exchange(
                 pip_idx, idx, pip->sink()->node_id(), _runtime_state->obj_pool(), pip,
@@ -1377,31 +1567,50 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         break;
     }
     case TPlanNodeType::HASH_JOIN_NODE: {
+        // 1. 判断 Join 类型和执行策略
+        // is_broadcast_join: 是否为广播 Join（小表广播到所有节点）
+        // enable_spill: 是否启用溢出到磁盘功能（当内存不足时）
         const auto is_broadcast_join = tnode.hash_join_node.__isset.is_broadcast_join &&
                                        tnode.hash_join_node.is_broadcast_join;
         const auto enable_spill = _runtime_state->enable_spill();
+        
+        // 2. 如果启用 Spill 且不是广播 Join，创建分区 Hash Join（支持溢出到磁盘）
+        // 分区 Hash Join 可以将数据分成多个分区，当某个分区的内存不足时，可以溢出到磁盘
         if (enable_spill && !is_broadcast_join) {
+            // 2.1 准备 TPlanNode（清除 runtime filters，因为溢出场景下不需要）
             auto tnode_ = tnode;
             tnode_.runtime_filters.clear();
             uint32_t partition_count = _runtime_state->spill_hash_join_partition_count();
+            
+            // 2.2 创建内部 Probe Operator（用于处理溢出到磁盘的数据）
+            // 当 Probe 端的数据溢出时，需要重新构建 Hash 表，此时使用内部 Probe Operator
             auto inner_probe_operator =
                     std::make_shared<HashJoinProbeOperatorX>(pool, tnode_, 0, descs);
 
-            // probe side inner sink operator is used to build hash table on probe side when data is spilled.
-            // So here use `tnode_` which has no runtime filters.
+            // 2.3 创建 Probe 端的内部 Build Sink Operator
+            // 当 Probe 端数据溢出时，需要在 Probe 端重新构建 Hash 表
+            // 使用 `tnode_`（没有 runtime filters），因为溢出场景下不需要运行时过滤
             auto probe_side_inner_sink_operator =
                     std::make_shared<HashJoinBuildSinkOperatorX>(pool, 0, 0, tnode_, descs);
 
             RETURN_IF_ERROR(inner_probe_operator->init(tnode_, _runtime_state.get()));
             RETURN_IF_ERROR(probe_side_inner_sink_operator->init(tnode_, _runtime_state.get()));
 
+            // 2.4 创建分区 Hash Join Probe Operator（主 Probe Operator）
+            // PartitionedHashJoinProbeOperatorX 负责：
+            // - 将 Probe 端数据分区
+            // - 处理内存中的分区数据
+            // - 当内存不足时，将数据溢出到磁盘
+            // - 从磁盘恢复数据并执行 Join
             auto probe_operator = std::make_shared<PartitionedHashJoinProbeOperatorX>(
                     pool, tnode_, next_operator_id(), descs, partition_count);
+            // 设置内部 Operator，用于处理溢出数据
             probe_operator->set_inner_operators(probe_side_inner_sink_operator,
                                                 inner_probe_operator);
             op = std::move(probe_operator);
             RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
 
+            // 2.5 创建 Build 端 Pipeline（用于构建 Hash 表）
             const auto downstream_pipeline_id = cur_pipe->id();
             if (!_dag.contains(downstream_pipeline_id)) {
                 _dag.insert({downstream_pipeline_id, {}});
@@ -1409,6 +1618,13 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
             PipelinePtr build_side_pipe = add_pipeline(cur_pipe);
             _dag[downstream_pipeline_id].push_back(build_side_pipe->id());
 
+            // 2.6 创建 Build 端的内部和外部 Sink Operator
+            // inner_sink_operator: 用于处理溢出数据的内部 Build Sink
+            // sink_operator: 分区 Hash Join Sink Operator（主 Build Sink）
+            // PartitionedHashJoinSinkOperatorX 负责：
+            // - 将 Build 端数据分区
+            // - 在内存中构建 Hash 表
+            // - 当内存不足时，将分区数据溢出到磁盘
             auto inner_sink_operator =
                     std::make_shared<HashJoinBuildSinkOperatorX>(pool, 0, 0, tnode, descs);
             auto sink_operator = std::make_shared<PartitionedHashJoinSinkOperatorX>(
@@ -1416,19 +1632,27 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
                     partition_count);
             RETURN_IF_ERROR(inner_sink_operator->init(tnode, _runtime_state.get()));
 
+            // 设置内部 Operator，用于处理溢出数据
             sink_operator->set_inner_operators(inner_sink_operator, inner_probe_operator);
             DataSinkOperatorPtr sink = std::move(sink_operator);
             RETURN_IF_ERROR(build_side_pipe->set_sink(sink));
             RETURN_IF_ERROR(build_side_pipe->sink()->init(tnode_, _runtime_state.get()));
 
+            // 2.7 记录 Pipeline 父子关系，用于后续的依赖管理
             _pipeline_parent_map.push(op->node_id(), cur_pipe);
             _pipeline_parent_map.push(op->node_id(), build_side_pipe);
+            // 标记是否后续有 Shuffle Operator，用于优化数据分布
             sink->set_followed_by_shuffled_operator(sink->is_shuffled_operator());
             op->set_followed_by_shuffled_operator(op->is_shuffled_operator());
         } else {
+            // 3. 创建普通 Hash Join（不支持溢出到磁盘）
+            // 适用于内存充足或广播 Join 的场景
+            
+            // 3.1 创建 Probe Operator（用于探测 Hash 表）
             op = std::make_shared<HashJoinProbeOperatorX>(pool, tnode, next_operator_id(), descs);
             RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
 
+            // 3.2 创建 Build 端 Pipeline（用于构建 Hash 表）
             const auto downstream_pipeline_id = cur_pipe->id();
             if (!_dag.contains(downstream_pipeline_id)) {
                 _dag.insert({downstream_pipeline_id, {}});
@@ -1436,31 +1660,49 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
             PipelinePtr build_side_pipe = add_pipeline(cur_pipe);
             _dag[downstream_pipeline_id].push_back(build_side_pipe->id());
 
+            // 3.3 创建 Build Sink Operator（用于构建 Hash 表）
             DataSinkOperatorPtr sink;
             sink = std::make_shared<HashJoinBuildSinkOperatorX>(pool, next_sink_operator_id(),
                                                                 op->operator_id(), tnode, descs);
             RETURN_IF_ERROR(build_side_pipe->set_sink(sink));
             RETURN_IF_ERROR(build_side_pipe->sink()->init(tnode, _runtime_state.get()));
 
+            // 3.4 记录 Pipeline 父子关系
             _pipeline_parent_map.push(op->node_id(), cur_pipe);
             _pipeline_parent_map.push(op->node_id(), build_side_pipe);
             sink->set_followed_by_shuffled_operator(sink->is_shuffled_operator());
             op->set_followed_by_shuffled_operator(op->is_shuffled_operator());
         }
+        
+        // 4. 如果是广播 Join 且启用共享 Hash 表，创建共享状态
+        // 共享 Hash 表允许多个 Probe Operator 共享同一个 Build 端构建的 Hash 表，
+        // 减少内存使用和提高执行效率
         if (is_broadcast_join && _runtime_state->enable_share_hash_table_for_broadcast_join()) {
+            // 4.1 创建共享状态，管理多个实例之间的 Hash 表共享
             std::shared_ptr<HashJoinSharedState> shared_state =
                     HashJoinSharedState::create_shared(_num_instances);
+            
+            // 4.2 为每个实例创建 Build 依赖
+            // Build 依赖确保 Probe 端在所有 Build 端完成之前不会开始执行
             for (int i = 0; i < _num_instances; i++) {
                 auto sink_dep = std::make_shared<Dependency>(op->operator_id(), op->node_id(),
                                                              "HASH_JOIN_BUILD_DEPENDENCY");
                 sink_dep->set_shared_state(shared_state.get());
                 shared_state->sink_deps.push_back(sink_dep);
             }
+            
+            // 4.3 创建 Probe 端的依赖关系
+            // 确保 Probe 端可以正确等待 Build 端完成
             shared_state->create_source_dependencies(_num_instances, op->operator_id(),
                                                      op->node_id(), "HASH_JOIN_PROBE");
+            
+            // 4.4 将共享状态注册到全局映射中
             _op_id_to_shared_state.insert(
                     {op->operator_id(), {shared_state, shared_state->sink_deps}});
         }
+        
+        // 5. 更新数据分布要求
+        // 如果 Hash Join 需要特定的数据分布（如按 Join Key 分区），则标记需要 bucket 分布
         _require_bucket_distribution =
                 _require_bucket_distribution || op->require_data_distribution();
         break;
@@ -1510,10 +1752,16 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         break;
     }
     case TPlanNodeType::SORT_NODE: {
+        // 1）根据 Plan 决定这次排序是否需要 spill 以及是否启用本地 merge
         const auto should_spill = _runtime_state->enable_spill() &&
                                   tnode.sort_node.algorithm == TSortAlgorithm::FULL_SORT;
         const bool use_local_merge =
                 tnode.sort_node.__isset.use_local_merge && tnode.sort_node.use_local_merge;
+
+        // 2）在当前 pipeline 尾部添加一个“排序结果 Source” 算子
+        //    - SpillSortSourceOperatorX：对应支持外排（磁盘溢写）的排序
+        //    - LocalMergeSortSourceOperatorX：本地多路 merge sort
+        //    - SortSourceOperatorX：普通全内存排序
         if (should_spill) {
             op = std::make_shared<SpillSortSourceOperatorX>(pool, tnode, next_operator_id(), descs);
         } else if (use_local_merge) {
@@ -1524,6 +1772,8 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         }
         RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
 
+        // 3）记录当前 pipeline（包含 SortSource）的 id，并基于它创建一条新的 pipeline（包含 SortSink）
+        //    新 pipeline 作为当前 pipeline 的依赖（必须先执行），负责排序工作
         const auto downstream_pipeline_id = cur_pipe->id();
         if (!_dag.contains(downstream_pipeline_id)) {
             _dag.insert({downstream_pipeline_id, {}});
@@ -1531,6 +1781,11 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         cur_pipe = add_pipeline(cur_pipe);
         _dag[downstream_pipeline_id].push_back(cur_pipe->id());
 
+        // 4）在新建的 pipeline（数据流上游）上创建对应的 SortSink：
+        //    - SpillSortSinkOperatorX：写入可溢写的 sort buffer
+        //    - SortSinkOperatorX：普通 sort sink
+        //    SortSink 会从数据流上游拉数据、做排序并将结果写入 shared_state，
+        //    供前面创建的 SortSource（数据流下游）读取并输出给更下游的算子。
         DataSinkOperatorPtr sink;
         if (should_spill) {
             sink = std::make_shared<SpillSortSinkOperatorX>(pool, next_sink_operator_id(),
@@ -1541,24 +1796,37 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
                                                        op->operator_id(), tnode, descs,
                                                        _require_bucket_distribution);
         }
+        // 标记排序 sink 的下游是否会再接 shuffle 类算子，影响部分分布要求
         sink->set_followed_by_shuffled_operator(followed_by_shuffled_operator);
         _require_bucket_distribution =
                 _require_bucket_distribution || sink->require_data_distribution();
+        // 将新 pipeline 的 sink 设置为排序 sink，并用 TPlanNode 初始化之
         RETURN_IF_ERROR(cur_pipe->set_sink(sink));
         RETURN_IF_ERROR(cur_pipe->sink()->init(tnode, _runtime_state.get()));
         break;
     }
     case TPlanNodeType::PARTITION_SORT_NODE: {
+        // 1）在当前 pipeline 的末尾添加一个 Source 算子：PartitionSortSourceOperatorX
+        //    这条“当前 pipeline”后面不会再设置 sink，而是作为上游管道（child pipeline）存在，
+        //    专门给后面构建的新 pipeline 的 PartitionSortSink 提供数据。
         op = std::make_shared<PartitionSortSourceOperatorX>(pool, tnode, next_operator_id(), descs);
         RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
 
+        // 2）记录当前（上游）pipeline 的 id，作为后面新建下游 pipeline 的“父节点”
         const auto downstream_pipeline_id = cur_pipe->id();
         if (!_dag.contains(downstream_pipeline_id)) {
             _dag.insert({downstream_pipeline_id, {}});
         }
+
+        // 3）基于当前 pipeline 新建一条下游 pipeline（cur_pipe 重新指向新建的这条）
+        //    新建的 pipeline 会被设置 sink = PartitionSortSinkOperatorX，构成完整的 sink pipeline。
         cur_pipe = add_pipeline(cur_pipe);
         _dag[downstream_pipeline_id].push_back(cur_pipe->id());
 
+        // 4）在新建的下游 pipeline 上创建 PartitionSortSinkOperatorX：
+        //    - 它的 child 就是上面那条（带 PartitionSortSource 的）上游 pipeline；
+        //    - 它负责从 child 拉数据、按 PARTITION BY 分区并在每个分区内部排序/TopN；
+        //    - 结果写入 shared_state，供 PartitionSortSource 再作为 Source 输出给更下游。
         DataSinkOperatorPtr sink;
         sink = std::make_shared<PartitionSortSinkOperatorX>(pool, next_sink_operator_id(),
                                                             op->operator_id(), tnode, descs);

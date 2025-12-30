@@ -226,40 +226,74 @@ public class StreamLoadHandler {
         }
     }
 
+    /**
+     * 为单个表生成Stream Load执行计划
+     * 这是Stream Load的核心入口方法，负责创建数据加载的执行计划
+     * 
+     * @param table 目标OLAP表
+     * @throws UserException 当获取表锁超时或创建计划时出现错误
+     */
     public void generatePlan(OlapTable table) throws UserException {
+        // ==================== 第一步：获取表读锁 ====================
+        // 尝试获取表的读锁，确保在规划过程中表结构不会发生变化
         if (!table.tryReadLock(timeoutMs, TimeUnit.MILLISECONDS)) {
             throw new UserException(
                     "get table read lock timeout, database=" + request.getDb() + ",table=" + table.getName());
         }
         try {
+            // ==================== 第二步：创建Stream Load任务 ====================
+            // 从Thrift请求中创建Nereids Stream Load任务对象
             NereidsStreamLoadTask streamLoadTask = NereidsStreamLoadTask.fromTStreamLoadPutRequest(request);
+            
+            // 如果是多表请求，需要构建多表Stream Load任务信息
             if (isMultiTableRequest) {
                 buildMultiTableStreamLoadTask(streamLoadTask, request.getTxnId());
             }
 
+            // ==================== 第三步：创建规划器 ====================
+            // 根据运行模式选择不同的规划器
             NereidsStreamLoadPlanner planner = null;
             if (Config.isCloudMode()) {
+                // 云模式：使用云版本的Stream Load规划器
                 planner = new NereidsCloudStreamLoadPlanner(db, table, streamLoadTask, request.getCloudCluster());
             } else {
+                // 本地模式：使用标准版本的Stream Load规划器
                 planner = new NereidsStreamLoadPlanner(db, table, streamLoadTask);
             }
+            
+            // ==================== 第四步：生成执行计划 ====================
+            // 获取片段实例ID索引（用于多表场景）
             int index = multiTableFragmentInstanceIdIndex != null
                     ? multiTableFragmentInstanceIdIndex.getAndIncrement() : 0;
+            
+            // 调用规划器的plan方法生成执行计划
+            // 这里就是调用我们之前分析的NereidsStreamLoadPlanner.plan()方法
             TPipelineFragmentParams result = null;
             result = planner.plan(streamLoadTask.getId(), index);
+            
+            // ==================== 第五步：设置计划参数 ====================
+            // 设置表名
             result.setTableName(table.getName());
+            // 设置FE进程UUID
             result.query_options.setFeProcessUuid(ExecuteEnv.getInstance().getProcessUUID());
+            // 设置是否为MOW（Merge On Write）表
             result.setIsMowTable(table.getEnableUniqueKeyMergeOnWrite());
+            // 将生成的计划添加到片段参数列表中
             fragmentParams.add(result);
 
+            // ==================== 第六步：处理事务状态 ====================
+            // 如果不是组提交模式，需要更新事务状态
             if (StringUtils.isEmpty(streamLoadTask.getGroupCommit())) {
-                // add table indexes to transaction state
+                // 获取事务状态
                 TransactionState txnState = Env.getCurrentGlobalTransactionMgr()
                         .getTransactionState(db.getId(), request.getTxnId());
                 if (txnState == null) {
                     throw new UserException("txn does not exist: " + request.getTxnId());
                 }
+                // 添加表索引到事务状态
                 txnState.addTableIndexes(table);
+                
+                // 如果是部分更新模式，需要设置部分更新的schema
                 TUniqueKeyUpdateMode uniqueKeyUpdateMode = request.getUniqueKeyUpdateMode();
                 if (uniqueKeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS
                         || uniqueKeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS) {
@@ -267,6 +301,8 @@ public class StreamLoadHandler {
                 }
             }
         } finally {
+            // ==================== 第七步：释放表锁 ====================
+            // 确保在任何情况下都释放表读锁
             table.readUnlock();
         }
     }

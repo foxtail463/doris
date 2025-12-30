@@ -739,12 +739,12 @@ function build_ui() {
     cp -r "${ui_dist}"/* "${DORIS_HOME}/fe/fe-core/src/main/resources/static"/
 }
 
-# FE UI must be built before building FE
-if [[ "${BUILD_FE}" -eq 1 ]]; then
-    if [[ "${BUILD_UI}" -eq 1 ]]; then
-        build_ui
-    fi
-fi
+# # FE UI must be built before building FE
+# if [[ "${BUILD_FE}" -eq 1 ]]; then
+#     if [[ "${BUILD_UI}" -eq 1 ]]; then
+#         build_ui
+#     fi
+# fi
 
 # Clean and build Frontend
 if [[ "${FE_MODULES}" != '' ]]; then
@@ -848,6 +848,11 @@ if [[ "${OUTPUT_BE_BINARY}" -eq 1 ]]; then
     cp -r -p "${DORIS_HOME}/be/output/bin"/* "${DORIS_OUTPUT}/be/bin"/
     cp -r -p "${DORIS_HOME}/be/output/conf"/* "${DORIS_OUTPUT}/be/conf"/
     cp -r -p "${DORIS_HOME}/be/output/dict" "${DORIS_OUTPUT}/be/"
+    
+    # Copy hdfs-site.xml if exists
+    if [[ -f "${DORIS_HOME}/conf/hdfs-site.xml" ]]; then
+        cp -r -p "${DORIS_HOME}/conf/hdfs-site.xml" "${DORIS_OUTPUT}/be/conf/"
+    fi
 
     if [[ -f "${DORIS_THIRDPARTY}/installed/lib/libz.so" ]]; then
         cp -r -p "${DORIS_THIRDPARTY}/installed/lib/libz.so"* "${DORIS_OUTPUT}/be/lib/"

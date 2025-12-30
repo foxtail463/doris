@@ -250,22 +250,22 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
     }
 
     /**
-     * disable join reorder if
-     * 1. any table rowCount is not available, or
-     * 2. col stats ndv=0 but minExpr or maxExpr is not null
-     * 3. ndv > 10 * rowCount
+     * 是否禁用 Join 重排的判定逻辑（返回原因字符串即表示需要禁用，否则为空）
+     * 触发禁用的条件：
+     * 1) 任一表的行数不可用（rowCount == -1）
+     * 2) 对于 OLAP 表，列统计异常：ndv = 0 但存在 min/max，或 ndv 明显失真（ndv > 10 * rowCount）
      */
     public static Optional<String> disableJoinReorderIfStatsInvalid(List<CatalogRelation> scans,
             CascadesContext context) {
         StatsCalculator calculator = new StatsCalculator(context);
         if (ConnectContext.get() == null) {
-            // ut case
+            // 单元测试场景：无会话上下文，直接不禁用
             return Optional.empty();
         }
         boolean enableDebugLog = LOG.isDebugEnabled();
         for (CatalogRelation scan : scans) {
             double rowCount = calculator.getTableRowCount(scan);
-            // row count not available
+            // 行数不可用：禁用 Join 重排
             if (rowCount == -1) {
                 if (enableDebugLog) {
                     LOG.debug("disable join reorder since row count not available: "
@@ -280,7 +280,7 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
                 return Optional.of("table[" + scan.getTable().getName() + "] row count is invalid");
             }
             if (scan instanceof OlapScan) {
-                // ndv abnormal
+                // 对 OLAP 表做列统计的有效性检查：若异常同样禁用 Join 重排
                 Optional<String> reason = calculator.checkNdvValidation((OlapScan) scan, rowCount);
                 if (reason.isPresent()) {
                     try {
@@ -296,6 +296,7 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
                 }
             }
         }
+        // 所有检查均通过：不禁用 Join 重排
         return Optional.empty();
     }
 

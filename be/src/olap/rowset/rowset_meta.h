@@ -288,20 +288,43 @@ public:
                 (start_version() == end_version() && segments_overlap() == NONOVERLAPPING));
     }
 
-    // get the compaction score of this rowset.
-    // if segments are overlapping, the score equals to the number of segments,
-    // otherwise, score is 1.
+    /**
+     * 获取行集的合并分数（compaction score）
+     * 合并分数用于决定行集在合并操作中的优先级
+     * 
+     * 评分规则：
+     * - 如果段（segments）不重叠：分数 = 1
+     * - 如果段重叠：分数 = 段的数量
+     * 
+     * 重叠的段越多，分数越高，越优先进行合并操作
+     * 
+     * @return 合并分数，分数越高表示越需要合并
+     */
     uint32_t get_compaction_score() const {
-        uint32_t score = 0;
+        uint32_t score = 0;  // 初始化合并分数
+        
         if (!is_segments_overlapping()) {
+            // 情况1：段不重叠
+            // 当段之间没有重叠时，数据组织良好，合并需求较低
+            // 给予最低分数1，表示合并优先级较低
             score = 1;
         } else {
-            auto num_seg = num_segments();
+            // 情况2：段重叠
+            // 当段之间有重叠时，数据组织混乱，查询性能较差
+            // 分数等于段的数量，段越多表示越需要合并
+            auto num_seg = num_segments();  // 获取段的数量
+            
+            // 断言检查：段数量必须大于0
             DCHECK_GT(num_seg, 0);
+            
+            // 将段数量转换为合并分数
             score = cast_set<uint32_t>(num_seg);
+            
+            // 运行时检查：确保分数大于0
             CHECK(score > 0);
         }
-        return score;
+        
+        return score;  // 返回计算出的合并分数
     }
 
     uint32_t get_merge_way_num() const {

@@ -140,28 +140,60 @@ Status DeltaWriterV2::init() {
 }
 
 Status DeltaWriterV2::write(const vectorized::Block* block, const DorisVector<uint32_t>& row_idxs) {
+    // 快速路径检查：如果行索引为空，直接返回成功
+    // 避免不必要的锁竞争和初始化开销
     if (UNLIKELY(row_idxs.empty())) {
         return Status::OK();
     }
+    
+    // 锁竞争监控：记录获取锁的耗时
+    // 用于性能分析和锁竞争诊断
     _lock_watch.start();
+    
+    // 获取写锁：确保同一时间只有一个线程可以写入
+    // 这是保证数据一致性的关键机制
     std::lock_guard<std::mutex> l(_lock);
+    
+    // 停止锁竞争计时：记录实际获取锁的耗时
     _lock_watch.stop();
+    
+    // 延迟初始化检查：如果DeltaWriter还未初始化且未被取消，则进行初始化
+    // 这种设计避免了在构造函数中进行昂贵的初始化操作
     if (!_is_init && !_is_cancelled) {
         RETURN_IF_ERROR(init());
     }
+    
+    // 内存表刷新限制检查：等待刷新任务数量降到限制以下
+    // 这是背压控制机制，防止内存表刷新任务过多导致系统过载
     {
-        SCOPED_RAW_TIMER(&_wait_flush_limit_time);
+        SCOPED_RAW_TIMER(&_wait_flush_limit_time);  // 记录等待刷新限制的耗时
+        
+        // 获取配置的刷新任务数量限制
         auto memtable_flush_running_count_limit = config::memtable_flush_running_count_limit;
+        
+        // 调试模式：模拟背压情况，强制等待10秒
+        // 用于测试背压处理逻辑和超时机制
         DBUG_EXECUTE_IF("DeltaWriterV2.write.back_pressure",
                         { std::this_thread::sleep_for(std::chrono::milliseconds(10 * 1000)); });
+        
+        // 等待循环：当运行中的刷新任务数量达到限制时，等待并重试
+        // 每次等待10毫秒，避免过度消耗CPU资源
         while (_memtable_writer->flush_running_count() >= memtable_flush_running_count_limit) {
+            // 检查操作是否被取消：如果被取消，立即返回取消原因
             if (_state->is_cancelled()) {
                 return _state->cancel_reason();
             }
+            
+            // 短暂休眠：避免忙等待，减少CPU占用
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
+    
+    // 实际写入阶段：记录写入内存表的耗时
     SCOPED_RAW_TIMER(&_write_memtable_time);
+    
+    // 调用内存表写入器的write方法，执行实际的数据写入操作
+    // 传入数据块指针和行索引，将指定行写入到内存表中
     return _memtable_writer->write(block, row_idxs);
 }
 

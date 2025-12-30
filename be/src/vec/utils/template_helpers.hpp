@@ -48,9 +48,15 @@ std::variant<std::false_type, std::true_type> inline make_bool_variant(bool cond
     }
 }
 
+// 组合多个可调用对象形成“重载集”，常与 std::visit 配合：
+// 用法示例：
+//   std::visit(vectorized::Overload{
+//       [](std::monostate&){ ... },
+//       [](auto& method){ ... }  // 泛型兜底，匹配除 monostate 外的所有方法类型
+//   }, variant_value);
 template <typename... Callables>
 struct Overload : Callables... {
-    using Callables::operator()...;
+    using Callables::operator()...;  // 将各基类的 operator() 引入派生作用域，形成重载集
 };
 
 template <typename... Callables>

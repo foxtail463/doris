@@ -136,38 +136,55 @@ public class HiveScanNode extends FileQueryScanNode {
         }
     }
 
+    /**
+     * 获取Hive表的分区信息
+     * 对于分区表，从缓存中获取已选择的分区；对于非分区表，创建虚拟分区以统一接口
+     * @return 分区列表
+     * @throws AnalysisException 分析异常
+     */
     protected List<HivePartition> getPartitions() throws AnalysisException {
+        // 初始化分区结果列表
         List<HivePartition> resPartitions = Lists.newArrayList();
+        // 获取Hive元数据存储缓存管理器
         HiveMetaStoreCache cache = Env.getCurrentEnv().getExtMetaCacheMgr()
                 .getMetaStoreCache((HMSExternalCatalog) hmsTable.getCatalog());
+        // 获取分区列的类型信息
         List<Type> partitionColumnTypes = hmsTable.getPartitionColumnTypes(MvccUtil.getSnapshotFromContext(hmsTable));
+        
         if (!partitionColumnTypes.isEmpty()) {
-            // partitioned table
+            // 分区表处理逻辑
             Collection<PartitionItem> partitionItems;
-            // partitions has benn pruned by Nereids, in PruneFileScanPartition,
-            // so just use the selected partitions.
+            // 分区已经被Nereids优化器在PruneFileScanPartition阶段进行了裁剪，
+            // 因此直接使用已选择的分区即可
             this.totalPartitionNum = selectedPartitions.totalPartitionNum;
             partitionItems = selectedPartitions.selectedPartitions.values();
             Preconditions.checkNotNull(partitionItems);
             this.selectedPartitionNum = partitionItems.size();
 
-            // get partitions from cache
+            // 从缓存中获取分区信息
+            // 构建分区值列表，用于从缓存中查询分区信息
             List<List<String>> partitionValuesList = Lists.newArrayListWithCapacity(partitionItems.size());
             for (PartitionItem item : partitionItems) {
+                // 将分区项转换为字符串列表格式，供Hive使用
                 partitionValuesList.add(
                         ((ListPartitionItem) item).getItems().get(0).getPartitionValuesAsStringListForHive());
             }
+            // 从缓存中批量获取分区信息
             resPartitions = cache.getAllPartitionsWithCache(hmsTable, partitionValuesList);
         } else {
-            // non partitioned table, create a dummy partition to save location and inputformat,
-            // so that we can unify the interface.
+            // 非分区表处理逻辑
+            // 创建虚拟分区来保存位置和输入格式信息，
+            // 这样可以统一接口处理
             HivePartition dummyPartition = new HivePartition(hmsTable.getOrBuildNameMapping(), true,
                     hmsTable.getRemoteTable().getSd().getInputFormat(),
                     hmsTable.getRemoteTable().getSd().getLocation(), null, Maps.newHashMap());
+            // 设置分区统计信息
             this.totalPartitionNum = 1;
             this.selectedPartitionNum = 1;
             resPartitions.add(dummyPartition);
         }
+        
+        // 记录分区获取完成时间，用于查询性能统计
         if (ConnectContext.get().getExecutor() != null) {
             ConnectContext.get().getExecutor().getSummaryProfile().setGetPartitionsFinishTime();
         }
@@ -176,18 +193,28 @@ public class HiveScanNode extends FileQueryScanNode {
 
     @Override
     public List<Split> getSplits(int numBackends) throws UserException {
+        // 获取待扫描的文件切分（Split）列表的主入口
+        // 整体流程：
+        // 1) 若分区尚未初始化，则先从元数据缓存中获取并裁剪分区列表；
+        // 2) 通过 HiveMetaStoreCache 获取各分区下的文件列表；
+        // 3) 根据文件与格式等信息切分为多个 Split；
+        // 4) 返回所有可调度的 Split 列表。
         long start = System.currentTimeMillis();
         try {
             if (!partitionInit) {
+                // 首次调用时初始化分区（已由 Nereids 可能完成分区裁剪）
                 prunedPartitions = getPartitions();
                 partitionInit = true;
             }
             HiveMetaStoreCache cache = Env.getCurrentEnv().getExtMetaCacheMgr()
                     .getMetaStoreCache((HMSExternalCatalog) hmsTable.getCatalog());
             String bindBrokerName = hmsTable.getCatalog().bindBrokerName();
+            // 收集所有文件对应的 Split
             List<Split> allFiles = Lists.newArrayList();
+            // 根据分区列表生成文件 Split；内部会根据文件大小、格式等决定是否切分
             getFileSplitByPartitions(cache, prunedPartitions, allFiles, bindBrokerName, numBackends);
             if (ConnectContext.get().getExecutor() != null) {
+                // 记录获取分区文件完成时间，用于查询概要统计
                 ConnectContext.get().getExecutor().getSummaryProfile().setGetPartitionFilesFinishTime();
             }
             if (LOG.isDebugEnabled()) {
@@ -197,6 +224,7 @@ public class HiveScanNode extends FileQueryScanNode {
             }
             return allFiles;
         } catch (Throwable t) {
+            // 捕获并封装异常，便于上层处理
             LOG.warn("get file split failed for table: {}", hmsTable.getName(), t);
             throw new UserException(
                 "get file split failed for table: " + hmsTable.getName() + ", err: " + Util.getRootCauseMessage(t),
@@ -278,21 +306,26 @@ public class HiveScanNode extends FileQueryScanNode {
 
     private void getFileSplitByPartitions(HiveMetaStoreCache cache, List<HivePartition> partitions,
             List<Split> allFiles, String bindBrokerName, int numBackends) throws IOException, UserException {
+        // 根据分区列表获取文件缓存信息，支持事务表和非事务表两种模式
         List<FileCacheValue> fileCaches;
         if (hiveTransaction != null) {
+            // 事务表模式：通过事务管理器获取有效的文件列表
             try {
                 fileCaches = getFileSplitByTransaction(cache, partitions, bindBrokerName);
             } catch (Exception e) {
-                // Release shared load (getValidWriteIds acquire Lock).
-                // If no exception is throw, the lock will be released when `finalizeQuery()`.
+                // 释放共享锁（getValidWriteIds 会获取锁）
+                // 如果没有异常，锁会在 `finalizeQuery()` 时释放
                 Env.getCurrentHiveTransactionMgr().deregister(hiveTransaction.getQueryId());
                 throw e;
             }
         } else {
+            // 非事务表模式：直接从缓存获取文件列表
             boolean withCache = Config.max_external_file_cache_num > 0;
             fileCaches = cache.getFilesByPartitions(partitions, withCache, partitions.size() > 1,
                     directoryLister, hmsTable);
         }
+        
+        // 如果设置了表采样，则先选择文件再进行切分
         if (tableSample != null) {
             List<HiveMetaStoreCache.HiveFileStatus> hiveFileStatuses = selectFiles(fileCaches);
             splitAllFiles(allFiles, hiveFileStatuses);
@@ -300,16 +333,17 @@ public class HiveScanNode extends FileQueryScanNode {
         }
 
         /**
-         * If the push down aggregation operator is COUNT,
-         * we don't need to split the file because for parquet/orc format, only metadata is read.
-         * If we split the file, we will read metadata of a file multiple times, which is not efficient.
+         * 针对 COUNT 聚合下推的优化：
+         * 对于 parquet/orc 格式，只需要读取元数据，不需要切分文件
+         * 如果切分文件，会多次读取同一个文件的元数据，效率低下
          *
-         * - Hive Full Acid Transactional Table may need merge on read, so do not apply this optimization.
-         * - If the file format is not parquet/orc, eg, text, we need to split the file to increase the parallelism.
+         * - Hive Full ACID 事务表可能需要合并读取，因此不应用此优化
+         * - 如果文件格式不是 parquet/orc（如 text），需要切分文件以提高并行度
          */
         boolean needSplit = true;
         if (getPushDownAggNoGroupingOp() == TPushAggOp.COUNT
                 && !(hmsTable.isHiveTransactionalTable() && hmsTable.isFullAcidTable())) {
+            // 计算总文件数量，用于判断是否需要切分
             int totalFileNum = 0;
             for (FileCacheValue fileCacheValue : fileCaches) {
                 if (fileCacheValue.getFiles() != null) {
@@ -317,14 +351,18 @@ public class HiveScanNode extends FileQueryScanNode {
                 }
             }
             int parallelNum = sessionVariable.getParallelExecInstanceNum();
+            // 根据并行度、后端数量和文件数量决定是否需要切分
             needSplit = FileSplitter.needSplitForCountPushdown(parallelNum, numBackends, totalFileNum);
         }
+        
+        // 遍历所有文件缓存，为每个文件生成对应的 Split
         for (HiveMetaStoreCache.FileCacheValue fileCacheValue : fileCaches) {
             if (fileCacheValue.getFiles() != null) {
                 boolean isSplittable = fileCacheValue.isSplittable();
                 for (HiveMetaStoreCache.HiveFileStatus status : fileCacheValue.getFiles()) {
+                    // 使用 FileSplitter 将文件切分为多个 Split
                     allFiles.addAll(FileSplitter.splitFile(status.getPath(),
-                            // set block size to Long.MAX_VALUE to avoid splitting the file.
+                            // 如果不需要切分，设置块大小为 Long.MAX_VALUE 避免文件切分
                             getRealFileSplitSize(needSplit ? status.getBlockSize() : Long.MAX_VALUE),
                             status.getBlockLocations(), status.getLength(), status.getModificationTime(),
                             isSplittable, fileCacheValue.getPartitionValues(),

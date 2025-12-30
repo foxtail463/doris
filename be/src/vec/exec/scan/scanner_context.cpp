@@ -103,23 +103,35 @@ ScannerContext::ScannerContext(
 // After init function call, should not access _parent
 Status ScannerContext::init() {
 #ifndef BE_TEST
+    // 说明：init() 主要完成 ScannerContext 的“运行期初始化 + 调度启动”：
+    // - 绑定 scan local state 上的 profile/counter，便于统计 scanner 的内存/并发等指标
+    // - 为本 scan context 初始化调度/执行资源（可选：TaskExecutor task）
+    // - 计算 blocks queue 的内存上限（scan queue mem limit）
+    // - 根据列宽/配置等动态调整 scanner 并发
+    // - 最后把自己提交给 ScannerScheduler，开始真正的扫描任务调度
     _scanner_profile = _local_state->_scanner_profile;
     _newly_create_free_blocks_num = _local_state->_newly_create_free_blocks_num;
     _scanner_memory_used_counter = _local_state->_memory_used_counter;
 
     // 3. get thread token
+    // QueryContext 是 scanner 调度/资源归属的关键入口（WorkloadGroup、ResourceContext 等都从这里取得）
     if (!_state->get_query_ctx()) {
         return Status::InternalError("Query context of {} is not set",
                                      print_id(_state->query_id()));
     }
 
+    // 如果 QueryContext 已经指定了 scan scheduler，则线程名不需要在 scanner 线程中反复重置
     if (_state->get_query_ctx()->get_scan_scheduler()) {
         _should_reset_thread_name = false;
     }
 
+    // 取一个 scanner 做一些基本校验（避免后续逻辑里解引用空指针）
     auto scanner = _all_scanners.front().lock();
     DCHECK(scanner != nullptr);
 
+    // 部分调度器实现基于 TaskExecutor：
+    // - create_task() 会在 task executor 内部为该 scan context 创建一个“任务槽位/句柄”
+    // - 后续 scanner 的并发/调度会受该 task 的最大并发等参数约束
     if (auto* task_executor_scheduler =
                 dynamic_cast<TaskExecutorSimplifiedScanScheduler*>(_scanner_scheduler)) {
         std::shared_ptr<TaskExecutor> task_executor = task_executor_scheduler->task_executor();
@@ -135,12 +147,18 @@ Status ScannerContext::init() {
     // _max_bytes_in_queue controls the maximum memory that can be used by a single scan operator.
     // scan_queue_mem_limit on FE is 100MB by default, on backend we will make sure its actual value
     // is larger than 10MB.
+    // 计算 scan blocks 队列的最大内存（producer-consumer buffer 上限）：
+    // - 上游 scanner 产出的 block 会进入队列
+    // - 下游 ScanOperator 从队列取 block
+    // 这个上限用于避免 scan 过快导致 block 堆积、内存膨胀
     _max_bytes_in_queue = std::max(_state->scan_queue_mem_limit(), (int64_t)1024 * 1024 * 10);
 
     // Provide more memory for wide tables, increase proportionally by multiples of 300
+    // 宽表（slot 多）单个 block 更大，因此按列数做比例放大队列上限
     _max_bytes_in_queue *= _output_tuple_desc->slots().size() / 300 + 1;
 
     if (_all_scanners.empty()) {
+        // 没有任何 scanner：直接标记完成，并唤醒依赖（让下游不再等待 scan 数据）
         _is_finished = true;
         _set_scanner_done();
     }
@@ -148,6 +166,8 @@ Status ScannerContext::init() {
     // when user not specify scan_thread_num, so we can try downgrade _max_thread_num.
     // becaue we found in a table with 5k columns, column reader may ocuppy too much memory.
     // you can refer https://github.com/apache/doris/issues/35340 for details.
+    // 动态并发降级：当列数极多时，column reader 的内存占用会随并发线性增长，
+    // 这里用 max_column_reader_num 限制总的 column reader 数量，从而降低 _max_scan_concurrency。
     const int32_t max_column_reader_num = _state->max_column_reader_num();
 
     if (_max_scan_concurrency != 1 && max_column_reader_num > 0) {
@@ -167,10 +187,14 @@ Status ScannerContext::init() {
         }
     }
 
+    // 将并发配置写入 profile，便于 explain/profile 里观察 scan 并发策略
     COUNTER_SET(_local_state->_max_scan_concurrency, (int64_t)_max_scan_concurrency);
     COUNTER_SET(_local_state->_min_scan_concurrency, (int64_t)_min_scan_concurrency);
 
     std::unique_lock<std::mutex> l(_transfer_lock);
+    // 关键：把 ScannerContext 提交给 ScannerScheduler 进行调度。
+    // schedule_scan_task() 会把 pending scanners 逐步 submit 到扫描线程池/执行器中，
+    // 从这一行开始，scanner 才算“真正启动扫描”。
     RETURN_IF_ERROR(_scanner_scheduler->schedule_scan_task(shared_from_this(), nullptr, l));
 
     return Status::OK();

@@ -310,6 +310,8 @@ private:
         Status convert_to_olap() override {
             typename PrimitiveTypeTraits<T>::ColumnType* column_data = nullptr;
             if (_nullmap) {
+                // 处理可空列的情况：列可能包含NULL值
+                // 将可空列转换为具体的列类型，获取嵌套的实际数据列
                 auto nullable_column =
                         assert_cast<const vectorized::ColumnNullable*>(_typed_column.column.get());
                 _mutable_column = std::move(nullable_column->get_nested_column()).mutate();
@@ -321,6 +323,7 @@ private:
                         _mutable_column.get());
             }
 
+            // 断言检查：确保列数据指针不为空
             assert(column_data);
             _values = (typename PrimitiveTypeTraits<T>::ColumnItemType*)(column_data->get_data()
                                                                                  .data()) +

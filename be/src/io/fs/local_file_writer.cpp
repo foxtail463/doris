@@ -121,70 +121,104 @@ void LocalFileWriter::_abort() {
     }
 }
 
+/**
+ * 向量化写入多个数据片段到本地文件
+ * 使用系统调用writev实现高效的批量写入，支持部分写入和重试机制
+ * 
+ * @param data 数据片段数组指针，每个Slice包含一段要写入的数据
+ * @param data_cnt 数据片段的数量
+ * @return 写入结果状态
+ */
 Status LocalFileWriter::appendv(const Slice* data, size_t data_cnt) {
+    // 测试同步点：用于注入IO错误进行测试
     TEST_SYNC_POINT_RETURN_WITH_VALUE("LocalFileWriter::appendv",
                                       Status::IOError("inject io error"));
+    
+    // 检查文件状态：只能向已打开的文件写入数据
     if (_state != State::OPENED) [[unlikely]] {
         return Status::InternalError("append to closed file: {}", _path.native());
     }
+    
+    // 标记文件为脏状态，表示有未同步的数据
     _dirty = true;
 
-    // Convert the results into the iovec vector to request
-    // and calculate the total bytes requested.
-    size_t bytes_req = 0;
-    std::vector<iovec> iov(data_cnt);
+    // 将Slice数组转换为iovec向量，并计算总字节数
+    // iovec是系统调用writev使用的数据结构，包含数据指针和长度
+    size_t bytes_req = 0;                    // 总请求字节数
+    std::vector<iovec> iov(data_cnt);        // iovec向量，用于writev系统调用
+    
     for (size_t i = 0; i < data_cnt; i++) {
-        const Slice& result = data[i];
-        bytes_req += result.size;
-        iov[i] = {result.data, result.size};
+        const Slice& result = data[i];        // 获取第i个数据片段
+        bytes_req += result.size;             // 累加总字节数
+        iov[i] = {result.data, result.size}; // 构造iovec结构：数据指针 + 长度
     }
 
-    size_t completed_iov = 0;
-    size_t n_left = bytes_req;
+    // 写入循环：处理部分写入的情况
+    size_t completed_iov = 0;                 // 已完成的iovec数量
+    size_t n_left = bytes_req;                // 剩余待写入的字节数
+    
     while (n_left > 0) {
-        // Never request more than IOV_MAX in one request.
+        // 单次请求的iovec数量不能超过系统限制IOV_MAX
         size_t iov_count = std::min(data_cnt - completed_iov, static_cast<size_t>(IOV_MAX));
-        ssize_t res;
+        
+        ssize_t res;  // 实际写入的字节数
+        
+        // 调用writev系统调用进行向量化写入
+        // RETRY_ON_EINTR：在EINTR错误时自动重试
+        // SYNC_POINT_HOOK_RETURN_VALUE：用于测试的同步点钩子
         RETRY_ON_EINTR(res, SYNC_POINT_HOOK_RETURN_VALUE(::writev(_fd, iov.data() + completed_iov,
                                                                   cast_set<int32_t>(iov_count)),
                                                          "LocalFileWriter::writev", _fd));
+        
+        // 调试执行点：用于测试时注入IO错误
         DBUG_EXECUTE_IF("LocalFileWriter::appendv.io_error", {
             auto sub_path = dp->param<std::string>("sub_path", "");
             if ((sub_path.empty() && _path.filename().compare(kTestFilePath)) ||
                 (!sub_path.empty() && _path.native().find(sub_path) != std::string::npos)) {
-                res = -1;
-                errno = EIO;
+                res = -1;                    // 模拟写入失败
+                errno = EIO;                 // 设置IO错误
                 LOG(WARNING) << Status::IOError("debug write io error: {}", _path.native());
             }
         });
+        
+        // 检查写入错误：如果返回负值表示写入失败
         if (UNLIKELY(res < 0)) {
             return localfs_error(errno, fmt::format("failed to write {}", _path.native()));
         }
 
+        // 检查是否完全写入：如果写入字节数等于剩余字节数，说明全部写入完成
         if (LIKELY(res == n_left)) {
-            // All requested bytes were read. This is almost always the case.
+            // 所有请求的字节都已写入，这是最常见的情况
             n_left = 0;
             break;
         }
-        // Adjust iovec vector based on bytes read for the next request.
-        ssize_t bytes_rem = res;
+        
+        // 处理部分写入：调整iovec向量，为下一次写入请求做准备
+        ssize_t bytes_rem = res;  // 已写入的字节数
+        
         for (size_t i = completed_iov; i < data_cnt; i++) {
             if (bytes_rem >= iov[i].iov_len) {
-                // The full length of this iovec was written.
+                // 这个iovec完全写入：移动到下一个iovec
                 completed_iov++;
                 bytes_rem -= iov[i].iov_len;
             } else {
-                // Partially wrote this result.
-                // Adjust the iov_len and iov_base to write only the missing data.
-                iov[i].iov_base = static_cast<uint8_t*>(iov[i].iov_base) + bytes_rem;
-                iov[i].iov_len -= bytes_rem;
-                break; // Don't need to adjust remaining iovec's.
+                // 这个iovec部分写入：调整数据指针和长度，只写入剩余部分
+                iov[i].iov_base = static_cast<uint8_t*>(iov[i].iov_base) + bytes_rem;  // 调整数据指针
+                iov[i].iov_len -= bytes_rem;                                            // 调整剩余长度
+                break; // 不需要调整剩余的iovec
             }
         }
+        
+        // 更新剩余待写入的字节数
         n_left -= res;
     }
+    
+    // 断言检查：确保所有数据都已写入
     DCHECK_EQ(0, n_left);
+    
+    // 更新已追加的字节数统计
     _bytes_appended += bytes_req;
+    
     return Status::OK();
 }
 

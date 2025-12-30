@@ -319,24 +319,44 @@ public class ExpressionUtils {
     }
 
     /**
-     * Replace the slot in expressions with the lineage identifier from specifiedbaseTable sets or target table types
-     * example as following:
-     * select a + 10 as a1, d from (
-     * select b - 5 as a, d from table
+     * 将表达式中的 slot 替换为 lineage（血缘）标识符，即回溯表达式到基表列形式。
+     * 
+     * 核心作用：追踪表达式的 lineage，将上层表达式（可能包含别名）回溯到底层表达式（基表列）。
+     * 
+     * 示例：
+     * SELECT a + 10 as a1, d FROM (
+     *     SELECT b - 5 as a, d FROM table
      * );
-     * op expression before is: a + 10 as a1, d. after is: b - 5 + 10, d
-     * todo to get from plan struct info
+     * 
+     * shuttle 前（上层表达式）: a + 10, d
+     * shuttle 后（回溯到底层）: (b - 5) + 10, d
+     * 
+     * 处理过程：
+     * 1. 识别表达式中的 NamedExpression（如别名 a#5）
+     * 2. 从计划树向下遍历，找到每个 NamedExpression 对应的底层表达式
+     * 3. 建立映射关系：{a#5 -> b - 5, d#6 -> d#0}
+     * 4. 替换表达式：a + 10 -> (b - 5) + 10
+     * 
+     * 使用场景：
+     * - MV 重写：需要将查询表达式统一到基表列空间，才能与 MV 表达式匹配
+     * - 表达式等价性检查：需要比较底层表达式是否等价
+     * 
+     * @param expressions 需要 shuttle 的表达式列表（上层表达式）
+     * @param plan 计划树，用于追踪 lineage
+     * @return shuttle 后的表达式列表（回溯到底层表达式）
      */
     public static List<? extends Expression> shuttleExpressionWithLineage(List<? extends Expression> expressions,
             Plan plan) {
         if (expressions.isEmpty()) {
             return ImmutableList.of();
         }
+        // 创建替换上下文，收集表达式中使用的所有 NamedExpression 的 ExprId
         ExpressionLineageReplacer.ExpressionReplaceContext replaceContext =
                 new ExpressionLineageReplacer.ExpressionReplaceContext(expressions);
 
+        // 从计划树顶部向下遍历，收集每个 NamedExpression 对应的底层表达式，建立映射关系
         plan.accept(ExpressionLineageReplacer.INSTANCE, replaceContext);
-        // Replace expressions by expression map
+        // 根据映射关系替换表达式中的 NamedExpression 为对应的底层表达式
         List<? extends Expression> replacedExpressions = replaceContext.getReplacedExpressions();
         if (replacedExpressions == null || expressions.size() != replacedExpressions.size()) {
             throw new NereidsException("shuttle expression fail",

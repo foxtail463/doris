@@ -93,6 +93,8 @@ struct AggregatedDataVariants
                               vectorized::MethodOneNumber, vectorized::DataWithNullKey> {
     AggregatedDataWithoutKey without_key = nullptr;
 
+    // 根据 GROUP BY 键形态与可空性，选择并构造具体聚合“方法+容器”到 method_variant
+    // 说明：method_variant 后续在执行期通过 std::visit 做零开销分发
     void init(const std::vector<vectorized::DataTypePtr>& data_types, HashKeyType type) {
         bool nullable = data_types.size() == 1 && data_types[0]->is_nullable();
 
@@ -109,6 +111,8 @@ struct AggregatedDataVariants
             emplace_single<vectorized::UInt16, AggData<vectorized::UInt16>>(nullable);
             break;
         case HashKeyType::int32_key:
+            // 单列 UInt32 键：可空 → MethodSingleNullableColumn< MethodOneNumber<UInt32, AggDataNullable<UInt32>> >
+            //               非空 → MethodOneNumber<UInt32, AggData<UInt32>>
             emplace_single<vectorized::UInt32, AggData<vectorized::UInt32>>(nullable);
             break;
         case HashKeyType::int32_key_phase2:

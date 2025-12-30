@@ -128,39 +128,112 @@ Status SortSinkOperatorX::prepare(RuntimeState* state) {
 }
 
 Status SortSinkOperatorX::sink(doris::RuntimeState* state, vectorized::Block* in_block, bool eos) {
+    // ===== 功能说明：SortSinkOperatorX 的核心方法，接收上游数据并进行排序 =====
+    // 
+    // 【工作流程】
+    // 1. 接收上游 Pipeline 传来的数据块（in_block）
+    // 2. 将数据追加到排序器（sorter）中进行排序
+    // 3. 更新内存使用统计和运行时谓词
+    // 4. 当数据流结束时（eos=true），准备排序器供下游读取，并通知依赖关系
+    
+    // ===== 阶段 1：初始化并记录统计信息 =====
+    // 获取当前 PipelineTask 对应的本地状态
+    // 每个 PipelineTask 都有独立的本地状态实例，用于管理该 task 的排序操作
     auto& local_state = get_local_state(state);
+    // 记录本次 sink 操作的执行时间，用于性能分析
     SCOPED_TIMER(local_state.exec_time_counter());
+    // 更新输入行数计数器，记录已处理的输入数据行数
     COUNTER_UPDATE(local_state.rows_input_counter(), (int64_t)in_block->rows());
+    
+    // ===== 阶段 2：处理输入数据块 =====
+    // 如果输入块中有数据（行数 > 0），进行排序处理
     if (in_block->rows() > 0) {
+        // ===== 阶段 2.1：将数据追加到排序器 =====
         {
+            // 记录追加数据块的时间，用于性能分析
             SCOPED_TIMER(local_state._append_blocks_timer);
+            // 将输入块追加到排序器中
+            // sorter 会根据排序算法（HEAP_SORT、TOPN_SORT、FULL_SORT）进行排序
+            // 例如：
+            // - HeapSorter：使用堆排序，维护 TopN 结果
+            // - TopNSorter：使用 TopN 排序算法
+            // - FullSorter：使用全排序，支持 spill 到磁盘
             RETURN_IF_ERROR(local_state._shared_state->sorter->append_block(in_block));
         }
+        
+        // ===== 阶段 2.2：更新内存使用统计 =====
+        // 获取排序器当前使用的内存大小（包括已排序的数据块）
         int64_t data_size = local_state._shared_state->sorter->data_size();
+        // 更新排序块的内存使用统计，用于监控和内存管理
         COUNTER_SET(local_state._sort_blocks_memory_usage, data_size);
+        // 更新总内存使用计数器，用于查询级别的内存追踪
         COUNTER_SET(local_state._memory_used_counter, data_size);
 
+        // ===== 阶段 2.3：检查查询是否被取消 =====
+        // 如果查询被取消（如用户执行了 CANCEL 命令），立即返回错误
+        // 这样可以快速响应取消请求，避免继续处理无用的数据
         RETURN_IF_CANCELLED(state);
 
+        // ===== 阶段 2.4：更新运行时谓词（Runtime Predicate） =====
+        // 运行时谓词是一种查询优化技术，用于在查询执行过程中动态生成过滤条件
+        // 
+        // 【工作原理】
+        // 1. 在 TopN 查询中，排序后的"最小值"（top value）可以作为过滤条件
+        // 2. 将这个值推送给上游的扫描算子，用于过滤不需要的数据
+        // 3. 例如：如果当前 TopN 的最小值是 100，上游可以跳过 < 100 的数据
+        //
+        // 【举例】
+        // SQL: SELECT * FROM t ORDER BY id LIMIT 10
+        // 当排序器收集到足够的数据后，top_value 可能是 100
+        // 运行时谓词会告诉扫描算子：只扫描 id >= 100 的数据，跳过 id < 100 的数据
         if (state->get_query_ctx()->has_runtime_predicate(_node_id)) {
+            // 记录更新运行时谓词的时间
             SCOPED_TIMER(local_state._update_runtime_predicate_timer);
+            // 获取该节点的运行时谓词
             auto& predicate = state->get_query_ctx()->get_runtime_predicate(_node_id);
+            // 如果运行时谓词已启用
             if (predicate.enable()) {
+                // 获取排序器当前的"最小值"（top value）
+                // 对于 TopN 查询，这是当前 TopN 结果中的最小值
                 vectorized::Field new_top = local_state._shared_state->sorter->get_top_value();
+                // 如果新值有效且与上次不同，更新运行时谓词
+                // 这样可以避免重复更新相同的值
                 if (!new_top.is_null() && new_top != local_state.old_top) {
                     auto* query_ctx = state->get_query_ctx();
+                    // 更新运行时谓词，将新值推送给上游算子
                     RETURN_IF_ERROR(query_ctx->get_runtime_predicate(_node_id).update(new_top));
+                    // 保存当前值，用于下次比较
                     local_state.old_top = std::move(new_top);
                 }
             }
         }
+        
+        // ===== 阶段 2.5：清理输入块（可选） =====
+        // 如果不需要重用输入块的内存，清空输入块
+        // _reuse_mem 标志控制是否重用内存：
+        // - true：保留输入块的内存，供后续使用（减少内存分配）
+        // - false：清空输入块，释放内存（减少内存占用）
         if (!_reuse_mem) {
             in_block->clear();
         }
     }
 
+    // ===== 阶段 3：处理数据流结束（EOS） =====
+    // 当上游数据流结束时（eos = true），需要：
+    // 1. 准备排序器供下游读取（完成排序，准备输出）
+    // 2. 通知依赖关系，让下游 Pipeline 可以开始读取数据
     if (eos) {
+        // 准备排序器供读取
+        // prepare_for_read(false) 表示不使用 spill（全内存排序）
+        // 这会完成最后的排序工作，准备输出数据
+        // 例如：
+        // - HeapSorter：完成堆排序，准备输出 TopN 结果
+        // - TopNSorter：完成 TopN 排序，准备输出结果
+        // - FullSorter：完成全排序，准备输出结果
         RETURN_IF_ERROR(local_state._shared_state->sorter->prepare_for_read(false));
+        // 设置依赖关系为"可读"状态
+        // 这会通知下游 Pipeline（包含 SortSourceOperatorX）可以开始读取排序结果
+        // 依赖关系确保下游 Pipeline 在排序完成之前不会开始执行
         local_state._dependency->set_ready_to_read();
     }
     return Status::OK();

@@ -741,20 +741,48 @@ void Block::update_hash(SipHash& hash) const {
     }
 }
 
+/**
+ * 根据过滤器对 Block 中指定的列进行过滤（内部方法）
+ * 
+ * @param block 要过滤的 Block 指针
+ * @param columns_to_filter 需要过滤的列索引列表
+ * @param filter 过滤器，每个元素为 0（过滤掉）或 1（保留）
+ * 
+ * 过滤逻辑：
+ * 1. 计算过滤后应保留的行数（filter 中 1 的个数）
+ * 2. 对每个需要过滤的列：
+ *    - 如果列大小已等于过滤后的行数，跳过（已过滤过）
+ *    - 如果过滤后行数为 0，清空列
+ *    - 如果列是独占的（exclusive），原地过滤（修改原列）
+ *    - 否则创建新的过滤后的列（不修改原列）
+ */
 void Block::filter_block_internal(Block* block, const std::vector<uint32_t>& columns_to_filter,
                                   const IColumn::Filter& filter) {
+    // 计算过滤后应保留的行数：总行数 - filter 中 0 的个数
+    // 使用 SIMD 优化计算 0 的个数，提高性能
     size_t count = filter.size() - simd::count_zero_num((int8_t*)filter.data(), filter.size());
+    
+    // 遍历需要过滤的每一列
     for (const auto& col : columns_to_filter) {
         auto& column = block->get_by_position(col).column;
+        
+        // 如果列的大小已经等于过滤后的行数，说明已经过滤过了，跳过
         if (column->size() == count) {
             continue;
         }
+        
+        // 如果过滤后没有行需要保留，清空该列
         if (count == 0) {
             block->get_by_position(col).column->assume_mutable()->clear();
             continue;
         }
+        
+        // 如果列是独占的（exclusive），可以直接原地修改，避免创建新列
+        // 这种方式更高效，因为不需要分配新内存
         if (column->is_exclusive()) {
+            // 原地过滤，返回实际过滤后的行数
             const auto result_size = column->assume_mutable()->filter(filter);
+            // 验证过滤后的行数是否与预期一致，不一致则抛出异常
             if (result_size != count) [[unlikely]] {
                 throw Exception(ErrorCode::INTERNAL_ERROR,
                                 "result_size not equal with filter_size, result_size={}, "
@@ -762,6 +790,8 @@ void Block::filter_block_internal(Block* block, const std::vector<uint32_t>& col
                                 result_size, count);
             }
         } else {
+            // 列不是独占的，创建新的过滤后的列（不修改原列）
+            // 这种方式适用于列被多个地方共享的情况
             column = column->filter(filter, count);
         }
     }
@@ -950,20 +980,153 @@ void MutableBlock::add_row(const Block* block, int row) {
     }
 }
 
+/**
+ * 批量添加行数据（按索引数组）
+ * 
+ * 【功能说明】
+ * 从源 Block 中按照指定的行索引数组，批量复制行数据到当前 MutableBlock。
+ * 支持列重映射（通过 column_offset 参数），可以从源 Block 的不同列位置复制数据。
+ * 
+ * 【核心特点】
+ * 1. 按索引复制：不是连续复制，而是按照 row_begin 到 row_end 之间的索引数组复制
+ * 2. 列重映射：可以通过 column_offset 参数重新映射列的位置
+ * 3. 批量操作：一次性复制多行数据，比逐行复制更高效
+ * 4. 类型检查：确保源列和目标列的类型匹配
+ * 
+ * 【使用场景】
+ * - Hash Join 分区：将数据按照分区索引复制到不同的分区块中
+ * - 数据过滤：按照过滤后的行索引复制数据
+ * - 列重排：通过 column_offset 重新排列列的顺序
+ * 
+ * 【参数说明】
+ * @param block 源 Block，从中复制数据
+ * @param row_begin 行索引数组的起始指针（指向 uint32_t 数组）
+ * @param row_end 行索引数组的结束指针（指向 uint32_t 数组的末尾，不包含）
+ * @param column_offset 列偏移映射（可选）
+ *   - nullptr：按顺序复制列（第 i 列复制到第 i 列）
+ *   - 非空：column_offset[i] 表示目标第 i 列对应源 Block 的第 column_offset[i] 列
+ * 
+ * 【工作流程】
+ * 1. 参数验证：检查列数是否匹配，column_offset 大小是否匹配
+ * 2. 获取源 Block 的列数据
+ * 3. 遍历目标 Block 的每一列：
+ *    - 根据 column_offset 确定源列位置（如果有 column_offset，使用 column_offset[i]，否则使用 i）
+ *    - 检查源列和目标列的类型是否匹配
+ *    - 调用 insert_indices_from 按索引数组复制数据
+ * 
+ * 【示例】
+ * 
+ * 示例 1：按顺序复制列
+ * ```cpp
+ * // 源 Block：3 列，10 行
+ * Block src_block;
+ * 
+ * // 目标 MutableBlock：3 列，0 行
+ * MutableBlock dst_block;
+ * 
+ * // 行索引数组：复制第 2、5、7 行
+ * uint32_t indices[] = {2, 5, 7};
+ * 
+ * // 复制数据（按顺序复制列）
+ * dst_block.add_rows(&src_block, indices, indices + 3, nullptr);
+ * // 结果：dst_block 有 3 行数据（来自 src_block 的第 2、5、7 行）
+ * ```
+ * 
+ * 示例 2：列重映射
+ * ```cpp
+ * // 源 Block：5 列，10 行
+ * Block src_block;  // 列：A, B, C, D, E
+ * 
+ * // 目标 MutableBlock：3 列，0 行
+ * MutableBlock dst_block;  // 列：X, Y, Z
+ * 
+ * // 列映射：X ← C, Y ← A, Z ← E
+ * std::vector<int> column_offset = {2, 0, 4};
+ * 
+ * // 行索引数组：复制第 1、3、5 行
+ * uint32_t indices[] = {1, 3, 5};
+ * 
+ * // 复制数据（列重映射）
+ * dst_block.add_rows(&src_block, indices, indices + 3, &column_offset);
+ * // 结果：dst_block 有 3 行数据
+ * //   - 第 0 列（X）：来自 src_block 的第 2 列（C）的第 1、3、5 行
+ * //   - 第 1 列（Y）：来自 src_block 的第 0 列（A）的第 1、3、5 行
+ * //   - 第 2 列（Z）：来自 src_block 的第 4 列（E）的第 1、3、5 行
+ * ```
+ * 
+ * 示例 3：Hash Join 分区
+ * ```cpp
+ * // 在 PartitionedHashJoinSink 中，将数据按照分区索引复制到不同的分区块
+ * 
+ * // 源 Block：待分区的数据
+ * Block* in_block;
+ * 
+ * // 分区索引数组：partition_indexes[i] 存储属于分区 i 的行索引
+ * std::vector<std::vector<uint32_t>> partition_indexes(partition_count);
+ * 
+ * // 计算每行属于哪个分区
+ * for (size_t i = 0; i < rows; ++i) {
+ *     partition_indexes[channel_ids[i]].emplace_back(i);
+ * }
+ * 
+ * // 将数据复制到各个分区块
+ * for (uint32_t i = 0; i < partition_count; ++i) {
+ *     if (!partition_indexes[i].empty()) {
+ *         partitioned_blocks[i]->add_rows(
+ *             in_block,
+ *             partition_indexes[i].data(),
+ *             partition_indexes[i].data() + partition_indexes[i].size(),
+ *             nullptr  // 按顺序复制列
+ *         );
+ *     }
+ * }
+ * ```
+ * 
+ * 【注意事项】
+ * 1. row_begin 和 row_end 必须指向有效的行索引数组
+ * 2. 行索引必须在源 Block 的有效范围内（0 到 rows()-1）
+ * 3. 如果使用 column_offset，必须确保 column_offset[i] 在源 Block 的有效列范围内
+ * 4. 源列和目标列的类型必须匹配（通过类型名称检查）
+ * 5. 该方法会捕获异常并返回 Status，确保内存分配失败时能正确处理
+ */
 Status MutableBlock::add_rows(const Block* block, const uint32_t* row_begin,
                               const uint32_t* row_end, const std::vector<int>* column_offset) {
     RETURN_IF_CATCH_EXCEPTION({
+        // ===== 步骤 1：参数验证 =====
+        // 检查目标 Block 的列数不能超过源 Block 的列数
         DCHECK_LE(columns(), block->columns());
+        
+        // 如果提供了 column_offset，检查其大小必须等于目标 Block 的列数
         if (column_offset != nullptr) {
             DCHECK_EQ(columns(), column_offset->size());
         }
+        
+        // ===== 步骤 2：获取源 Block 的列数据 =====
         const auto& block_data = block->get_columns_with_type_and_name();
+        
+        // ===== 步骤 3：遍历目标 Block 的每一列，复制数据 =====
         for (size_t i = 0; i < _columns.size(); ++i) {
+            // ===== 步骤 3A：确定源列位置 =====
+            // 如果提供了 column_offset，使用 column_offset[i] 作为源列索引
+            // 否则，使用 i 作为源列索引（按顺序复制）
             const auto& src_col = column_offset ? block_data[(*column_offset)[i]] : block_data[i];
+            
+            // ===== 步骤 3B：类型检查 =====
+            // 确保源列和目标列的类型匹配（通过类型名称检查）
             DCHECK_EQ(_data_types[i]->get_name(), src_col.type->get_name());
-            auto& dst = _columns[i];
-            const auto& src = *src_col.column.get();
+            
+            // ===== 步骤 3C：获取列引用 =====
+            auto& dst = _columns[i];              // 目标列（MutableColumn）
+            const auto& src = *src_col.column.get();  // 源列（IColumn）
+            
+            // ===== 步骤 3D：范围检查 =====
+            // 确保源列的行数足够（至少要有 row_end - row_begin 行）
             DCHECK_GE(src.size(), row_end - row_begin);
+            
+            // ===== 步骤 3E：按索引数组复制数据 =====
+            // insert_indices_from 会按照 row_begin 到 row_end 之间的索引数组，
+            // 从源列中复制对应的行数据到目标列
+            // 例如：如果 row_begin 指向 [2, 5, 7]，则复制源列的第 2、5、7 行
             dst->insert_indices_from(src, row_begin, row_end);
         }
     });

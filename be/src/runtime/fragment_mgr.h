@@ -68,6 +68,14 @@ class WorkloadQueryInfo;
 
 std::string to_load_error_http_path(const std::string& file_name);
 
+/**
+ * 并发上下文映射模板类
+ * 用于管理查询上下文和管道片段的并发访问
+ * 
+ * @tparam Key 键类型（通常是查询ID或查询ID+片段ID）
+ * @tparam Value 值类型（通常是shared_ptr包装的上下文）
+ * @tparam ValueType 实际的值类型
+ */
 template <typename Key, typename Value, typename ValueType>
 class ConcurrentContextMap {
 public:
@@ -108,7 +116,29 @@ private:
             _internal_map;
 };
 
-// This class used to manage all the fragment execute in this instance
+/**
+ * FragmentMgr - 查询片段管理器
+ * 
+ * 核心作用：
+ * 1. 管理BE上所有查询片段的执行生命周期
+ * 2. 负责查询片段的调度、执行、监控和清理
+ * 3. 提供查询取消、超时处理、资源管理等功能
+ * 4. 协调FE和BE之间的查询执行状态同步
+ * 
+ * 主要职责：
+ * - 接收FE下发的查询片段执行请求
+ * - 创建和管理查询上下文（QueryContext）
+ * - 调度查询片段到执行引擎
+ * - 监控查询执行状态并向FE报告
+ * - 处理查询取消、超时等异常情况
+ * - 管理查询资源（内存、线程等）
+ * 
+ * 架构设计：
+ * - 使用分片锁（ConcurrentContextMap）提高并发性能
+ * - 异步任务处理（ThreadPool）避免阻塞
+ * - 后台清理线程处理过期查询
+ * - 支持Pipeline和传统执行模式
+ */
 class FragmentMgr : public RestMonitorIface {
 public:
     using FinishCallback = std::function<void(RuntimeState*, Status*)>;
@@ -202,12 +232,14 @@ private:
     ExecEnv* _exec_env = nullptr;
 
     // (QueryID, FragmentID) -> PipelineFragmentContext
+    // 存储所有正在执行的Pipeline查询片段上下文
     ConcurrentContextMap<std::pair<TUniqueId, int>,
                          std::shared_ptr<pipeline::PipelineFragmentContext>,
                          pipeline::PipelineFragmentContext>
             _pipeline_map;
 
     // query id -> QueryContext
+    // 存储所有查询的上下文信息
     ConcurrentContextMap<TUniqueId, std::weak_ptr<QueryContext>, QueryContext> _query_ctx_map;
 
     CountDownLatch _stop_background_threads_latch;

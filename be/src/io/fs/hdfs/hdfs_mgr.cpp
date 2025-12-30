@@ -124,11 +124,16 @@ void HdfsMgr::_cleanup_loop() {
     }
 }
 
+// 根据 hdfs 参数与 fs_name 计算唯一键，优先从本地缓存复用 hdfsFS 句柄，缺失则创建并放入缓存。
+// 采用“先查再创 + 双重检查”策略：
+// 1) 持锁查询缓存，命中则直接返回；
+// 2) 未命中则在锁外创建新 handler（避免长时间持锁）；
+// 3) 创建完成后再次加锁检查，若期间有其他线程已插入，则复用其结果，否则插入新建的 handler。
 Status HdfsMgr::get_or_create_fs(const THdfsParams& hdfs_params, const std::string& fs_name,
                                  std::shared_ptr<HdfsHandler>* fs_handler) {
     uint64_t hash_code = _hdfs_hash_code(hdfs_params, fs_name);
 
-    // First check without lock
+    // 第一次在持锁条件下检查缓存，若命中则复用并返回
     {
         std::lock_guard<std::mutex> lock(_mutex);
         auto it = _fs_handlers.find(hash_code);
@@ -142,19 +147,19 @@ Status HdfsMgr::get_or_create_fs(const THdfsParams& hdfs_params, const std::stri
         }
     }
 
-    // Create new hdfsFS handler outside the lock
+    // 未命中：在锁外创建新的 hdfsFS 句柄，避免长时间占用互斥锁
     LOG(INFO) << "Start to create new HDFS handler, hash_code=" << hash_code
               << ", fs_name=" << fs_name;
 
     std::shared_ptr<HdfsHandler> new_fs_handler;
     RETURN_IF_ERROR(_create_hdfs_fs(hdfs_params, fs_name, &new_fs_handler));
 
-    // Double check with lock before inserting
+    // 插入前的第二次检查（双重检查），防止并发场景下重复创建
     {
         std::lock_guard<std::mutex> lock(_mutex);
         auto it = _fs_handlers.find(hash_code);
         if (it != _fs_handlers.end()) {
-            // Another thread has created the handler, use it instead
+            // 期间已有其他线程创建并写入缓存：复用之
             LOG(INFO) << "Another thread created HDFS handler, reuse it, hash_code=" << hash_code
                       << ", is_kerberos=" << it->second->is_kerberos_auth
                       << ", principal=" << it->second->principal << ", fs_name=" << fs_name;
@@ -163,7 +168,7 @@ Status HdfsMgr::get_or_create_fs(const THdfsParams& hdfs_params, const std::stri
             return Status::OK();
         }
 
-        // Store the new handler
+        // 缓存未命中：存入新创建的 handler
         *fs_handler = new_fs_handler;
         _fs_handlers[hash_code] = new_fs_handler;
 
@@ -192,23 +197,27 @@ Status HdfsMgr::_create_hdfs_fs_impl(const THdfsParams& hdfs_params, const std::
     return Status::OK();
 }
 
-// https://brpc.apache.org/docs/server/basics/
-// According to the brpc doc, JNI code checks stack layout and cannot be run in
-// bthreads so create a pthread for creating hdfs connection if necessary.
+// 参考 brpc 文档：https://brpc.apache.org/docs/server/basics/
+// 背景：Hadoop 的 JNI 代码会检查线程栈布局，不能在 bthread（协程线程）中运行。
+// 因此：如果当前线程是 bthread，则临时切换到一个原生 pthread 中执行
+// _create_hdfs_fs_impl（真正的 hdfs 连接创建），创建完成后再唤醒 bthread 继续。
 Status HdfsMgr::_create_hdfs_fs(const THdfsParams& hdfs_params, const std::string& fs_name,
                                 std::shared_ptr<HdfsHandler>* fs_handler) {
     bool is_pthread = bthread_self() == 0;
     LOG(INFO) << "create hdfs fs, is_pthread=" << is_pthread << " fs_name=" << fs_name;
-    if (is_pthread) { // running in pthread
+    if (is_pthread) { // 已经运行在原生 pthread 中，直接创建
         return _create_hdfs_fs_impl(hdfs_params, fs_name, fs_handler);
     }
 
-    // running in bthread, switch to a pthread and wait
+    // 当前运行在 bthread 中：切换到 pthread 并等待其完成
     Status st;
+    // butex: brpc 的用户态同步原语，用于在 bthread 与 pthread 间同步
     auto btx = bthread::butex_create();
     *(int*)btx = 0;
     std::thread t([&] {
+        // 在 pthread 中执行真正的 hdfs 连接创建
         st = _create_hdfs_fs_impl(hdfs_params, fs_name, fs_handler);
+        // 创建完成后置位并唤醒等待方
         *(int*)btx = 1;
         bthread::butex_wake_all(btx);
     });
@@ -216,6 +225,7 @@ Status HdfsMgr::_create_hdfs_fs(const THdfsParams& hdfs_params, const std::strin
         if (t.joinable()) t.join();
         bthread::butex_destroy(btx);
     });
+    // 等待最长 60 秒（butex 超时返回后做错误处理）
     timespec tmout {.tv_sec = std::chrono::system_clock::now().time_since_epoch().count() + 60,
                     .tv_nsec = 0};
     if (int ret = bthread::butex_wait(btx, 1, &tmout); ret != 0) {

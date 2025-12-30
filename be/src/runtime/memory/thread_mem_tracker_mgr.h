@@ -305,21 +305,70 @@ inline void ThreadMemTrackerMgr::flush_untracked_mem() {
 }
 
 inline doris::Status ThreadMemTrackerMgr::try_reserve(int64_t size, TryReserveChecker checker) {
-    DCHECK(size >= 0);
-    CHECK(init());
-    DCHECK(_limiter_tracker);
+    // ===== 功能说明：尝试预留内存，支持多层级内存限制检查 =====
+    //
+    // 【工作流程】
+    // 1. 同步未跟踪的内存到进程级别
+    // 2. 解析 checker 参数，确定需要检查哪些层级的限制
+    // 3. 按顺序检查：Task（查询）-> WorkloadGroup（工作负载组）-> Process（进程）
+    // 4. 如果任何一级检查失败，回滚之前已预留的内存
+    // 5. 所有检查通过后，更新预留内存计数
+    //
+    // 【内存层级】
+    // - Task/Query 级别：单个查询的内存限制（query_mem_limit）
+    // - WorkloadGroup 级别：工作负载组的内存限制（wg_mem_limit）
+    // - Process 级别：整个进程的内存限制（process_mem_limit）
+    //
+    // 【TryReserveChecker 位标志】
+    // - CHECK_TASK = 1 (0b001)：检查查询内存限制
+    // - CHECK_WORKLOAD_GROUP = 2 (0b010)：检查工作负载组内存限制
+    // - CHECK_PROCESS = 4 (0b100)：检查进程内存限制
+    // - 可以组合：CHECK_TASK_AND_WORKLOAD_GROUP = 3 (0b011)
+    //
+    // 【返回值】
+    // - Status::OK()：预留成功
+    // - QUERY_MEMORY_EXCEEDED：查询内存超限
+    // - WORKLOAD_GROUP_MEMORY_EXCEEDED：工作负载组内存超限
+    // - PROCESS_MEMORY_EXCEEDED：进程内存超限
+    
+    // ===== 阶段 1：参数验证和初始化 =====
+    DCHECK(size >= 0);  // 确保预留大小非负
+    CHECK(init());       // 确保 ThreadMemTrackerMgr 已初始化
+    DCHECK(_limiter_tracker);  // 确保已附加 MemTrackerLimiter
+    
+    // 检查内存追踪器是否有效（防止内存泄漏）
     memory_orphan_check();
-    // if _reserved_mem not equal to 0, repeat reserve,
-    // _untracked_mem store bytes that not synchronized to process reserved memory.
+    
+    // ===== 阶段 2：同步未跟踪的内存 =====
+    // _untracked_mem 存储尚未同步到进程预留内存的字节数
+    // 如果 _reserved_mem != 0，说明是重复预留，需要先同步未跟踪的内存
+    // flush_untracked_mem 会将 _untracked_mem 同步到进程级别的预留内存
     flush_untracked_mem();
+    
+    // 获取 WorkloadGroup 的弱引用（如果存在）
     auto wg_ptr = _wg_wptr.lock();
 
-    bool task_limit_checker = static_cast<int>(checker) & 1;
-    bool workload_group_limit_checker = static_cast<int>(checker) & 2;
-    bool process_limit_checker = static_cast<int>(checker) & 4;
+    // ===== 阶段 3：解析 TryReserveChecker 参数 =====
+    // 使用位运算解析需要检查哪些层级的限制
+    // checker 的值是枚举，可以转换为整数进行位运算
+    // 
+    // 例如：
+    // - CHECK_TASK_AND_WORKLOAD_GROUP_AND_PROCESS = 7 (0b111)
+    //   → task_limit_checker = true, workload_group_limit_checker = true, process_limit_checker = true
+    // - CHECK_TASK = 1 (0b001)
+    //   → task_limit_checker = true, workload_group_limit_checker = false, process_limit_checker = false
+    bool task_limit_checker = static_cast<int>(checker) & 1;           // 检查第 0 位
+    bool workload_group_limit_checker = static_cast<int>(checker) & 2;  // 检查第 1 位
+    bool process_limit_checker = static_cast<int>(checker) & 4;         // 检查第 2 位
 
+    // ===== 阶段 4：检查 Task（查询）级别的内存限制 =====
+    // _limiter_tracker 是查询级别的内存追踪器
+    // 如果启用了检查，使用 try_reserve（会检查限制）
+    // 如果未启用检查，直接使用 reserve（不检查限制，但仍会记录）
     if (task_limit_checker) {
+        // 尝试预留，如果超过查询内存限制则失败
         if (!_limiter_tracker->try_reserve(size)) {
+            // 构建详细的错误消息，包含内存追踪器的状态信息
             auto err_msg = fmt::format(
                     "reserve memory failed, size: {}, because query memory exceeded, memory "
                     "tracker: {}, "
@@ -331,44 +380,73 @@ inline doris::Status ThreadMemTrackerMgr::try_reserve(int64_t size, TryReserveCh
             return doris::Status::Error<ErrorCode::QUERY_MEMORY_EXCEEDED>(err_msg);
         }
     } else {
+        // 不检查限制，直接预留（用于某些特殊场景）
         _limiter_tracker->reserve(size);
     }
 
+    // ===== 阶段 5：检查 WorkloadGroup 级别的内存限制 =====
+    // 只有当存在 WorkloadGroup 时才检查
     if (wg_ptr) {
         if (workload_group_limit_checker) {
+            // 尝试增加工作负载组的内存增长量，如果超过限制则失败
             if (!wg_ptr->try_add_wg_refresh_interval_memory_growth(size)) {
+                // 构建错误消息
                 auto err_msg = fmt::format(
                         "reserve memory failed, size: {}, because workload group memory exceeded, "
                         "workload group: {}",
                         PrettyPrinter::print_bytes(size), wg_ptr->memory_debug_string());
-                _limiter_tracker->release(size);         // rollback
-                _limiter_tracker->shrink_reserved(size); // rollback
+                
+                // ===== 回滚操作 =====
+                // 由于 Task 级别的预留已经成功，需要回滚
+                // 回滚顺序与预留顺序相反
+                _limiter_tracker->release(size);         // 释放 Task 级别的预留
+                _limiter_tracker->shrink_reserved(size); // 减少 Task 级别的预留计数
+                
                 return doris::Status::Error<ErrorCode::WORKLOAD_GROUP_MEMORY_EXCEEDED>(err_msg);
             }
         } else {
+            // 不检查限制，直接增加（用于某些特殊场景）
             wg_ptr->add_wg_refresh_interval_memory_growth(size);
         }
     }
 
+    // ===== 阶段 6：检查 Process（进程）级别的内存限制 =====
+    // 这是最后一级检查，如果失败需要回滚前面所有的预留
     if (process_limit_checker) {
+        // 尝试预留进程内存，检查是否超过进程内存限制
+        // try_reserve_process_memory 会检查：
+        // - 系统可用内存是否足够
+        // - 进程内存使用 + 预留内存是否超过软限制
         if (!doris::GlobalMemoryArbitrator::try_reserve_process_memory(size)) {
+            // 构建错误消息
             auto err_msg = fmt::format(
                     "reserve memory failed, size: {}, because proccess memory exceeded, {}",
                     PrettyPrinter::print_bytes(size),
                     GlobalMemoryArbitrator::process_mem_log_str());
-            _limiter_tracker->release(size);         // rollback
-            _limiter_tracker->shrink_reserved(size); // rollback
+            
+            // ===== 回滚操作 =====
+            // 由于 Task 和 WorkloadGroup 级别的预留都已经成功，需要全部回滚
+            // 回滚顺序：Process -> WorkloadGroup -> Task（与预留顺序相反）
+            _limiter_tracker->release(size);         // 回滚 Task 级别
+            _limiter_tracker->shrink_reserved(size); // 回滚 Task 级别预留计数
+            
             if (wg_ptr) {
-                wg_ptr->sub_wg_refresh_interval_memory_growth(size); // rollback
+                wg_ptr->sub_wg_refresh_interval_memory_growth(size); // 回滚 WorkloadGroup 级别
             }
+            
             return doris::Status::Error<ErrorCode::PROCESS_MEMORY_EXCEEDED>(err_msg);
         }
     } else {
+        // 不检查限制，直接预留（用于某些特殊场景）
         doris::GlobalMemoryArbitrator::reserve_process_memory(size);
     }
 
+    // ===== 阶段 7：所有检查通过，更新预留内存计数 =====
+    // _reserved_mem 记录当前线程已预留但尚未实际分配的内存大小
+    // 这个值会在实际分配内存时减少（通过 shrink_reserved）
     _reserved_mem += size;
-    DCHECK(_reserved_mem >= 0);
+    DCHECK(_reserved_mem >= 0);  // 确保预留内存计数非负
+    
     return doris::Status::OK();
 }
 

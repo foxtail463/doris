@@ -327,10 +327,28 @@ public class HudiUtils {
 
 
 
+    /**
+     * 获取 Hudi 表的模式缓存值
+     * 
+     * 该方法从外部模式缓存中获取指定时间点的 Hudi 表模式信息。
+     * 缓存键由表名映射和查询时间点组成，确保不同时间点的模式信息能够正确获取。
+     * 
+     * @param hmsTable Hudi 外部表对象，包含表的元数据信息
+     * @param queryInstant 查询时间点字符串，用于确定获取哪个时间点的模式信息
+     * @return HudiSchemaCacheValue 包含表模式信息的缓存值对象
+     * @throws RuntimeException 当缓存中不存在对应的模式信息时抛出异常
+     */
     public static HudiSchemaCacheValue getSchemaCacheValue(HMSExternalTable hmsTable, String queryInstant) {
+        // 获取外部模式缓存管理器中的模式缓存
         ExternalSchemaCache cache = Env.getCurrentEnv().getExtMetaCacheMgr().getSchemaCache(hmsTable.getCatalog());
+        
+        // 构建模式缓存键，包含表名映射和查询时间点
         SchemaCacheKey key = new HudiSchemaCacheKey(hmsTable.getOrBuildNameMapping(), Long.parseLong(queryInstant));
+        
+        // 从缓存中获取模式值
         Optional<SchemaCacheValue> schemaCacheValue = cache.getSchemaValue(key);
+        
+        // 将通用模式缓存值转换为 Hudi 特定的模式缓存值并返回
         return (HudiSchemaCacheValue) schemaCacheValue.get();
     }
 

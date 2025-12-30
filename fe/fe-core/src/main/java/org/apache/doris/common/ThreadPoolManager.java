@@ -68,6 +68,14 @@ import java.util.function.Supplier;
  *  when all thread pools are constructed,
  *  ThreadPoolManager will register some metrics of all thread pool to MetricRepo,
  *  so we can know the runtime state for all thread pool by prometheus metrics
+ *
+ *  该类用于统一创建 FE 端的守护线程池，并对线程数与内存等资源进行约束；
+ *  线程名统一为“poolName-序号”。提供多种工厂方法：
+ *  - 缓存线程池（带最大线程数限制）
+ *  - 固定大小线程池（带队列容量与拒绝策略）
+ *  - 可自定义参数的通用线程池
+ *  - 定时线程池（当前不限制延迟任务数量和线程数，注意避免 OOM）
+ *  所有创建的线程池可选择注册到 MetricRepo，以便通过 Prometheus 观测运行时指标。
  */
 
 public class ThreadPoolManager {
@@ -80,6 +88,7 @@ public class ThreadPoolManager {
     public static final long KEEP_ALIVE_TIME = 60L;
 
     public static void registerAllThreadPoolMetric() {
+        // 为已记录的所有线程池注册指标，并在注册后清空记录。
         for (Map.Entry<String, ThreadPoolExecutor> entry : nameToThreadPoolMap.entrySet()) {
             registerThreadPoolMetric(entry.getKey(), entry.getValue());
         }
@@ -87,6 +96,7 @@ public class ThreadPoolManager {
     }
 
     public static void registerThreadPoolMetric(String poolName, ThreadPoolExecutor threadPool) {
+        // 为指定线程池注册通用运行时指标（线程数、活跃度、队列长度、任务计数、拒绝计数等）。
         Metric.MetricType gauge = Metric.MetricType.GAUGE;
         Metric.MetricType counter = Metric.MetricType.COUNTER;
         MetricUnit nounit = MetricUnit.NOUNIT;
@@ -106,6 +116,7 @@ public class ThreadPoolManager {
 
     private static <T> void registerMetric(String poolName, String metricName,
                                            Metric.MetricType type, MetricUnit unit, Supplier<T> supplier) {
+        // 封装指标注册，延迟获取指标值。
         Metric<T> gauge = new Metric<T>("thread_pool", type, unit, "thread_pool statistics") {
             @Override
             public T getValue() {
@@ -118,6 +129,7 @@ public class ThreadPoolManager {
 
     public static ThreadPoolExecutor newDaemonCacheThreadPool(int maxNumThread,
             String poolName, boolean needRegisterMetric) {
+        // 构建缓存线程池（最大线程数受限），队列为 SynchronousQueue，拒绝策略为记录并丢弃。
         return newDaemonThreadPool(0, maxNumThread, KEEP_ALIVE_TIME,
                 TimeUnit.SECONDS, new SynchronousQueue(),
                 new LogDiscardPolicy(poolName), poolName, needRegisterMetric);
@@ -125,6 +137,7 @@ public class ThreadPoolManager {
 
     public static ThreadPoolExecutor newDaemonCacheThreadPoolUseBlockedPolicy(int maxNumThread,
                                                               String poolName, boolean needRegisterMetric) {
+        // 构建缓存线程池，使用阻塞拒绝策略（等待最多 10 秒入队）。
         return newDaemonThreadPool(0, maxNumThread, KEEP_ALIVE_TIME,
             TimeUnit.SECONDS, new SynchronousQueue(),
             new BlockedPolicy(poolName, 10), poolName, needRegisterMetric);
@@ -132,6 +145,7 @@ public class ThreadPoolManager {
 
     public static ThreadPoolExecutor newDaemonCacheThreadPoolThrowException(int maxNumThread,
                                                               String poolName, boolean needRegisterMetric) {
+        // 构建缓存线程池，拒绝时抛出异常，便于上层快速感知压力。
         return newDaemonThreadPool(0, maxNumThread, KEEP_ALIVE_TIME,
             TimeUnit.SECONDS, new SynchronousQueue(),
             new LogDiscardPolicyThrowException(poolName), poolName, needRegisterMetric);
@@ -139,6 +153,7 @@ public class ThreadPoolManager {
 
     public static ThreadPoolExecutor newDaemonFixedThreadPool(int numThread,
             int queueSize, String poolName, boolean needRegisterMetric) {
+        // 固定大小线程池，使用有界队列与阻塞拒绝策略（默认 60 秒）。
         return newDaemonThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(queueSize), new BlockedPolicy(poolName, 60),
                 poolName, needRegisterMetric);
@@ -150,6 +165,7 @@ public class ThreadPoolManager {
             String poolName,
             boolean needRegisterMetric,
             ExecutionAuthenticator preAuth) {
+        // 固定大小线程池，在线程执行前进行预鉴权（例如设置上下文信息）。
         return newDaemonThreadPoolWithPreAuth(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
             new LinkedBlockingQueue<>(queueSize), new BlockedPolicy(poolName, 60),
             poolName, needRegisterMetric, preAuth);
@@ -158,6 +174,7 @@ public class ThreadPoolManager {
     public static ThreadPoolExecutor newDaemonFixedThreadPool(int numThread, int queueSize,
                                                               String poolName, int timeoutSeconds,
                                                               boolean needRegisterMetric) {
+        // 固定大小线程池，自定义阻塞超时时间。
         return newDaemonThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(queueSize), new BlockedPolicy(poolName, timeoutSeconds),
                 poolName, needRegisterMetric);
@@ -167,6 +184,7 @@ public class ThreadPoolManager {
                                                               String poolName,
                                                               boolean needRegisterMetric,
                                                               RejectedExecutionHandler handler) {
+        // 固定大小线程池，支持自定义拒绝策略。
         return newDaemonThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(queueSize), handler,
                 poolName, needRegisterMetric);
@@ -175,6 +193,7 @@ public class ThreadPoolManager {
     public static <T> ThreadPoolExecutor newDaemonFixedPriorityThreadPool(int numThread, int initQueueSize,
                                                                           Comparator<T> comparator, Class<T> tClass,
                                                                           String poolName, boolean needRegisterMetric) {
+        // 固定大小“优先级”线程池，任务需实现与 comparator 兼容的类型以参与排序。
         return newDaemonPriorityThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
                     new PriorityBlockingQueue<>(initQueueSize), new BlockedPolicy(poolName, 60),
                     comparator, tClass, poolName, needRegisterMetric);
@@ -182,6 +201,7 @@ public class ThreadPoolManager {
 
     public static ThreadPoolExecutor newDaemonProfileThreadPool(int numThread, int queueSize, String poolName,
                                                                 boolean needRegisterMetric) {
+        // 用于画像/分析等场景的线程池，队列满时丢弃最旧任务并记录日志。
         return newDaemonThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(queueSize), new LogDiscardOldestPolicy(poolName), poolName,
                 needRegisterMetric);
@@ -195,6 +215,7 @@ public class ThreadPoolManager {
                                                          RejectedExecutionHandler handler,
                                                          String poolName,
                                                          boolean needRegisterMetric) {
+        // 通用线程池构建方法，统一线程命名与守护线程属性，可选注册监控指标。
         ThreadFactory threadFactory = namedThreadFactory(poolName);
         ThreadPoolExecutor threadPool = new ThreadPoolExecutor(corePoolSize, maximumPoolSize,
                 keepAliveTime, unit, workQueue, threadFactory, handler);
@@ -214,6 +235,7 @@ public class ThreadPoolManager {
                                                                  Class<T> tClass,
                                                                  String poolName,
                                                                  boolean needRegisterMetric) {
+        // 带任务优先级的线程池，覆盖 newTaskFor 以包装为可比较的 FutureTask。
         ThreadFactory threadFactory = namedThreadFactory(poolName);
         ThreadPoolExecutor threadPool = new PriorityThreadPoolExecutor(corePoolSize, maximumPoolSize, keepAliveTime,
                     unit, workQueue, threadFactory, handler, comparator, tClass);
@@ -226,6 +248,7 @@ public class ThreadPoolManager {
     // Now, we have no delay task num limit and thread num limit in ScheduledThreadPoolExecutor,
     // so it may cause oom when there are too many delay tasks or threads in ScheduledThreadPoolExecutor
     // Please use this api only for scheduling short task at fix rate.
+    // 当前定时线程池未限制延迟任务数量与线程数，当延迟任务过多可能导致 OOM，仅用于短周期固定速率任务。
     public static ScheduledThreadPoolExecutor newDaemonScheduledThreadPool(
             int corePoolSize, String poolName, boolean needRegisterMetric) {
         ThreadFactory threadFactory = namedThreadFactory(poolName);
@@ -241,6 +264,7 @@ public class ThreadPoolManager {
      * Create a thread factory that names threads with a prefix and also sets the threads to daemon.
      */
     private static ThreadFactory namedThreadFactory(String poolName) {
+        // 创建带名称前缀的守护线程工厂，线程名格式为 “poolName-%d”。
         return new ThreadFactoryBuilder()
                 .setDaemon(true)
                 .setNameFormat(poolName + "-%d")
@@ -258,6 +282,7 @@ public class ThreadPoolManager {
             String poolName,
             boolean needRegisterMetric,
             ExecutionAuthenticator preAuth) {
+        // 在通用线程池基础上注入预鉴权逻辑，所有任务在执行入口前先执行 preAuth。
         ThreadFactory threadFactory = namedThreadFactoryWithPreAuth(poolName, preAuth);
         ThreadPoolExecutor threadPool = new ThreadPoolExecutor(corePoolSize, maximumPoolSize,
                 keepAliveTime, unit, workQueue, threadFactory, handler);
@@ -268,6 +293,7 @@ public class ThreadPoolManager {
     }
 
     private static ThreadFactory namedThreadFactoryWithPreAuth(String poolName, ExecutionAuthenticator preAuth) {
+        // 创建带预鉴权逻辑的线程工厂，在新线程中优先执行 preAuth，再执行实际任务。
         return new ThreadFactoryBuilder()
             .setDaemon(true)
             .setNameFormat(poolName + "-%d")
@@ -282,6 +308,7 @@ public class ThreadPoolManager {
     }
 
     private static class PriorityThreadPoolExecutor<T> extends ThreadPoolExecutor {
+        // 支持任务优先级排序的线程池，要求提交的任务类型与 tClass 匹配以参与比较。
 
         private final Comparator<T> comparator;
         private final Class<T> tClass;
@@ -296,6 +323,7 @@ public class ThreadPoolManager {
 
         private static class ComparableFutureTask<V, T> extends FutureTask<V>
                     implements Comparable<ComparableFutureTask<V, T>> {
+            // 包装任务为可比较的 FutureTask，以便在优先级队列中进行排序。
 
             private final @NotNull T t;
             private final Comparator<T> comparator;
@@ -348,6 +376,7 @@ public class ThreadPoolManager {
      * A handler for rejected task that discards and log it, used for cached thread pool
      */
     static class LogDiscardPolicy implements RejectedExecutionHandler {
+        // 缓存线程池使用的拒绝策略，记录日志并丢弃任务；同时累加被拒绝计数。
 
         private static final Logger LOG = LogManager.getLogger(LogDiscardPolicy.class);
 
@@ -367,6 +396,7 @@ public class ThreadPoolManager {
     }
 
     static class LogDiscardPolicyThrowException extends LogDiscardPolicy {
+        // 在记录和计数的基础上，拒绝时抛出异常，适用于需要快速失败反馈的场景。
 
         private static final Logger LOG = LogManager.getLogger(LogDiscardPolicyThrowException.class);
 
@@ -388,6 +418,7 @@ public class ThreadPoolManager {
      * used for fixed thread pool
      */
     public static class BlockedPolicy implements RejectedExecutionHandler {
+        // 固定线程池常用拒绝策略；当队列满时阻塞等待一段时间尝试入队，超时则拒绝。
 
         private static final Logger LOG = LogManager.getLogger(BlockedPolicy.class);
 
@@ -418,6 +449,7 @@ public class ThreadPoolManager {
     }
 
     static class LogDiscardOldestPolicy implements RejectedExecutionHandler {
+        // 丢弃队列中最旧任务以腾出空间插入新任务，并记录日志。
 
         private static final Logger LOG = LogManager.getLogger(LogDiscardOldestPolicy.class);
 
@@ -439,6 +471,7 @@ public class ThreadPoolManager {
 
     public static void shutdownExecutorService(ExecutorService executorService) {
         // Disable new tasks from being submitted
+        // 有序关闭线程池：先 shutdown，等待指定时间；超时则 shutdownNow，再次等待；仍未终止则记录告警。
         executorService.shutdown();
         try {
             // Wait a while for existing tasks to terminate

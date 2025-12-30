@@ -2016,6 +2016,30 @@ public class InternalCatalog implements CatalogIf<Database> {
         }
     }
 
+    /**
+     * 创建分区及其所有索引（BaseIndex 和 RollupIndex）
+     * 该方法会创建分区、索引、Tablets 和 Replicas，并提交创建任务到 BE 节点
+     * 
+     * @param dbId 数据库 ID
+     * @param tbl OLAP 表对象
+     * @param partitionId 分区 ID
+     * @param partitionName 分区名称
+     * @param indexIdToMeta 索引 ID 到索引元数据的映射
+     * @param distributionInfo 数据分布信息
+     * @param dataProperty 数据属性（存储介质、TTL 等）
+     * @param replicaAlloc 副本分配策略
+     * @param versionInfo 版本信息（可选，用于恢复场景）
+     * @param bfColumns Bloom Filter 列集合
+     * @param tabletIdSet Tablet ID 集合（用于记录已创建的 Tablet ID）
+     * @param isInMemory 是否内存表
+     * @param tabletType Tablet 类型
+     * @param storagePolicy 存储策略
+     * @param idGeneratorBuffer ID 生成器缓冲区
+     * @param binlogConfig Binlog 配置
+     * @param isStorageMediumSpecified 是否指定了存储介质
+     * @return 创建的分区对象
+     * @throws DdlException 创建失败时抛出异常
+     */
     protected Partition createPartitionWithIndices(long dbId, OlapTable tbl, long partitionId,
                                                    String partitionName, Map<Long, MaterializedIndexMeta> indexIdToMeta,
                                                    DistributionInfo distributionInfo, DataProperty dataProperty,
@@ -2028,48 +2052,63 @@ public class InternalCatalog implements CatalogIf<Database> {
                                                    BinlogConfig binlogConfig,
                                                    boolean isStorageMediumSpecified)
             throws DdlException {
-        // create base index first.
+        // ==================== 第一步：创建 BaseIndex ====================
+        // 首先创建基础索引，确保 baseIndexId 已设置
         Preconditions.checkArgument(tbl.getBaseIndexId() != -1);
         MaterializedIndex baseIndex = new MaterializedIndex(tbl.getBaseIndexId(), IndexState.NORMAL);
 
-        // create partition with base index
+        // ==================== 第二步：创建分区对象 ====================
+        // 使用 BaseIndex 创建分区对象
         Partition partition = new Partition(partitionId, partitionName, baseIndex, distributionInfo);
 
-        // add to index map
+        // ==================== 第三步：构建索引映射 ====================
+        // 将 BaseIndex 添加到索引映射中
         Map<Long, MaterializedIndex> indexMap = new HashMap<>();
         indexMap.put(tbl.getBaseIndexId(), baseIndex);
 
-        // create rollup index if has
+        // ==================== 第四步：创建 RollupIndex（如果有） ====================
+        // 遍历所有索引元数据，为每个 RollupIndex 创建 MaterializedIndex 实例
         for (long indexId : indexIdToMeta.keySet()) {
             if (indexId == tbl.getBaseIndexId()) {
+                // 跳过 BaseIndex，因为已经创建过了
                 continue;
             }
 
+            // 创建 RollupIndex 实例
             MaterializedIndex rollup = new MaterializedIndex(indexId, IndexState.NORMAL);
             indexMap.put(indexId, rollup);
         }
 
-        // version and version hash
+        // ==================== 第五步：设置分区版本信息 ====================
+        // 如果提供了版本信息（通常用于恢复场景），更新分区版本
         if (versionInfo != null) {
             partition.updateVisibleVersion(versionInfo);
             partition.setNextVersion(versionInfo + 1);
         }
         long version = partition.getVisibleVersion();
 
+        // ==================== 第六步：为每个索引创建 Tablets 和 Replicas ====================
         short totalReplicaNum = replicaAlloc.getTotalReplicaNum();
         TStorageMedium realStorageMedium = null;
         Map<Object, Object> objectPool = new HashMap<Object, Object>();
+        
+        // 遍历所有索引（包括 BaseIndex 和 RollupIndex）
         for (Map.Entry<Long, MaterializedIndex> entry : indexMap.entrySet()) {
             long indexId = entry.getKey();
             MaterializedIndex index = entry.getValue();
             MaterializedIndexMeta indexMeta = indexIdToMeta.get(indexId);
 
-            // create tablets
+            // ==================== 6.1 创建 Tablets ====================
+            // 获取索引的 Schema Hash
             int schemaHash = indexMeta.getSchemaHash();
+            // 创建 Tablet 元数据
             TabletMeta tabletMeta = new TabletMeta(dbId, tbl.getId(), partitionId, indexId,
                     schemaHash, dataProperty.getStorageMedium());
+            // 为索引创建 Tablets 和 Replicas
             realStorageMedium = createTablets(index, ReplicaState.NORMAL, distributionInfo, version, replicaAlloc,
                 tabletMeta, tabletIdSet, idGeneratorBuffer, dataProperty.isStorageMediumSpecified());
+            
+            // 如果实际存储介质与指定不同，更新数据属性
             if (realStorageMedium != null && !realStorageMedium.equals(dataProperty.getStorageMedium())) {
                 dataProperty.setStorageMedium(realStorageMedium);
                 LOG.info("real medium not eq default "
@@ -2080,27 +2119,41 @@ public class InternalCatalog implements CatalogIf<Database> {
             boolean ok = false;
             String errMsg = null;
 
-            // add create replica task for olap
+            // ==================== 6.2 准备创建 Replica 任务的参数 ====================
+            // 获取索引的元数据信息
             short shortKeyColumnCount = indexMeta.getShortKeyColumnCount();
             TStorageType storageType = indexMeta.getStorageType();
             List<Column> schema = indexMeta.getSchema();
+            
+            // 只有 BaseIndex 和 ShadowIndex 需要集群键唯一列 ID
             List<Integer> clusterKeyUids = null;
             if (indexId == tbl.getBaseIndexId()) {
                 // only base and shadow index need cluster key unique column ids
                 clusterKeyUids = OlapTable.getClusterKeyUids(schema);
             }
             KeysType keysType = indexMeta.getKeysType();
+            // 只有 BaseIndex 需要二级索引信息
             List<Index> indexes = indexId == tbl.getBaseIndexId() ? tbl.getCopiedIndexes() : null;
+            
+            // ==================== 6.3 创建批量任务 ====================
+            // 计算总任务数：Tablet 数量 × 副本数量
             int totalTaskNum = index.getTablets().size() * totalReplicaNum;
+            // 创建倒计时锁，用于等待所有任务完成
             MarkedCountDownLatch<Long, Long> countDownLatch = new MarkedCountDownLatch<Long, Long>(totalTaskNum);
+            // 创建批量任务对象
             AgentBatchTask batchTask = new AgentBatchTask();
             List<String> rowStoreColumns = tbl.getTableProperty().getCopiedRowStoreColumns();
+            
+            // ==================== 6.4 为每个 Tablet 的每个 Replica 创建任务 ====================
             for (Tablet tablet : index.getTablets()) {
                 long tabletId = tablet.getId();
                 for (Replica replica : tablet.getReplicas()) {
                     long backendId = replica.getBackendIdWithoutException();
                     long replicaId = replica.getId();
+                    // 在倒计时锁中标记该任务
                     countDownLatch.addMark(backendId, tabletId);
+                    
+                    // 创建 Replica 创建任务
                     CreateReplicaTask task = new CreateReplicaTask(backendId, dbId, tbl.getId(), partitionId, indexId,
                             tabletId, replicaId, shortKeyColumnCount, schemaHash, version, keysType, storageType,
                             realStorageMedium, schema, bfColumns, tbl.getBfFpp(), countDownLatch,
@@ -2121,47 +2174,66 @@ public class InternalCatalog implements CatalogIf<Database> {
                             tbl.storageDictPageSize(),
                             tbl.getColumnSeqMapping());
 
+                    // 设置存储格式
                     task.setStorageFormat(tbl.getStorageFormat());
                     task.setInvertedIndexFileStorageFormat(tbl.getInvertedIndexFileStorageFormat());
+                    
+                    // 如果是 BaseIndex，设置集群键唯一列 ID
                     if (!CollectionUtils.isEmpty(clusterKeyUids)) {
                         task.setClusterKeyUids(clusterKeyUids);
                         LOG.info("table: {}, partition: {}, index: {}, tablet: {}, cluster key uids: {}",
                                 tbl.getId(), partitionId, indexId, tabletId, clusterKeyUids);
                     }
+                    
+                    // 将任务添加到批量任务中
                     batchTask.addTask(task);
+                    // 将任务添加到任务队列中，用于处理完成报告（不用于重新发送任务）
                     // add to AgentTaskQueue for handling finish report.
                     // not for resending task
                     AgentTaskQueue.addTask(task);
                 }
             }
+            
+            // ==================== 6.5 提交批量任务到执行器 ====================
             AgentTaskExecutor.submit(batchTask);
 
-            // estimate timeout
+            // ==================== 6.6 等待所有任务完成 ====================
+            // 估算超时时间
             long timeout = DbUtil.getCreateReplicasTimeoutMs(totalTaskNum);
             try {
+                // 等待所有任务完成，最多等待 timeout 毫秒
                 ok = countDownLatch.await(timeout, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 LOG.warn("InterruptedException: ", e);
                 ok = false;
             }
 
+            // ==================== 6.7 处理任务执行结果 ====================
             if (!ok || !countDownLatch.getStatus().ok()) {
-                // clear tasks
+                // 清除任务
                 AgentTaskQueue.removeBatchTask(batchTask, TTaskType.CREATE);
 
+                // 计算法定副本数（超过半数）
                 int quorumReplicaNum = totalReplicaNum / 2 + 1;
+                // 统计每个 Tablet 的失败副本数
                 Map<Long, Integer> failedTabletCounter = Maps.newHashMap();
                 countDownLatch.getLeftMarks().stream().forEach(
                         item -> failedTabletCounter.put(item.getValue(),
                         failedTabletCounter.getOrDefault(item.getValue(), 0) + 1));
+                
+                // 检查是否有 Tablet 的可用副本数少于法定副本数
                 boolean createFailed = failedTabletCounter.values().stream().anyMatch(
                         failedNum -> (totalReplicaNum - failedNum) < quorumReplicaNum);
+                
+                // 构建错误消息
                 errMsg = createFailed ? "Failed to create partition[" + partitionName + "]."
                     : "Failed to create some replicas when create partition[" + partitionName + "].";
 
                 if (!countDownLatch.getStatus().ok()) {
+                    // 如果状态不正常，添加错误信息
                     errMsg += " Error: " + countDownLatch.getStatus().getErrorMsg();
                     if (countDownLatch.getStatus().getErrorCode() == TStatusCode.TIMEOUT) {
+                        // 如果是超时，检查是否有 BE 节点宕机
                         SystemInfoService infoService = Env.getCurrentSystemInfo();
                         Set<String> downBeSet = countDownLatch.getLeftMarks().stream()
                                 .map(item -> infoService.getBackend(item.getKey()))
@@ -2174,8 +2246,9 @@ public class InternalCatalog implements CatalogIf<Database> {
                         }
                     }
                 } else {
+                    // 如果是超时，添加超时信息和未完成的任务列表
                     errMsg += "Timeout:" + (timeout / 1000) + " seconds.";
-                    // only show at most 3 results
+                    // 只显示最多 3 个未完成的任务
                     List<String> subList = countDownLatch.getLeftMarks().stream().limit(3)
                             .map(item -> "(backendId = " + item.getKey() + ", tabletId = "  + item.getValue() + ")")
                             .collect(Collectors.toList());
@@ -2185,17 +2258,21 @@ public class InternalCatalog implements CatalogIf<Database> {
                 }
 
                 LOG.warn(errMsg);
+                // 如果创建失败（可用副本数少于法定副本数），抛出异常
                 if (createFailed) {
                     throw new DdlException(errMsg);
                 }
             }
 
+            // ==================== 6.8 将 RollupIndex 添加到分区 ====================
+            // 如果不是 BaseIndex，将 RollupIndex 添加到分区中
             if (index.getId() != tbl.getBaseIndexId()) {
                 // add rollup index to partition
                 partition.createRollupIndex(index);
             }
         } // end for indexMap
 
+        // ==================== 第七步：记录成功日志并返回 ====================
         LOG.info("succeed in creating partition[{}-{}], table : [{}-{}]", partitionId, partitionName,
                 tbl.getId(), tbl.getName());
 
@@ -3273,40 +3350,75 @@ public class InternalCatalog implements CatalogIf<Database> {
         return false;
     }
 
+    /**
+     * 为 MaterializedIndex 创建 Tablets 和 Replicas
+     * 该方法会根据分布策略、副本分配策略和协同定位信息创建 Tablets，并为每个 Tablet 创建指定数量的 Replicas
+     * 
+     * @param index 物化索引对象，用于添加创建的 Tablets
+     * @param replicaState 副本的初始状态
+     * @param distributionInfo 数据分布信息（Hash、Random 等）
+     * @param version 数据版本号
+     * @param replicaAlloc 副本分配策略（每个 Tag 的副本数量）
+     * @param tabletMeta Tablet 元数据信息
+     * @param tabletIdSet Tablet ID 集合，用于记录已创建的 Tablet ID
+     * @param idGeneratorBuffer ID 生成器缓冲区
+     * @param isStorageMediumSpecified 是否明确指定了存储介质
+     * @return 实际使用的存储介质（可能被系统自动调整）
+     * @throws DdlException 创建失败时抛出异常
+     */
     @VisibleForTesting
     public TStorageMedium createTablets(MaterializedIndex index, ReplicaState replicaState,
             DistributionInfo distributionInfo, long version, ReplicaAllocation replicaAlloc, TabletMeta tabletMeta,
             Set<Long> tabletIdSet, IdGeneratorBuffer idGeneratorBuffer, boolean isStorageMediumSpecified)
             throws DdlException {
+        // ==================== 第一步：处理协同定位表逻辑 ====================
         ColocateTableIndex colocateIndex = Env.getCurrentColocateIndex();
         SystemInfoService systemInfoService = Env.getCurrentSystemInfo();
+        // 后端节点序列：Tag -> [Bucket0的Backend列表, Bucket1的Backend列表, ...]
         Map<Tag, List<List<Long>>> backendsPerBucketSeq = null;
         GroupId groupId = null;
+        
+        // 检查是否是协同定位表
         if (colocateIndex.isColocateTable(tabletMeta.getTableId())) {
+            // 协同定位表不支持随机分布
             if (distributionInfo.getType() == DistributionInfoType.RANDOM) {
                 throw new DdlException("Random distribution for colocate table is unsupported");
             }
+            // 如果是协同定位表，尝试从协同定位索引中获取后端节点序列
             // if this is a colocate table, try to get backend seqs from colocation index.
             groupId = colocateIndex.getGroup(tabletMeta.getTableId());
             backendsPerBucketSeq = colocateIndex.getBackendsPerBucketSeq(groupId);
         }
 
+        // ==================== 第二步：决定后端节点选择策略 ====================
+        // chooseBackendsArbitrary 为 true 表示：
+        // 1. 这可能是协同定位组中的第一个表
+        // 2. 或者这只是一个普通表，可以任意选择后端节点
+        // 否则，应该从 backendsPerBucketSeq 中选择后端节点
         // chooseBackendsArbitrary is true, means this may be the first table of colocation group,
         // or this is just a normal table, and we can choose backends arbitrary.
         // otherwise, backends should be chosen from backendsPerBucketSeq;
         boolean chooseBackendsArbitrary = backendsPerBucketSeq == null || backendsPerBucketSeq.isEmpty();
         if (chooseBackendsArbitrary) {
+            // 初始化后端节点序列映射
             backendsPerBucketSeq = Maps.newHashMap();
         }
 
+        // ==================== 第三步：处理存储介质和轮询逻辑 ====================
+        // 获取存储介质（如果禁用了存储介质检查，则为 null）
         TStorageMedium storageMedium = Config.disable_storage_medium_check ? null : tabletMeta.getStorageMedium();
+        // 轮询索引映射：Tag -> 下一个要使用的后端节点索引
         Map<Tag, Integer> nextIndexs = new HashMap<>();
+        
+        // 如果启用了轮询创建 Tablet
         if (Config.enable_round_robin_create_tablet) {
             for (Tag tag : replicaAlloc.getAllocMap().keySet()) {
                 int startPos = -1;
                 if (Config.create_tablet_round_robin_from_start) {
+                    // 如果配置为从开始位置轮询，从 0 开始
                     startPos = 0;
                 } else {
+                    // 否则，从系统服务获取该 Tag 的轮询起始位置
                     startPos = systemInfoService.getStartPosOfRoundRobin(tag, storageMedium,
                             isStorageMediumSpecified);
                 }
@@ -3314,17 +3426,22 @@ public class InternalCatalog implements CatalogIf<Database> {
             }
         }
 
+        // ==================== 第四步：为每个 Bucket 创建 Tablet ====================
         for (int i = 0; i < distributionInfo.getBucketNum(); ++i) {
+            // 创建一个新的 Tablet，使用生成的 ID
             // create a new tablet with random chosen backends
             Tablet tablet = EnvFactory.getInstance().createTablet(idGeneratorBuffer.getNextId());
 
+            // 先将 Tablet 添加到倒排索引中
             // add tablet to inverted index first
             index.addTablet(tablet, tabletMeta);
             tabletIdSet.add(tablet.getId());
 
+            // ==================== 4.1 获取后端节点 ID ====================
             // get BackendIds
             Map<Tag, List<Long>> chosenBackendIds;
             if (chooseBackendsArbitrary) {
+                // 这是协同定位组中的第一个表，或者只是一个普通表，需要选择后端节点
                 // This is the first colocate table in the group, or just a normal table,
                 // choose backends
                 Pair<Map<Tag, List<Long>>, TStorageMedium> chosenBackendIdsAndMedium
@@ -3332,35 +3449,51 @@ public class InternalCatalog implements CatalogIf<Database> {
                         replicaAlloc, nextIndexs,
                         storageMedium, isStorageMediumSpecified, false);
                 chosenBackendIds = chosenBackendIdsAndMedium.first;
+                // 更新存储介质（可能被系统自动调整）
                 storageMedium = chosenBackendIdsAndMedium.second;
+                
+                // 将选择的后端节点添加到后端序列中，供后续协同定位表使用
                 for (Map.Entry<Tag, List<Long>> entry : chosenBackendIds.entrySet()) {
                     backendsPerBucketSeq.putIfAbsent(entry.getKey(), Lists.newArrayList());
                     backendsPerBucketSeq.get(entry.getKey()).add(entry.getValue());
                 }
             } else {
+                // 从已有的后端序列中获取后端节点（协同定位表的后续表使用）
                 // get backends from existing backend sequence
                 chosenBackendIds = Maps.newHashMap();
                 for (Map.Entry<Tag, List<List<Long>>> entry : backendsPerBucketSeq.entrySet()) {
+                    // 获取第 i 个 Bucket 对应的后端节点列表
                     chosenBackendIds.put(entry.getKey(), entry.getValue().get(i));
                 }
             }
+            
+            // ==================== 4.2 为 Tablet 创建 Replicas ====================
             // create replicas
             short totalReplicaNum = (short) 0;
+            // 遍历每个 Tag 的后端节点列表
             for (List<Long> backendIds : chosenBackendIds.values()) {
+                // 为每个后端节点创建一个 Replica
                 for (long backendId : backendIds) {
                     long replicaId = idGeneratorBuffer.getNextId();
+                    // 创建 Replica 对象
                     Replica replica = new Replica(replicaId, backendId, replicaState, version,
                             tabletMeta.getOldSchemaHash());
+                    // 将 Replica 添加到 Tablet 中
                     tablet.addReplica(replica);
                     totalReplicaNum++;
                 }
             }
+            // 验证创建的副本数量是否与配置一致
             Preconditions.checkState(totalReplicaNum == replicaAlloc.getTotalReplicaNum(),
                     totalReplicaNum + " vs. " + replicaAlloc.getTotalReplicaNum());
         }
 
+        // ==================== 第五步：保存协同定位表的后端序列 ====================
+        // 如果是协同定位表且是第一个表（选择了后端节点），保存后端序列供后续表使用
         if (groupId != null && chooseBackendsArbitrary) {
+            // 将后端序列添加到协同定位索引中
             colocateIndex.addBackendsPerBucketSeq(groupId, backendsPerBucketSeq);
+            // 创建持久化信息并写入 EditLog
             ColocatePersistInfo info = ColocatePersistInfo.createForBackendsPerBucketSeq(groupId, backendsPerBucketSeq);
             Env.getCurrentEnv().getEditLog().logColocateBackendsPerBucketSeq(info);
         }

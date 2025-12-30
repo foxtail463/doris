@@ -2031,31 +2031,60 @@ void VTabletWriter::_generate_index_channels_payloads(
     }
 }
 
+/**
+ * VTabletWriter::write：将输入 Block 写入到目标 OLAP 表
+ * 
+ * 主要流程：
+ * 1. 检查 dry_run 模式（如果是，直接返回）
+ * 2. 检查并发送新分区的批次（自动分区场景）
+ * 3. 统计输入行数和字节数
+ * 4. 行分布：根据分区键计算每行数据属于哪个分区和 tablet
+ * 5. 生成通道负载：将数据按 NodeChannel 分组（每个 NodeChannel 对应一个 BE）
+ * 6. 将数据添加到各个 NodeChannel（NodeChannel 会异步发送到目标 BE）
+ * 7. 检查不可容忍的失败（如副本数不足等）
+ * 
+ * @param state 运行时状态
+ * @param input_block 输入的 Block（待写入的数据）
+ * @return 写入状态
+ */
 Status VTabletWriter::write(RuntimeState* state, doris::vectorized::Block& input_block) {
+    // 1. 内存跟踪：记录本次写入的内存消耗
     SCOPED_CONSUME_MEM_TRACKER(_mem_tracker.get());
     Status status = Status::OK();
 
+    // 2. 检查是否为 dry_run 模式（只验证不实际写入）
     DCHECK(_state);
     DCHECK(_state->query_options().__isset.dry_run_query);
     if (_state->query_options().dry_run_query) {
         return status;
     }
 
+    // 3. 检查并发送新创建分区的批次（自动分区场景）
+    // 如果之前有分区创建请求，需要先发送缓存的数据
     // check out of limit
     RETURN_IF_ERROR(_send_new_partition_batch());
 
+    // 4. 获取输入 Block 的行数和字节数
     auto rows = input_block.rows();
     auto bytes = input_block.bytes();
     if (UNLIKELY(rows == 0)) {
         return status;
     }
+    
+    // 5. 启动性能计时器
     SCOPED_TIMER(_operator_profile->total_time_counter());
     SCOPED_RAW_TIMER(&_send_data_ns);
 
+    // 6. 行分布：根据分区键计算每行数据属于哪个分区和 tablet
+    // 输入：input_block（原始数据）
+    // 输出：block（转换后的数据，可能经过列映射、类型转换等）、filtered_rows（过滤的行数）、
+    //      _row_part_tablet_ids（每行对应的分区和 tablet ID）
     std::shared_ptr<vectorized::Block> block;
     int64_t filtered_rows = 0;
     _number_input_rows += rows;
+    // 增量更新行数和字节数，以便 FE 可以获取进度
     // update incrementally so that FE can get the progress.
+    // 真正的 'num_rows_load_total' 会在 sink 关闭时设置
     // the real 'num_rows_load_total' will be set when sink being closed.
     _state->update_num_rows_load_total(rows);
     _state->update_num_bytes_load_total(bytes);
@@ -2066,29 +2095,39 @@ Status VTabletWriter::write(RuntimeState* state, doris::vectorized::Block& input
     RETURN_IF_ERROR(_row_distribution.generate_rows_distribution(
             input_block, block, filtered_rows, _row_part_tablet_ids, _number_input_rows));
 
+    // 7. 生成通道负载：将数据按 NodeChannel 分组
+    // channel_to_payload[i] 表示第 i 个索引通道（主表或物化视图）的负载
+    // 每个负载是一个 map：NodeChannel* -> Payload（行选择器和 tablet_id 列表）
     ChannelDistributionPayloadVec channel_to_payload;
 
     channel_to_payload.resize(_channels.size());
     _generate_index_channels_payloads(_row_part_tablet_ids, channel_to_payload);
     _row_distribution_watch.stop();
 
+    // 8. 将数据添加到各个 NodeChannel
     // Add block to node channel
     for (size_t i = 0; i < _channels.size(); i++) {
         for (const auto& entry : channel_to_payload[i]) {
+            // 如果这个 node channel 已经失败，add_block 会被跳过
             // if this node channel is already failed, this add_row will be skipped
+            // entry.second 是一个 [row -> tablet] 映射（Payload：行选择器 + tablet_id 列表）
             // entry.second is a [row -> tablet] mapping
             auto st = entry.first->add_block(block.get(), &entry.second);
             if (!st.ok()) {
+                // 如果添加失败，标记该 NodeChannel 为失败
                 _channels[i]->mark_as_failed(entry.first, st.to_string());
             }
         }
     }
 
+    // 9. 检查不可容忍的失败（如副本数不足、quorum 不满足等）
+    // 如果某个 tablet 的失败副本数超过阈值，会返回错误
     // check intolerable failure
     for (const auto& index_channel : _channels) {
         RETURN_IF_ERROR(index_channel->check_intolerable_failure());
     }
 
+    // 10. 更新全局统计信息
     g_sink_write_bytes << bytes;
     g_sink_write_rows << rows;
     return Status::OK();

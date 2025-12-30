@@ -86,25 +86,54 @@ Status MemTableWriter::init(std::shared_ptr<RowsetWriter> rowset_writer,
     return Status::OK();
 }
 
+/**
+ * MemTableWriter::write：将 Block 中的指定行写入 MemTable
+ * 
+ * 主要流程：
+ * 1. 检查行索引是否为空
+ * 2. 加锁保护（防止并发写入冲突）
+ * 3. 检查状态（取消、初始化、关闭）
+ * 4. 检查行数限制（防止超过 int32_t 最大值）
+ * 5. 插入数据到 MemTable
+ * 6. 处理插入失败（重置 MemTable，防止后续刷新导致崩溃）
+ * 7. 内存优化（聚合场景下的内存收缩）
+ * 8. 检查是否需要刷新 MemTable
+ * 
+ * @param block 输入的 Block（包含待写入的数据）
+ * @param row_idxs 需要写入的行索引列表（指定 Block 中的哪些行需要写入）
+ * @return 写入状态
+ */
 Status MemTableWriter::write(const vectorized::Block* block,
                              const DorisVector<uint32_t>& row_idxs) {
+    // 1. 如果行索引为空，直接返回（没有数据需要写入）
     if (UNLIKELY(row_idxs.empty())) {
         return Status::OK();
     }
+    
+    // 2. 加锁保护（防止并发写入冲突）
+    // 记录锁等待时间，用于性能分析
     _lock_watch.start();
     std::lock_guard<std::mutex> l(_lock);
     _lock_watch.stop();
+    
+    // 3. 检查状态：如果已取消，返回取消状态
     if (_is_cancelled) {
         return _cancel_status;
     }
+    
+    // 4. 检查状态：如果未初始化，返回错误
     if (!_is_init) {
         return Status::Error<NOT_INITIALIZED>("delta segment writer has not been initialized");
     }
+    
+    // 5. 检查状态：如果已关闭，返回错误（不允许在关闭后写入）
     if (_is_closed) {
         return Status::Error<ALREADY_CLOSED>("write block after closed tablet_id={}, load_id={}-{}",
                                              _req.tablet_id, _req.load_id.hi(), _req.load_id.lo());
     }
 
+    // 6. 检查行数限制：如果 MemTable 的行数加上本次写入的行数超过 int32_t 最大值，
+    //    需要先刷新 MemTable，避免行数溢出
     // Flush and reset memtable if it is raw rows great than int32_t.
     int64_t raw_rows = _mem_table->raw_rows();
     DBUG_EXECUTE_IF("MemTableWriter.too_many_raws",
@@ -114,9 +143,17 @@ Status MemTableWriter::write(const vectorized::Block* block,
         RETURN_IF_ERROR(_flush_memtable());
     }
 
+    // 7. 更新总接收行数统计
     _total_received_rows += row_idxs.size();
+    
+    // 8. 将数据插入到 MemTable
     auto st = _mem_table->insert(block, row_idxs);
 
+    // 9. 处理插入失败的情况
+    // 如果插入失败（例如内存分配失败），MemTable 处于不一致状态，不应该被刷新
+    // 但是内存压力可能会触发对这个失败的 MemTable 的刷新操作
+    // 通过在这里重置 MemTable，确保失败的 MemTable 不会被包含在任何后续的刷新中，
+    // 从而防止潜在的崩溃
     // Reset memtable immediately after insert failure to prevent potential flush operations.
     // This is a defensive measure because:
     // 1. When insert fails (e.g., memory allocation failure during add_rows),
@@ -134,9 +171,15 @@ Status MemTableWriter::write(const vectorized::Block* block,
         return st;
     }
 
+    // 10. 内存优化：如果 MemTable 需要聚合且启用了内存收缩，则收缩内存
+    // 这可以减少内存占用，特别是在聚合场景下
     if (UNLIKELY(_mem_table->need_agg() && config::enable_shrink_memory)) {
         _mem_table->shrink_memtable_by_agg();
     }
+    
+    // 11. 检查是否需要刷新 MemTable
+    // 如果 MemTable 达到刷新条件（如内存大小、行数等），则触发刷新
+    // 刷新会将 MemTable 的数据写入磁盘 Segment
     if (UNLIKELY(_mem_table->need_flush())) {
         RETURN_IF_ERROR(_flush_memtable());
     }

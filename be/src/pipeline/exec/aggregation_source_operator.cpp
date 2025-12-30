@@ -55,6 +55,9 @@ Status AggLocalState::init(RuntimeState* state, LocalStateInfo& info) {
     _memory_usage_container = ADD_COUNTER(custom_profile(), "MemoryUsageContainer", TUnit::BYTES);
     _memory_usage_arena = ADD_COUNTER(custom_profile(), "MemoryUsageArena", TUnit::BYTES);
 
+    // 绑定导出策略：根据“是否有 key / 是否需要 finalize”绑定到不同的 get_result 实现
+    // 无 key: _get_results_without_key / _get_without_key_result
+    // 有 key: _get_results_with_serialized_key / _get_with_serialized_key_result
     auto& p = _parent->template cast<AggSourceOperatorX>();
     if (p._without_key) {
         if (p._needs_finalize) {
@@ -102,118 +105,178 @@ Status AggLocalState::_create_agg_status(vectorized::AggregateDataPtr data) {
     return Status::OK();
 }
 
+/**
+ * 有键聚合结果获取函数（不需要最终化处理）
+ * 
+ * 功能说明：
+ * 1. 从哈希表中遍历聚合结果，批量获取数据
+ * 2. 将GROUP BY键和聚合值序列化到输出列中
+ * 3. 处理NULL键值和内存优化
+ * 4. 构建最终的数据块输出
+ * 
+ * 适用场景：
+ * - 有GROUP BY子句的聚合查询（如 SELECT COUNT(*) FROM table GROUP BY id）
+ * - 单级聚合，不需要最终化处理
+ * - 最常见的OLAP聚合场景
+ * 
+ * @param state 运行时状态对象
+ * @param block 输出数据块，用于存储聚合结果
+ * @param eos 结束标志，指示是否已处理完所有数据
+ * @return Status 操作状态
+ */
 Status AggLocalState::_get_results_with_serialized_key(RuntimeState* state,
                                                        vectorized::Block* block, bool* eos) {
+    // 第一步：设置性能监控计时器
     SCOPED_TIMER(_get_results_timer);
+    
+    // 第二步：获取共享状态和基本参数
     auto& shared_state = *_shared_state;
-    size_t key_size = _shared_state->probe_expr_ctxs.size();
-    size_t agg_size = _shared_state->aggregate_evaluators.size();
-    vectorized::MutableColumns value_columns(agg_size);
-    vectorized::DataTypes value_data_types(agg_size);
+    size_t key_size = _shared_state->probe_expr_ctxs.size();      // GROUP BY列的数量
+    size_t agg_size = _shared_state->aggregate_evaluators.size(); // 聚合函数的数量
+    
+    // 第三步：准备输出列的数据结构
+    vectorized::MutableColumns value_columns(agg_size);  // 聚合值列
+    vectorized::DataTypes value_data_types(agg_size);    // 聚合值的数据类型
 
-    // non-nullable column(id in `_make_nullable_keys`) will be converted to nullable.
+    // 第四步：判断是否可以复用内存
+    // 当没有需要转换为可空的键且输出块支持内存复用时，可以复用内存以提高性能
     bool mem_reuse = shared_state.make_nullable_keys.empty() && block->mem_reuse();
 
+    // 第五步：准备GROUP BY键列
     vectorized::MutableColumns key_columns;
     for (int i = 0; i < key_size; ++i) {
         if (mem_reuse) {
+            // 内存复用：直接使用输出块中现有的列内存
             key_columns.emplace_back(std::move(*block->get_by_position(i).column).mutate());
         } else {
+            // 创建新列：根据表达式类型创建新的列
             key_columns.emplace_back(
                     shared_state.probe_expr_ctxs[i]->root()->data_type()->create_column());
         }
     }
 
+    // 第六步：使用访问者模式处理不同类型的聚合方法
     std::visit(
             vectorized::Overload {
+                    // 处理未初始化的哈希表（错误情况）
                     [&](std::monostate& arg) -> void {
                         throw doris::Exception(ErrorCode::INTERNAL_ERROR, "uninited hash table");
                     },
+                    // 处理具体的聚合方法（模板函数）
                     [&](auto& agg_method) -> void {
+                        // 6.1 初始化哈希表迭代器
                         agg_method.init_iterator();
                         auto& data = *agg_method.hash_table;
+                        
+                        // 6.2 计算本次处理的数据量（批量处理，避免内存过大）
                         const auto size = std::min(data.size(), size_t(state->batch_size()));
                         using KeyType = std::decay_t<decltype(agg_method)>::Key;
-                        std::vector<KeyType> keys(size);
+                        std::vector<KeyType> keys(size);  // 存储键值的临时数组
+                        
+                        // 6.3 确保聚合数据容器有足够的空间
                         if (shared_state.values.size() < size + 1) {
                             shared_state.values.resize(size + 1);
                         }
 
-                        uint32_t num_rows = 0;
+                        uint32_t num_rows = 0;  // 实际处理的行数
                         shared_state.aggregate_data_container->init_once();
                         auto& iter = shared_state.aggregate_data_container->iterator;
 
+                        // 6.4 遍历哈希表，收集键值和聚合数据
                         {
                             SCOPED_TIMER(_hash_table_iterate_timer);
                             while (iter != shared_state.aggregate_data_container->end() &&
                                    num_rows < state->batch_size()) {
+                                // 获取当前迭代器位置的键值
                                 keys[num_rows] = iter.template get_key<KeyType>();
+                                // 获取当前迭代器位置的聚合数据
                                 shared_state.values[num_rows] = iter.get_aggregate_data();
-                                ++iter;
-                                ++num_rows;
+                                ++iter;      // 移动到下一个位置
+                                ++num_rows;  // 增加处理行数
                             }
                         }
 
+                        // 6.5 将键值插入到输出列中
                         {
                             SCOPED_TIMER(_insert_keys_to_column_timer);
                             agg_method.insert_keys_into_columns(keys, key_columns, num_rows);
                         }
 
+                        // 6.6 处理哈希表遍历结束后的特殊情况
                         if (iter == shared_state.aggregate_data_container->end()) {
                             if (agg_method.hash_table->has_null_key_data()) {
-                                // only one key of group by support wrap null key
-                                // here need additional processing logic on the null key / value
+                                // 处理GROUP BY中的NULL键值
+                                // 注意：只有单个GROUP BY列才支持NULL键包装
+                                // 这里需要额外的NULL键/值处理逻辑
                                 DCHECK(key_columns.size() == 1);
                                 DCHECK(key_columns[0]->is_nullable());
                                 if (agg_method.hash_table->has_null_key_data()) {
+                                    // 插入NULL键值
                                     key_columns[0]->insert_data(nullptr, 0);
+                                    // 获取NULL键对应的聚合数据
                                     shared_state.values[num_rows] =
                                             agg_method.hash_table->template get_null_key_data<
                                                     vectorized::AggregateDataPtr>();
                                     ++num_rows;
-                                    *eos = true;
+                                    *eos = true;  // 标记数据流结束
                                 }
                             } else {
-                                *eos = true;
+                                *eos = true;  // 没有更多数据，标记结束
                             }
                         }
 
+                        // 6.7 将聚合值序列化到输出列中
                         {
                             SCOPED_TIMER(_insert_values_to_column_timer);
                             for (size_t i = 0; i < shared_state.aggregate_evaluators.size(); ++i) {
+                                // 获取聚合函数的序列化类型
                                 value_data_types[i] = shared_state.aggregate_evaluators[i]
                                                               ->function()
                                                               ->get_serialized_type();
+                                
+                                // 准备聚合值列
                                 if (mem_reuse) {
+                                    // 内存复用：使用输出块中现有的列
                                     value_columns[i] =
                                             std::move(*block->get_by_position(i + key_size).column)
                                                     .mutate();
                                 } else {
+                                    // 创建新的序列化列
                                     value_columns[i] = shared_state.aggregate_evaluators[i]
                                                                ->function()
                                                                ->create_serialize_column();
                                 }
+                                
+                                // 将聚合数据序列化到列中
                                 shared_state.aggregate_evaluators[i]
                                         ->function()
                                         ->serialize_to_column(
-                                                shared_state.values,
-                                                shared_state.offsets_of_aggregate_states[i],
-                                                value_columns[i], num_rows);
+                                                shared_state.values,                    // 聚合数据数组
+                                                shared_state.offsets_of_aggregate_states[i], // 数据偏移量
+                                                value_columns[i],                       // 目标列
+                                                num_rows);                              // 行数
                             }
                         }
                     }},
-            shared_state.agg_data->method_variant);
+            shared_state.agg_data->method_variant);  // 聚合方法的变体类型
 
+    // 第七步：构建最终的数据块（仅在非内存复用模式下）
     if (!mem_reuse) {
         vectorized::ColumnsWithTypeAndName columns_with_schema;
+        
+        // 7.1 添加GROUP BY键列
         for (int i = 0; i < key_size; ++i) {
             columns_with_schema.emplace_back(std::move(key_columns[i]),
                                              shared_state.probe_expr_ctxs[i]->root()->data_type(),
                                              shared_state.probe_expr_ctxs[i]->root()->expr_name());
         }
+        
+        // 7.2 添加聚合值列
         for (int i = 0; i < agg_size; ++i) {
             columns_with_schema.emplace_back(std::move(value_columns[i]), value_data_types[i], "");
         }
+        
+        // 7.3 构建最终的数据块
         *block = vectorized::Block(columns_with_schema);
     }
 
@@ -248,6 +311,10 @@ Status AggLocalState::_get_with_serialized_key_result(RuntimeState* state, vecto
     }
 
     SCOPED_TIMER(_get_results_timer);
+    // 执行期统一分发：对不同键方法(method_variant)做零开销分发
+    // 两阶段：
+    // 1) 遍历容器，批量收集 (key, state) → keys[] / values[]
+    // 2) 写出 key 列(insert_keys_into_columns) 与 序列化聚合值(serialize_to_column)
     std::visit(
             vectorized::Overload {
                     [&](std::monostate& arg) -> void {
@@ -441,15 +508,58 @@ AggSourceOperatorX::AggSourceOperatorX(ObjectPool* pool, const TPlanNode& tnode,
           _needs_finalize(tnode.agg_node.need_finalize),
           _without_key(tnode.agg_node.grouping_exprs.empty()) {}
 
+/**
+ * 聚合源操作符获取数据块的核心方法
+ * 
+ * 功能说明：
+ * 1. 从聚合执行器中获取聚合计算结果
+ * 2. 处理输出键的可空性
+ * 3. 应用HAVING子句过滤条件
+ * 4. 应用LIMIT限制和分页处理
+ * 
+ * 在Push流程中的作用：
+ * - 作为Source操作符，从共享聚合状态中拉取最终结果
+ * - 与AggSinkOperatorX配合，实现完整的聚合Push流程
+ * - 负责将聚合结果转换为用户可见的最终输出
+ * 
+ * @param state 运行时状态对象，包含查询执行的上下文信息
+ * @param block 输出数据块，用于存储聚合后的最终结果
+ * @param eos 结束标志，指示是否已处理完所有聚合数据
+ * @return Status 操作状态，成功返回OK，失败返回错误状态
+ */
 Status AggSourceOperatorX::get_block(RuntimeState* state, vectorized::Block* block, bool* eos) {
+    // 第一步：获取当前操作符的本地状态
+    // 每个PipelineTask都有独立的本地状态实例，包含聚合执行器、内存统计等信息
     auto& local_state = get_local_state(state);
+    
+    // 第二步：设置性能监控计时器
+    // 记录函数执行时间，用于性能分析和优化
     SCOPED_TIMER(local_state.exec_time_counter());
+    
+    // 第三步：设置内存使用监控
+    // 记录内存使用峰值，用于内存管理和溢出检测
     SCOPED_PEAK_MEM(&local_state._estimate_memory_usage);
+    
+    // 第四步：从聚合执行器获取聚合结果
+    // 这是核心步骤，从共享聚合状态中获取计算完成的聚合数据
+    // _executor是聚合执行器，负责实际的聚合计算（GROUP BY, COUNT, SUM等）
     RETURN_IF_ERROR(local_state._executor.get_result(state, block, eos));
+    
+    // 第五步：处理输出键的可空性
+    // 将GROUP BY列设置为可空类型，处理可能为NULL的键值
+    // 确保输出格式符合SQL语义和用户预期
     local_state.make_nullable_output_key(block);
-    // dispose the having clause, should not be execute in prestreaming agg
+    
+    // 第六步：应用HAVING子句过滤条件
+    // 根据HAVING条件过滤聚合结果，只保留满足条件的分组
+    // 注意：HAVING子句不应该在预流式聚合中执行，因为此时聚合还未完成
     RETURN_IF_ERROR(local_state.filter_block(local_state._conjuncts, block, block->columns()));
+    
+    // 第七步：应用LIMIT限制和分页处理
+    // 处理聚合查询的LIMIT子句，实现分页查询功能
+    // 可能修改eos标志，表示是否还有更多数据需要处理
     local_state.do_agg_limit(block, eos);
+    
     return Status::OK();
 }
 

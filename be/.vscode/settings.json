@@ -1,0 +1,11 @@
+{
+    "cmake.cmakePath": "/home/yangtao555/local/ldb-toolchain-0.27/bin/cmake",
+    "cmake.configureSettings": {
+        "CMAKE_C_COMPILER": "/home/yangtao555/local/ldb-toolchain-0.27/bin/clang",
+        "CMAKE_CXX_COMPILER": "/home/yangtao555/local/ldb-toolchain-0.27/bin/clang++"
+    },
+    "clangd.path": "/home/yangtao555/local/ldb-toolchain-0.27/bin/clangd",
+    "clangd.arguments": [
+        "--clang-tidy"
+    ]
+}

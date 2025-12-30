@@ -609,14 +609,59 @@ struct HashJoinSharedState : public JoinSharedState {
     std::shared_ptr<vectorized::Block> build_block;
     std::shared_ptr<std::vector<uint32_t>> build_indexes_null;
 
-    // Used by shared hash table
-    // For probe operator, hash table in _hash_table_variants is read-only if visited flags is not
-    // used. (visited flags will be used only in right / full outer join).
-    //
-    // For broadcast join, although hash table is read-only, some states in `_hash_table_variants`
-    // are still could be written. For example, serialized keys will be written in a continuous
-    // memory in `_hash_table_variants`. So before execution, we should use a local _hash_table_variants
-    // which has a shared hash table in it.
+    /**
+     * @brief Hash 表变体向量，用于共享 Hash 表机制
+     *
+     * 【功能说明】
+     * 存储多个 Hash 表变体（JoinDataVariants），支持 Broadcast Join 的共享 Hash 表机制。
+     * 每个元素对应一个 PipelineTask 的 Hash 表槽位。
+     *
+     * 【共享机制】
+     * 1. Broadcast Join + 共享 Hash 表模式：
+     *    - Task 0 构建 Hash 表，存储到 hash_table_variant_vector[0]
+     *    - Task 1-N 复制 Task 0 的 Hash 表到各自的槽位
+     *    - 所有 Task 共享同一个 Hash 表实例（共享底层数据）
+     *
+     * 2. 非共享模式：
+     *    - 每个 Task 构建自己的 Hash 表
+     *    - hash_table_variant_vector 大小为 1，所有 Task 使用同一个槽位
+     *
+     * 【读写特性】
+     * 1. Probe 算子的读取特性：
+     *    - 如果未使用 visited flags（visited flags 仅在 RIGHT/FULL OUTER JOIN 中使用），
+     *      Hash 表是只读的，多个 Probe Task 可以安全地并发读取
+     *    - 如果使用了 visited flags，每个 Probe Task 需要独立的 visited flags 状态
+     *
+     * 2. Broadcast Join 的特殊情况：
+     *    - 虽然 Hash 表的核心数据（buckets、keys）是只读的，
+     *      但 `JoinDataVariants` 中的某些状态仍然可以写入
+     *    - 例如：序列化的 keys（serialized keys）会被写入到连续的内存区域
+     *    - 这些状态写入发生在 `_hash_table_variants` 中，而不是 Hash 表本身
+     *
+     * 【为什么需要本地副本】
+     * 在执行前，应该使用本地的 `_hash_table_variants`，其中包含共享的 Hash 表。
+     * 原因：
+     * 1. 避免并发写入冲突：每个 Task 有独立的状态空间，可以安全地写入序列化 keys 等状态
+     * 2. 支持 visited flags：RIGHT/FULL OUTER JOIN 需要每个 Task 独立的 visited flags
+     * 3. 性能优化：本地副本可以减少锁竞争，提高并发性能
+     *
+     * 【示例】
+     * ```cpp
+     * // Broadcast Join，4 个 Task，启用共享 Hash 表
+     * hash_table_variant_vector.size() = 4
+     * 
+     * // Task 0 构建 Hash 表
+     * hash_table_variant_vector[0]->method_variant = HashTable (构建完成)
+     * 
+     * // Task 1-3 复制 Hash 表
+     * hash_table_variant_vector[1]->method_variant.hash_table = hash_table_variant_vector[0]->method_variant.hash_table
+     * hash_table_variant_vector[2]->method_variant.hash_table = hash_table_variant_vector[0]->method_variant.hash_table
+     * hash_table_variant_vector[3]->method_variant.hash_table = hash_table_variant_vector[0]->method_variant.hash_table
+     * 
+     * // 每个 Task 的 method_variant 是独立的，但 hash_table 指针指向同一个实例
+     * // 这样既共享了 Hash 表数据，又避免了状态写入冲突
+     * ```
+     */
     std::vector<std::shared_ptr<JoinDataVariants>> hash_table_variant_vector;
 };
 
@@ -752,58 +797,182 @@ struct DataDistribution {
 
 class ExchangerBase;
 
+/**
+ * 本地交换共享状态：继承自 BasicSharedState，提供本地数据交换功能
+ * 
+ * 设计理念：
+ * 1. 继承复用：继承 BasicSharedState 的基础功能（统计、配置、依赖等）
+ * 2. 功能扩展：添加本地交换特有的功能（数据交换、内存管理、通道协调等）
+ * 3. 内存控制：提供细粒度的内存使用监控和限制机制
+ * 4. 通道管理：管理多个数据通道的依赖关系和内存使用
+ * 
+ * 在 Stream Load 中的作用：
+ * - 当数据需要在本地节点内重新分布时使用
+ * - 支持数据重新分区、并行度调整、数据倾斜处理等场景
+ * - 提供内存使用监控，防止内存溢出
+ */
 struct LocalExchangeSharedState : public BasicSharedState {
 public:
     ENABLE_FACTORY_CREATOR(LocalExchangeSharedState);
+    
+    /**
+     * 构造函数：初始化本地交换共享状态
+     * @param num_instances 实例数量，用于初始化内存计数器和依赖关系
+     */
     LocalExchangeSharedState(int num_instances);
+    
+    /**
+     * 析构函数：清理资源
+     */
     ~LocalExchangeSharedState() override;
+    
+    /**
+     * 数据交换器：负责实际的数据交换逻辑
+     * 支持不同类型的数据交换策略（如哈希分区、轮询等）
+     */
     std::unique_ptr<ExchangerBase> exchanger {};
+    
+    /**
+     * 内存计数器：每个通道一个，用于监控各个通道的内存使用情况
+     * 索引对应通道ID，便于定位内存使用热点
+     */
     std::vector<RuntimeProfile::Counter*> mem_counters;
+    
+    /**
+     * 总内存使用量：所有通道的总内存使用统计
+     * 原子操作，线程安全，用于全局内存控制
+     */
     std::atomic<int64_t> mem_usage = 0;
+    
+    /**
+     * 缓冲区内存限制：本地交换缓冲区的最大内存使用量
+     * 可配置，支持低内存模式下的动态调整
+     */
     std::atomic<size_t> _buffer_mem_limit = config::local_exchange_buffer_mem_limit;
-    // We need to make sure to add mem_usage first and then enqueue, otherwise sub mem_usage may cause negative mem_usage during concurrent dequeue.
+    
+    /**
+     * 本地交换锁：保护共享状态的并发访问
+     * 主要用于内存使用统计的原子性操作
+     */
     std::mutex le_lock;
+    
+    /**
+     * 减少运行中的 Sink 操作符计数
+     * 当 Sink 操作符完成时调用，用于协调操作符的生命周期
+     */
     void sub_running_sink_operators();
+    
+    /**
+     * 减少运行中的 Source 操作符计数
+     * 当 Source 操作符完成时调用，用于协调操作符的生命周期
+     */
     void sub_running_source_operators();
+    
+    /**
+     * 设置所有依赖关系为始终就绪状态
+     * 用于测试或特殊场景，确保数据流不会阻塞
+     */
     void _set_always_ready() {
+        // 设置所有 Source 依赖为始终就绪
         for (auto& dep : source_deps) {
             DCHECK(dep);
             dep->set_always_ready();
         }
+        // 设置所有 Sink 依赖为始终就绪
         for (auto& dep : sink_deps) {
             DCHECK(dep);
             dep->set_always_ready();
         }
     }
 
+    /**
+     * 根据通道ID获取Sink依赖关系
+     * 本地交换不需要网络通道，所以返回 nullptr
+     * @param channel_id 通道ID（本地交换中不使用）
+     * @return Dependency* 总是返回 nullptr
+     */
     Dependency* get_sink_dep_by_channel_id(int channel_id) { return nullptr; }
 
+    /**
+     * 设置指定通道为可读状态
+     * 当通道有数据可读时调用，通知依赖该通道的操作符
+     * @param channel_id 通道ID
+     */
     void set_ready_to_read(int channel_id) {
         auto& dep = source_deps[channel_id];
         DCHECK(dep) << channel_id;
         dep->set_ready();
     }
 
-    void add_mem_usage(int channel_id, size_t delta) { mem_counters[channel_id]->update(delta); }
+    /**
+     * 增加指定通道的内存使用量
+     * 更新通道级别的内存计数器，用于细粒度监控
+     * @param channel_id 通道ID
+     * @param delta 增加的内存量
+     */
+    void add_mem_usage(int channel_id, size_t delta) { 
+        mem_counters[channel_id]->update(delta); 
+    }
 
+    /**
+     * 减少指定通道的内存使用量
+     * 更新通道级别的内存计数器，用于细粒度监控
+     * @param channel_id 通道ID
+     * @param delta 减少的内存量
+     */
     void sub_mem_usage(int channel_id, size_t delta) {
         mem_counters[channel_id]->update(-(int64_t)delta);
     }
 
+    /**
+     * 增加总内存使用量
+     * 关键方法：需要先增加内存使用量，再入队数据
+     * 否则并发出队时可能导致内存使用量为负数
+     * 
+     * 内存控制逻辑：
+     * - 如果总内存使用量超过限制，阻塞第一个 Sink 依赖
+     * - 防止内存溢出，实现背压控制
+     * 
+     * @param delta 增加的内存量
+     */
     void add_total_mem_usage(size_t delta) {
         if (cast_set<int64_t>(mem_usage.fetch_add(delta) + delta) > _buffer_mem_limit) {
+            // 内存超限，阻塞 Sink 操作符，实现背压控制
             sink_deps.front()->block();
         }
     }
 
+    /**
+     * 减少总内存使用量
+     * 当数据被消费后，释放相应的内存
+     * 
+     * 内存控制逻辑：
+     * - 如果内存使用量降到限制以下，唤醒第一个 Sink 依赖
+     * - 恢复数据流，避免不必要的阻塞
+     * 
+     * @param delta 减少的内存量
+     */
     void sub_total_mem_usage(size_t delta) {
         auto prev_usage = mem_usage.fetch_sub(delta);
+        // 断言检查：内存使用量不能为负数
         DCHECK_GE(prev_usage - delta, 0) << "prev_usage: " << prev_usage << " delta: " << delta;
+        
         if (cast_set<int64_t>(prev_usage - delta) <= _buffer_mem_limit) {
+            // 内存释放到限制以下，唤醒 Sink 操作符
             sink_deps.front()->set_ready();
         }
     }
 
+    /**
+     * 设置低内存模式
+     * 在内存紧张时动态调整缓冲区限制
+     * 
+     * 调整策略：
+     * - 取配置的本地交换缓冲区限制和低内存模式限制的较小值
+     * - 确保在内存紧张时不会过度使用内存
+     * 
+     * @param state 运行时状态，包含低内存模式的配置信息
+     */
     void set_low_memory_mode(RuntimeState* state) {
         _buffer_mem_limit = std::min<int64_t>(config::local_exchange_buffer_mem_limit,
                                               state->low_memory_mode_buffer_limit());

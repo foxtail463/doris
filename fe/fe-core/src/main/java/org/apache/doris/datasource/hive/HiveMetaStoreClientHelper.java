@@ -813,9 +813,31 @@ public class HiveMetaStoreClientHelper {
         return output.toString();
     }
 
+    /**
+     * 获取指定 Hudi 表在某个时间点的内部模式（InternalSchema）。
+     * 
+     * 功能说明：
+     * - 优先尝试从指定提交时间点（timestamp）的提交元数据中读取 InternalSchema；
+     * - 若该时间点未启用 schema 演进（hoodie.schema.on.read.enable = false），
+     *   则退化为读取 Avro schema 并转换为 InternalSchema（会生成字段 ID）。
+     * - 在读取前会强制 reload 时间线，避免由于 metaClient 缓存导致引用到已被清理的旧提交文件。
+     * 
+     * 参数：
+     * - table：HMS 外部表对象，封装了 Hudi 的 metaClient 访问能力。
+     * - enableSchemaEvolution：长度为 1 的输出参数，返回是否启用了 schema 演进。
+     * - timestamp：目标提交时间点字符串（Hudi 提交 instant）。
+     * 
+     * 返回：
+     * - InternalSchema：在目标时间点解析出的内部模式定义。
+     * 
+     * 异常：
+     * - RuntimeException：当无法获取 Hudi 表 schema 时抛出。
+     */
     public static InternalSchema getHudiTableSchema(HMSExternalTable table, boolean[] enableSchemaEvolution,
             String timestamp) {
+        // 从表对象获取 Hudi 的 MetaClient（包含元数据与时间线访问能力）
         HoodieTableMetaClient metaClient = table.getHudiClient();
+        // 基于 MetaClient 创建表结构解析器，用于解析 InternalSchema / Avro Schema
         TableSchemaResolver schemaUtil = new TableSchemaResolver(metaClient);
 
         // Here, the timestamp should be reloaded again.
@@ -824,18 +846,21 @@ public class HiveMetaStoreClientHelper {
         // But the `metaClient` is obtained from cache, so the file obtained may be an old file.
         // This file may be deleted by hudi clean task, and an error will be reported.
         // So, we should reload timeline so that we can read the latest commit files.
+        // 重新加载活跃时间线，确保读取到最新可用的提交文件（避免引用被清理的旧文件）
         metaClient.reloadActiveTimeline();
 
+        // 尝试从指定提交时间点的提交元数据中直接获取 InternalSchema（开启 schema 演进时可用）
         Option<InternalSchema> internalSchemaOption = schemaUtil.getTableInternalSchemaFromCommitMetadata(timestamp);
 
         if (internalSchemaOption.isPresent()) {
+            // 找到 InternalSchema，表示已启用 schema 演进
             enableSchemaEvolution[0] = true;
             return internalSchemaOption.get();
         } else {
             try {
                 // schema evolution is not enabled. (hoodie.schema.on.read.enable = false).
                 enableSchemaEvolution[0] = false;
-                // AvroInternalSchemaConverter.convert() will generator field id.
+                // 未启用演进：读取 Avro Schema 并转换为 InternalSchema（转换过程中会生成字段 ID）
                 return AvroInternalSchemaConverter.convert(schemaUtil.getTableAvroSchema(true));
             } catch (Exception e) {
                 throw new RuntimeException("Cannot get hudi table schema.", e);

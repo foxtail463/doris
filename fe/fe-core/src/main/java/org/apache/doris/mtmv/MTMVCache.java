@@ -92,19 +92,27 @@ public class MTMVCache {
     }
 
     /**
-     * @param defSql the def sql of materialization
-     * @param createCacheContext should create new createCacheContext use MTMVPlanUtil createMTMVContext
-     *         or createBasicMvContext
-     * @param needCost the plan from def sql should calc cost or not
-     * @param needLock should lock when create mtmv cache
-     * @param currentContext current context, after create cache,should setThreadLocalInfo
-     * @param addSessionVarGuard whether to add SessionVarGuardExpr to expressions
+     * 根据 MV 定义 SQL 构建 MTMVCache。
+     * 
+     * 核心流程：
+     * 1. 解析 MV 定义 SQL 得到 unbound plan
+     * 2. 通过 NereidsPlanner 进行分析、重写、优化（计划会被规范化）
+     * 3. 可选地添加 SessionVarGuard 表达式（用于会话变量不匹配时阻止重写）
+     * 4. 构建 StructInfo 用于后续 MV 匹配
+     * 
+     * @param defSql MV 定义 SQL
+     * @param createCacheContext 用于创建缓存的上下文
+     * @param needCost 是否需要计算代价（用于 MV 选择）
+     * @param needLock 是否需要锁表
+     * @param currentContext 当前上下文，缓存创建后恢复 ThreadLocal
+     * @param addSessionVarGuard 是否添加会话变量 guard 表达式
      */
     public static MTMVCache from(String defSql,
             ConnectContext createCacheContext,
             boolean needCost, boolean needLock,
             ConnectContext currentContext,
             boolean addSessionVarGuard) throws AnalysisException {
+        // 创建 MV SQL 的 StatementContext
         StatementContext mvSqlStatementContext = new StatementContext(createCacheContext,
                 new OriginStatement(defSql, 0));
         if (!needLock) {
@@ -113,26 +121,29 @@ public class MTMVCache {
         if (mvSqlStatementContext.getConnectContext().getStatementContext() == null) {
             mvSqlStatementContext.getConnectContext().setStatementContext(mvSqlStatementContext);
         }
+        // 强制记录临时计划，用于 Pre-MV rewrite
         createCacheContext.getStatementContext().setForceRecordTmpPlan(true);
         mvSqlStatementContext.setForceRecordTmpPlan(true);
+        // 禁用 MV 重写，避免递归重写
         boolean originalRewriteFlag = createCacheContext.getSessionVariable().enableMaterializedViewRewrite;
         createCacheContext.getSessionVariable().enableMaterializedViewRewrite = false;
+        // 解析 MV 定义 SQL
         LogicalPlan unboundMvPlan = new NereidsParser().parseSingle(defSql);
         NereidsPlanner planner = new NereidsPlanner(mvSqlStatementContext);
         try {
-            // Can not convert to table sink, because use the same column from different table when self join
-            // the out slot is wrong
+            // 执行计划：分析 -> 重写（包含表达式规范化）-> 优化
             if (needCost) {
-                // Only in mv rewrite, we need plan with eliminated cost which is used for mv chosen
+                // MV 重写时需要代价信息用于选择最优 MV
                 planner.planWithLock(unboundMvPlan, PhysicalProperties.ANY, ExplainLevel.ALL_PLAN);
             } else {
-                // No need cost for performance
+                // 不需要代价，提升性能
                 planner.planWithLock(unboundMvPlan, PhysicalProperties.ANY, ExplainLevel.REWRITTEN_PLAN);
             }
             CascadesContext cascadesContext = planner.getCascadesContext();
             Plan rewritePlan = cascadesContext.getRewritePlan();
 
-            // Only add SessionVarGuardExpr if requested
+            // 根据需要添加 SessionVarGuard 表达式
+            // 当会话变量不匹配时，guard 表达式会阻止该 MV 被使用
             Optional<SessionVarGuardRewriter> exprRewriter = addSessionVarGuard
                     ? Optional.of(new SessionVarGuardRewriter(
                     ConnectContextUtil.getAffectQueryResultInPlanVariables(createCacheContext),
@@ -141,8 +152,10 @@ public class MTMVCache {
             Plan addGuardRewritePlan = exprRewriter
                     .map(rewriter -> SessionVarGuardRewriter.rewritePlanTree(rewriter, rewritePlan))
                     .orElse(rewritePlan);
+            // 构建最终的 Plan 和 StructInfo
             Pair<Plan, StructInfo> finalPlanStructInfoPair = constructPlanAndStructInfo(
                     addGuardRewritePlan, cascadesContext);
+            // 处理临时计划（用于 Pre-MV rewrite 模式）
             List<Pair<Plan, StructInfo>> tmpPlanUsedForRewrite = new ArrayList<>();
             for (Plan plan : cascadesContext.getStatementContext().getTmpPlanForMvRewrite()) {
                 Plan addGuardplan = exprRewriter
@@ -153,6 +166,7 @@ public class MTMVCache {
             return new MTMVCache(finalPlanStructInfoPair, addGuardRewritePlan, needCost
                     ? cascadesContext.getMemo().getRoot().getStatistics() : null, tmpPlanUsedForRewrite);
         } finally {
+            // 恢复状态
             createCacheContext.getStatementContext().setForceRecordTmpPlan(false);
             mvSqlStatementContext.setForceRecordTmpPlan(false);
             createCacheContext.getSessionVariable().enableMaterializedViewRewrite = originalRewriteFlag;

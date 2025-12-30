@@ -48,38 +48,68 @@ import java.util.stream.Collectors;
 /**SplitAggRule*/
 public abstract class SplitAggBaseRule {
     /**
-     * This functions is used to split bottom deduplicate Aggregate(phase1):
-     * e.g.select count(distinct a) group by b
-     *   agg(group by b, count(a); distinct global) ---phase2
-     *     +--agg(group by a,b; global) ---phase1
+     * 拆分去重聚合的第一阶段（phase1）
+     * 
+     * 这个方法用于将包含 DISTINCT 的聚合函数拆分为多个阶段。
+     * 第一阶段（phase1）负责对 DISTINCT 列和 GROUP BY 列进行去重和预聚合。
+     * 
+     * 示例：select count(distinct a) group by b
+     * 拆分后的计划结构：
+     *   agg(group by b, count(a); distinct global) ---phase2（第二阶段）
+     *     +--agg(group by a,b; global) ---phase1（第一阶段，本方法生成）
      *       +--hashShuffle(b)
-     * */
+     * 
+     * @param aggregate 逻辑聚合节点
+     * @param localAggGroupBySet 本地聚合的 GROUP BY 集合（包含 DISTINCT 列和原始 GROUP BY 列）
+     * @param inputToBufferParam 输入到缓冲区的聚合参数（用于非 DISTINCT 聚合函数）
+     * @param paramForAggFunc 聚合函数的参数（用于非 DISTINCT 聚合函数）
+     * @param localAggFunctionToAlias 本地聚合函数到别名的映射（输出参数，用于存储生成的别名）
+     * @param child 子计划
+     * @param partitionExpressions 分区表达式（用于数据分布）
+     * @return 第一阶段（phase1）的物理聚合节点
+     */
     protected PhysicalHashAggregate<? extends Plan> splitDeduplicateOnePhase(LogicalAggregate<? extends Plan> aggregate,
             Set<NamedExpression> localAggGroupBySet, AggregateParam inputToBufferParam, AggregateParam paramForAggFunc,
             Map<AggregateFunction, Alias> localAggFunctionToAlias, Plan child, List<Expression> partitionExpressions) {
+        // 步骤1: 处理非 DISTINCT 的聚合函数
+        // 对于非 DISTINCT 的聚合函数（如 sum、avg 等），在第一阶段也需要进行预聚合
+        // 创建 AggregateExpression 并包装为 Alias，存储到 localAggFunctionToAlias 中
         aggregate.getAggregateFunctions().stream()
-                .filter(aggFunc -> !aggFunc.isDistinct())
+                .filter(aggFunc -> !aggFunc.isDistinct())  // 只处理非 DISTINCT 的聚合函数
                 .collect(Collectors.toMap(
-                        expr -> expr,
+                        expr -> expr,  // key: 原始聚合函数
                         expr -> {
+                            // value: 创建本地聚合表达式（使用 paramForAggFunc 参数）
                             AggregateExpression localAggExpr = new AggregateExpression(expr, paramForAggFunc);
                             return new Alias(localAggExpr);
                         },
-                        (existing, replacement) -> existing,
-                        () -> localAggFunctionToAlias
+                        (existing, replacement) -> existing,  // 如果 key 已存在，保留现有的
+                        () -> localAggFunctionToAlias  // 使用提供的 map 作为结果容器
                 ));
+        
+        // 步骤2: 构建第一阶段聚合的输出表达式列表
+        // 输出包括：GROUP BY 的列 + 非 DISTINCT 聚合函数的别名
         List<NamedExpression> localAggOutput = ImmutableList.<NamedExpression>builder()
-                .addAll(localAggGroupBySet)
-                .addAll(localAggFunctionToAlias.values())
+                .addAll(localAggGroupBySet)  // 添加 GROUP BY 列
+                .addAll(localAggFunctionToAlias.values())  // 添加非 DISTINCT 聚合函数的别名
                 .build();
+        
+        // 步骤3: 将 GROUP BY 集合转换为表达式列表
         List<Expression> localAggGroupBy = Utils.fastToImmutableList(localAggGroupBySet);
+        
+        // 步骤4: 处理空聚合的特殊情况
+        // 检查是否同时满足：GROUP BY 为空 且 输出表达式为空
         boolean isGroupByEmptySelectEmpty = localAggGroupBy.isEmpty() && localAggOutput.isEmpty();
-        // be not recommend generate an aggregate node with empty group by and empty output,
-        // so add a null int slot to group by slot and output
+        // 不推荐生成空的聚合节点（GROUP BY 和输出都为空），因为：
+        // 1. 空的聚合节点没有实际意义
+        // 2. 可能导致后续处理出现问题（如 computeUniform 中的类型转换错误）
+        // 所以添加一个 NullLiteral 作为占位符到 GROUP BY 和输出中
         if (isGroupByEmptySelectEmpty) {
             localAggGroupBy = ImmutableList.of(new NullLiteral(TinyIntType.INSTANCE));
             localAggOutput = ImmutableList.of(new Alias(new NullLiteral(TinyIntType.INSTANCE)));
         }
+        
+        // 步骤5: 创建并返回第一阶段的物理聚合节点
         return new PhysicalHashAggregate<>(localAggGroupBy, localAggOutput, Optional.ofNullable(partitionExpressions),
                 inputToBufferParam, AggregateUtils.maybeUsingStreamAgg(localAggGroupBy, inputToBufferParam),
                 null, child);

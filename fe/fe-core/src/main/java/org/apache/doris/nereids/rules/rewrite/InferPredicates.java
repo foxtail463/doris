@@ -127,20 +127,63 @@ public class InferPredicates extends DefaultPlanRewriter<JobContext> implements 
         }
     }
 
+    /**
+     * 处理 LogicalFilter 节点，推导额外的谓词。
+     * 
+     * 核心流程：
+     * 1. 从子计划中拉取谓词并推导新的谓词（通过 UnequalPredicateInfer）
+     * 2. 移除子计划中已有的谓词（避免重复）
+     * 3. 如果推导出新谓词，创建新的 Filter；否则优化掉 Filter
+     * 
+     * 示例：
+     * 原始计划：
+     *   LogicalFilter(id = 5 OR id = 2 OR id > 10)
+     *     LogicalOlapScan(T1)
+     * 
+     * 处理过程：
+     * 1. pullUpPredicates(filter) 收集并推导谓词：
+     *    - 收集：id = 5, id = 2, id > 10
+     *    - 推导：id >= 2（通过 UnequalPredicateInfer）
+     *    - 结果：{id = 5, id = 2, id > 10, id >= 2}
+     * 
+     * 2. pullUpAllPredicates(filter.child()) 收集子计划的所有谓词：
+     *    - 子计划是 LogicalOlapScan，没有谓词
+     *    - 结果：{}
+     * 
+     * 3. inferredPredicates.removeAll(...) 移除重复：
+     *    - 移除后：{id = 5, id = 2, id > 10, id >= 2}
+     * 
+     * 4. 创建新的 Filter（包含推导出的谓词）
+     * 
+     * 为什么需要 removeAll(pullUpAllPredicates(filter.child()))：
+     * - 避免重复添加子计划中已有的谓词
+     * - 例如：如果子计划已经有 id = 5，就不需要在 Filter 中再次添加
+     * - pullUpAllPredicates 收集子计划的所有谓词（包括推导出的）
+     * - pullUpPredicates 只收集可以上拉的谓词（不包括推导出的）
+     */
     @Override
     public Plan visitLogicalFilter(LogicalFilter<? extends Plan> filter, JobContext context) {
+        // 如果 Filter 包含 FALSE 字面量，说明条件永远不满足，返回空关系
         if (filter.getConjuncts().contains(BooleanLiteral.FALSE)) {
             return new LogicalEmptyRelation(StatementScopeIdGenerator.newRelationId(), filter.getOutput());
         }
+        // 先递归处理子节点（自下而上处理）
         filter = visitChildren(this, filter, context);
+        // 从当前 Filter 及其子计划中拉取谓词，并通过 UnequalPredicateInfer 推导新的谓词
+        // 例如：id = 2 和 id > 10 可以推导出 id >= 2
         Set<Expression> inferredPredicates = pullUpPredicates(filter);
+        // 移除子计划中已有的谓词（避免重复添加）
+        // pullUpAllPredicates 收集子计划的所有谓词（包括推导出的），用于去重
         inferredPredicates.removeAll(pullUpAllPredicates(filter.child()));
+        // 如果没有推导出新的谓词，说明 Filter 是冗余的，可以直接返回子计划
         if (inferredPredicates.isEmpty()) {
             return filter.child();
         }
+        // 如果推导出的谓词和原来的谓词完全一样，返回原 Filter（避免不必要的重建）
         if (inferredPredicates.equals(filter.getConjuncts())) {
             return filter;
         } else {
+            // 推导出了新的谓词，创建新的 Filter 包含所有谓词（原始 + 推导出的）
             return new LogicalFilter<>(ImmutableSet.copyOf(inferredPredicates), filter.child());
         }
     }

@@ -182,15 +182,40 @@ Status RowsetBuilder::prepare_txn() {
     return tablet()->prepare_txn(_req.partition_id, _req.txn_id, _req.load_id, false);
 }
 
+/**
+ * RowsetBuilder::init：初始化 RowsetBuilder，准备写入 Rowset
+ * 
+ * 主要流程：
+ * 1. 获取 Tablet 对象
+ * 2. 如果是 Unique Key Merge-On-Write 模式，初始化 MowContext
+ * 3. 检查 Tablet 版本数量是否超限
+ * 4. 检查 Tablet 元数据序列化大小是否超限
+ * 5. 准备事务（prepare_txn）
+ * 6. 构建当前 Tablet Schema（处理部分更新、列映射等）
+ * 7. 创建 RowsetWriter（用于写入数据）
+ * 8. 注册到 PendingRowsets（防止被清理）
+ * 9. 创建 DeleteBitmap 计算令牌
+ * 
+ * @return 初始化状态
+ */
 Status RowsetBuilder::init() {
+    // 1. 从 StorageEngine 获取 Tablet 对象
     _tablet = DORIS_TRY(_engine.get_tablet(_req.tablet_id));
+    
+    // 2. 如果是 Unique Key Merge-On-Write 模式，初始化 MowContext
+    // MowContext 用于在写入时处理删除位图（Delete Bitmap）的计算
     std::shared_ptr<MowContext> mow_context;
     if (_tablet->enable_unique_key_merge_on_write()) {
         RETURN_IF_ERROR(init_mow_context(mow_context));
     }
 
+    // 3. 检查 Tablet 版本数量是否超过限制
+    // 如果版本数过多，会导致查询性能下降，需要触发 Compaction
     RETURN_IF_ERROR(check_tablet_version_count());
 
+    // 4. 检查 Tablet 元数据序列化大小是否超过限制
+    // 元数据大小 = 平均每个版本的元数据大小 × 版本总数（包括过期版本）
+    // 如果超过限制，说明版本过多，需要减少导入频率或调整配置
     auto version_count = tablet()->version_count() + tablet()->stale_version_count();
     if (tablet()->avg_rs_meta_serialize_size() * version_count >
         config::tablet_meta_serialize_size_limit) {
@@ -202,37 +227,53 @@ Status RowsetBuilder::init() {
                 config::tablet_meta_serialize_size_limit, _tablet->tablet_id());
     }
 
+    // 5. 准备事务（prepare_txn）
+    // 在 Tablet 的事务管理器中注册本次事务，防止并发冲突
     RETURN_IF_ERROR(prepare_txn());
 
+    // 6. 调试点：检查部分更新的列数量（仅在调试模式下执行）
     DBUG_EXECUTE_IF("BaseRowsetBuilder::init.check_partial_update_column_num", {
         if (_req.table_schema_param->partial_update_input_columns().size() !=
             dp->param<int>("column_num")) {
             return Status::InternalError("partial update input column num wrong!");
         };
     })
+    
+    // 7. 构建当前请求级别的 Tablet Schema
+    // 处理列映射、部分更新、物化视图等场景，生成实际写入时使用的 Schema
     // build tablet schema in request level
     RETURN_IF_ERROR(_build_current_tablet_schema(_req.index_id, _req.table_schema_param.get(),
                                                  *_tablet->tablet_schema()));
+    
+    // 8. 创建 RowsetWriterContext，配置写入参数
     RowsetWriterContext context;
-    context.txn_id = _req.txn_id;
-    context.load_id = _req.load_id;
-    context.rowset_state = PREPARED;
-    context.segments_overlap = OVERLAPPING;
-    context.tablet_schema = _tablet_schema;
-    context.newest_write_timestamp = UnixSeconds();
-    context.tablet_id = _req.tablet_id;
-    context.index_id = _req.index_id;
-    context.tablet = _tablet;
-    context.enable_segcompaction = true;
-    context.write_type = DataWriteType::TYPE_DIRECT;
-    context.mow_context = mow_context;
-    context.write_file_cache = _req.write_file_cache;
-    context.partial_update_info = _partial_update_info;
+    context.txn_id = _req.txn_id;                    // 事务 ID
+    context.load_id = _req.load_id;                  // 导入任务 ID
+    context.rowset_state = PREPARED;                 // Rowset 状态：PREPARED（准备中）
+    context.segments_overlap = OVERLAPPING;          // Segment 重叠：OVERLAPPING（允许重叠）
+    context.tablet_schema = _tablet_schema;          // Tablet Schema（已处理列映射等）
+    context.newest_write_timestamp = UnixSeconds();  // 最新写入时间戳
+    context.tablet_id = _req.tablet_id;              // Tablet ID
+    context.index_id = _req.index_id;                // 索引 ID（主表或物化视图）
+    context.tablet = _tablet;                        // Tablet 对象
+    context.enable_segcompaction = true;             // 启用 Segment Compaction（小文件合并）
+    context.write_type = DataWriteType::TYPE_DIRECT; // 写入类型：直接写入
+    context.mow_context = mow_context;               // Merge-On-Write 上下文
+    context.write_file_cache = _req.write_file_cache; // 是否写入文件缓存
+    context.partial_update_info = _partial_update_info; // 部分更新信息
+    
+    // 9. 创建 RowsetWriter（用于写入数据到 Rowset）
     _rowset_writer = DORIS_TRY(_tablet->create_rowset_writer(context, false));
+    
+    // 10. 将 Rowset 注册到 PendingRowsets
+    // 防止在写入过程中 Rowset 被清理，保证数据安全
     _pending_rs_guard = _engine.pending_local_rowsets().add(context.rowset_id);
 
+    // 11. 创建 DeleteBitmap 计算令牌
+    // 用于异步计算删除位图（在 Merge-On-Write 模式下需要）
     _calc_delete_bitmap_token = _engine.calc_delete_bitmap_executor()->create_token();
 
+    // 12. 标记初始化完成
     _is_init = true;
     return Status::OK();
 }

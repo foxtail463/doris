@@ -53,9 +53,15 @@ SpillStreamManager::SpillStreamManager(
 
 Status SpillStreamManager::init() {
     LOG(INFO) << "init spill stream manager";
+    
+    // 步骤 1: 初始化所有 SpillDataDir
+    // 调用每个 SpillDataDir 的 init() 方法，检查路径、更新容量、注册监控指标
     RETURN_IF_ERROR(_init_spill_store_map());
 
+    // 步骤 2: 为每个 SpillDataDir 创建必要的目录结构
     for (const auto& [path, store] : _spill_store_map) {
+        // 2.1 创建 GC 根目录（如果不存在）
+        // GC 目录用于存放待清理的 spill 文件
         auto gc_dir_root_dir = store->get_spill_data_gc_path();
         bool exists = true;
         RETURN_IF_ERROR(io::global_local_filesystem()->exists(gc_dir_root_dir, &exists));
@@ -63,26 +69,38 @@ Status SpillStreamManager::init() {
             RETURN_IF_ERROR(io::global_local_filesystem()->create_directory(gc_dir_root_dir));
         }
 
+        // 2.2 处理 spill 数据目录
         auto spill_dir = store->get_spill_data_path();
         RETURN_IF_ERROR(io::global_local_filesystem()->exists(spill_dir, &exists));
         if (!exists) {
+            // 如果 spill 目录不存在，直接创建
             RETURN_IF_ERROR(io::global_local_filesystem()->create_directory(spill_dir));
         } else {
+            // 如果 spill 目录已存在（可能是上次异常退出留下的）
+            // 将其移动到 GC 目录，由后台 GC 线程清理
             auto suffix = ToStringFromUnixMillis(UnixMillis());
             auto gc_dir = store->get_spill_data_gc_path(suffix);
             if (std::filesystem::exists(gc_dir)) {
+                // GC 目录已存在（极小概率），记录警告日志
                 LOG(WARNING) << "gc dir already exists: " << gc_dir;
             }
+            // 使用 rename 操作原子性地移动目录
+            // 注意：这里使用 (void) 忽略返回值，因为即使失败也不影响后续创建新目录
             (void)io::global_local_filesystem()->rename(spill_dir, gc_dir);
+            // 重新创建空的 spill 目录
             RETURN_IF_ERROR(io::global_local_filesystem()->create_directory(spill_dir));
         }
     }
 
+    // 步骤 3: 启动 GC 后台线程
+    // GC 线程定期清理 spill_gc 目录下的过期文件，避免磁盘空间被占用
     RETURN_IF_ERROR(Thread::create(
             "Spill", "spill_gc_thread", [this]() { this->_spill_gc_thread_callback(); },
             &_spill_gc_thread));
     LOG(INFO) << "spill gc thread started";
 
+    // 步骤 4: 初始化监控指标
+    // 注册 spill_write_bytes 和 spill_read_bytes 等指标
     _init_metrics();
 
     return Status::OK();

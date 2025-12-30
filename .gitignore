@@ -9,6 +9,7 @@
 *.so.tmp
 *.flattened-pom.xml
 core.*
+*.idx
 
 # ignore file with specifiy name anywhere
 .DS_Store
@@ -37,7 +38,7 @@ __pycache__
 **/.idea/
 !.idea/vcs.xml
 !.idea/icon.svg
-**/.vscode/
+# **/.vscode/
 **/.fleet/
 
 # docs
@@ -142,4 +143,3 @@ docker/runtime/be/resource/apache-doris/
 # other
 compile_commands.json
 .github
-

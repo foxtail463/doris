@@ -64,22 +64,59 @@ public class InitMaterializationContextHook implements PlannerHook {
     public static final Logger LOG = LogManager.getLogger(InitMaterializationContextHook.class);
     public static final InitMaterializationContextHook INSTANCE = new InitMaterializationContextHook();
 
+    /**
+     * 在 rewrite 阶段之后调用。收集查询表的分区信息用于 MV 匹配，
+     * 然后为每个可用的 MV 初始化 MaterializationContext。
+     */
     @Override
     public void afterRewrite(CascadesContext cascadesContext) {
-        // collect partitions table used, this is for query rewrite by materialized view
-        // this is needed before init hook, because compare partition version in init hook would use this
+        // 收集查询表使用的分区信息，必须在 initMaterializationContext 之前执行，
+        // 因为 MV 匹配时需要比较分区版本
         if (cascadesContext.getStatementContext().isNeedPreMvRewrite()) {
+            // Pre-MV rewrite 模式：从临时计划中收集分区信息
+            // 
+            // 为什么需要从临时计划收集？
+            // 1. 临时计划（tmpPlanForMvRewrite）是在 RBO 阶段保存的，经过了预处理：
+            //    - CTE 重写（CTE 内联或展开）
+            //    - 表达式规范化（ExpressionNormalizationAndOptimization）
+            //    - 子查询去嵌套（Subquery unnesting）
+            //    这些预处理使得计划结构更稳定，更适合进行物化视图匹配
+            // 
+            // 2. Pre-MV Rewrite 阶段会使用临时计划进行物化视图重写：
+            //    - preMaterializedViewRewrite() 会遍历 tmpPlanForMvRewrite
+            //    - 对每个临时计划进行物化视图重写
+            //    - 因此分区信息也应该从临时计划中收集，以保持一致性
+            // 
+            // 3. 如果从 rewrite plan 收集，可能会收集到错误的分区信息：
+            //    - rewrite plan 可能还没有经过 Pre-MV Rewrite 的优化
+            //    - 计划结构可能与最终用于 MV 匹配的计划不一致
+            //    - 导致分区匹配失败或错误
+            // 
+            // 示例场景：
+            // - 查询包含 CTE：WITH cte AS (SELECT * FROM orders) SELECT * FROM cte
+            // - 临时计划：CTE 已内联，结构为 SELECT * FROM orders
+            // - rewrite plan：可能还包含 CTE 节点，结构不一致
+            // - 从临时计划收集：能正确识别 orders 表的分区
+            // - 从 rewrite plan 收集：可能无法正确识别分区（因为 CTE 节点）
             for (Plan plan : cascadesContext.getStatementContext().getTmpPlanForMvRewrite()) {
                 MaterializedViewUtils.collectTableUsedPartitions(plan, cascadesContext);
             }
         } else {
+            // 普通模式：从当前 rewrite plan 中收集分区信息
+            // 
+            // 为什么可以直接从 rewrite plan 收集？
+            // 1. 普通模式下没有 Pre-MV Rewrite，不需要临时计划
+            // 2. rewrite plan 就是最终用于 MV 匹配的计划
+            // 3. 分区信息直接从 rewrite plan 收集即可
             MaterializedViewUtils.collectTableUsedPartitions(cascadesContext.getRewritePlan(), cascadesContext);
         }
+        // 记录耗时用于性能分析
         StatementContext statementContext = cascadesContext.getStatementContext();
         if (statementContext.getConnectContext().getExecutor() != null) {
             statementContext.getConnectContext().getExecutor().getSummaryProfile()
                     .setNereidsCollectTablePartitionFinishTime(TimeUtils.getStartTimeMs());
         }
+        // 为每个候选 MV 构建 MaterializationContext
         initMaterializationContext(cascadesContext);
     }
 
@@ -92,25 +129,28 @@ public class InitMaterializationContextHook implements PlannerHook {
     }
 
     /**
-     * Init materialization context
-     * @param cascadesContext current cascadesContext in the planner
+     * 初始化物化视图上下文，为后续 MV 重写做准备。
+     * 会分别创建同步 MV 和异步 MV 的 MaterializationContext。
      */
     protected void doInitMaterializationContext(CascadesContext cascadesContext) {
+        // 调试模式下跳过 MV 重写
         if (cascadesContext.getConnectContext().getSessionVariable().isInDebugMode()) {
             LOG.info("MaterializationContext init return because is in debug mode, current queryId is {}",
                     cascadesContext.getConnectContext().getQueryIdentifier());
             return;
         }
+        // 短路查询（如点查）跳过 MV 重写
         if (cascadesContext.getStatementContext().isShortCircuitQuery()) {
             LOG.debug("MaterializationContext init return because isShortCircuitQuery, current queryId is {}",
                     cascadesContext.getConnectContext().getQueryIdentifier());
             return;
         }
+        // 收集查询涉及的所有表
         Set<TableIf> collectedTables = Sets.newHashSet(cascadesContext.getStatementContext().getTables().values());
         if (collectedTables.isEmpty()) {
             return;
         }
-        // Create sync materialization context
+        // 为每个 OlapTable 创建同步 MV（Rollup）的上下文
         for (TableIf tableIf : collectedTables) {
             if (tableIf instanceof OlapTable) {
                 for (MaterializationContext context : createSyncMvContexts(
@@ -120,7 +160,7 @@ public class InitMaterializationContextHook implements PlannerHook {
             }
         }
 
-        // Create async materialization context
+        // 创建异步 MV（MTMV）的上下文
         for (MaterializationContext context : createAsyncMaterializationContext(cascadesContext,
                 collectedTables)) {
             cascadesContext.addMaterializationContext(context);
@@ -189,8 +229,15 @@ public class InitMaterializationContextHook implements PlannerHook {
                         }));
     }
 
+    /**
+     * 为异步物化视图（MTMV）创建 MaterializationContext。
+     * 1. 获取查询表关联的所有可用 MTMV
+     * 2. 为每个 MTMV 获取或生成缓存（包含已重写的计划和 StructInfo）
+     * 3. 根据是否需要 Pre-MV rewrite 选择不同的 plan 和 StructInfo
+     */
     private List<MaterializationContext> createAsyncMaterializationContext(CascadesContext cascadesContext,
             Set<TableIf> usedTables) {
+        // 获取与查询表相关的所有可用 MTMV
         Set<MTMV> availableMTMVs;
         try {
             availableMTMVs = getAvailableMTMVs(usedTables, cascadesContext);
@@ -208,18 +255,20 @@ public class InitMaterializationContextHook implements PlannerHook {
         for (MTMV materializedView : availableMTMVs) {
             MTMVCache mtmvCache = null;
             try {
+                // 获取或生成 MTMV 的缓存，包含解析、分析、重写后的计划
                 mtmvCache = materializedView.getOrGenerateCache(cascadesContext.getConnectContext());
                 if (mtmvCache == null) {
                     continue;
                 }
-                // For async materialization context, the cascades context when construct the struct info maybe
-                // different from the current cascadesContext
-                // so regenerate the struct info table bitset
+                // 异步 MV 的 StructInfo 可能是在不同的 CascadesContext 中构建的，
+                // 需要根据当前上下文重新生成 table bitset
                 if (!cascadesContext.getStatementContext().isNeedPreMvRewrite()) {
+                    // 普通模式：使用完整重写后的计划
                     asyncMaterializationContext.add(doCreateAsyncMaterializationContext(materializedView,
                             mtmvCache, mtmvCache.getAllRulesRewrittenPlanAndStructInfo(), cascadesContext
                     ));
                 } else {
+                    // Pre-MV rewrite 模式：使用部分重写的计划（多个 StructInfo）
                     for (Pair<Plan, StructInfo> planAndStructInfo
                             : mtmvCache.getPartRulesRewrittenPlanAndStructInfos()) {
                         asyncMaterializationContext.add(doCreateAsyncMaterializationContext(materializedView,
@@ -232,6 +281,7 @@ public class InitMaterializationContextHook implements PlannerHook {
                         cascadesContext.getConnectContext().getQueryIdentifier()), e);
             }
         }
+        // 根据 hint 过滤，只保留用户指定的 MV
         return getMaterializationContextByHint(asyncMaterializationContext);
     }
 

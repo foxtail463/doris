@@ -168,62 +168,81 @@ public class AgentBatchTask implements Runnable {
 
     @Override
     public void run() {
+        // 遍历每个后端节点，逐个处理其对应的任务列表
         for (Long backendId : this.backendIdToTasks.keySet()) {
             BackendService.Client client = null;
             TNetworkAddress address = null;
             boolean ok = false;
             String errMsg = "";
+            // 收集要发送给当前后端的任务请求
             List<TAgentTaskRequest> agentTaskRequests = new LinkedList<TAgentTaskRequest>();
             try {
+                // 获取后端节点信息，检查是否存活
                 Backend backend = Env.getCurrentSystemInfo().getBackend(backendId);
                 if (backend == null || !backend.isAlive()) {
                     errMsg = String.format("backend %d is not alive", backendId);
                     continue;
                 }
+                // 获取该后端的所有任务
                 List<AgentTask> tasks = this.backendIdToTasks.get(backendId);
-                // create AgentClient
+                
+                // 创建 Agent 客户端连接
                 String host = FeConstants.runningUnitTest ? "127.0.0.1" : backend.getHost();
                 address = new TNetworkAddress(host, backend.getBePort());
                 client = ClientPool.backendPool.borrowObject(address);
+                
+                // 遍历该后端的所有任务，按批次大小分批提交
                 for (AgentTask task : tasks) {
                     agentTaskRequests.add(toAgentTaskRequest(task));
+                    // 达到批次大小时，立即提交当前批次
                     if (agentTaskRequests.size() >= batchSize) {
                         submitTasks(backendId, client, agentTaskRequests);
                         agentTaskRequests.clear();
                     }
                 }
+                // 提交剩余的任务（不足批次大小的部分）
                 submitTasks(backendId, client, agentTaskRequests);
                 ok = true;
             } catch (Exception e) {
+                // 单元测试环境下忽略异常，标记为成功
                 if (org.apache.doris.common.FeConstants.runningUnitTest) {
                     ok = true;
                 } else {
                     LOG.warn("task exec error. backend[{}]", backendId, e);
                     errMsg = String.format("task exec error: %s. backend[%d]", e.getMessage(), backendId);
+                    
+                    // 特殊处理：Broken pipe 错误时记录任务大小信息，帮助调试大消息问题
                     if (!agentTaskRequests.isEmpty() && errMsg.contains("Broken pipe")) {
-                        // Log the task binary message size and the max task type, to help debug the
-                        // large thrift message size issue.
+                        // 记录每个任务的类型和二进制消息大小
                         List<Pair<TTaskType, Long>> taskTypeAndSize = agentTaskRequests.stream()
                                 .map(req -> Pair.of(req.getTaskType(), ThriftUtils.getBinaryMessageSize(req)))
                                 .collect(Collectors.toList());
+                        // 找出最大的任务类型和大小
                         Pair<TTaskType, Long> maxTaskTypeAndSize = taskTypeAndSize.stream()
                                 .max((p1, p2) -> Long.compare(p1.value(), p2.value()))
                                 .orElse(null);  // taskTypeAndSize is not empty
                         TTaskType maxType = maxTaskTypeAndSize.first;
                         long maxSize = maxTaskTypeAndSize.second;
                         long totalSize = taskTypeAndSize.stream().map(Pair::value).reduce(0L, Long::sum);
+                        
+                        // 记录详细的调试信息：任务数量、总大小、最大任务类型及大小
                         LOG.warn("submit {} tasks to backend[{}], total size: {}, max task type: {}, size: {}. msg: {}",
                                 agentTaskRequests.size(), backendId, totalSize, maxType, maxSize, e.getMessage());
                     }
                 }
             } finally {
+                // 资源清理：根据执行结果决定是归还还是废弃客户端连接
                 if (ok) {
+                    // 执行成功：归还客户端到连接池
                     ClientPool.backendPool.returnObject(address, client);
                 } else {
+                    // 执行失败：废弃客户端连接，避免使用有问题的连接
                     ClientPool.backendPool.invalidateObject(address, client);
+                    // 获取该后端的所有任务，标记为失败
                     List<AgentTask> tasks = this.backendIdToTasks.get(backendId);
                     for (AgentTask task : tasks) {
                         task.failedWithMsg(errMsg);
+                        // 特殊处理：Socket 关闭错误时设置网络错误码
                         if (errMsg.contains("Socket is closed")) {
                             task.setErrorCode(TStatusCode.NETWORK_ERROR);
                         }

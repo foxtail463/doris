@@ -2044,20 +2044,28 @@ public class FrontendServiceImpl implements FrontendService.Iface {
 
     @Override
     public TStreamLoadPutResult streamLoadPut(TStreamLoadPutRequest request) {
+        // ==================== 第一步：获取客户端地址 ====================
         String clientAddr = getClientAddrAsString();
         if (LOG.isDebugEnabled()) {
             LOG.debug("receive stream load put request: {}, backend: {}", request, clientAddr);
         }
 
+        // ==================== 第二步：初始化结果对象 ====================
         TStreamLoadPutResult result = new TStreamLoadPutResult();
         TStatus status = new TStatus(TStatusCode.OK);
         result.setStatus(status);
 
+        // ==================== 第三步：创建Stream Load处理器 ====================
+        // 创建StreamLoadHandler来处理Stream Load请求
+        // 这里传入null作为indexId，表示单表加载
         StreamLoadHandler streamLoadHandler = new StreamLoadHandler(request, null, result, clientAddr);
 
         try {
+            // ==================== 第四步：设置云集群信息 ====================
+            // 如果是云模式，需要设置云集群相关信息
             streamLoadHandler.setCloudCluster();
 
+            // ==================== 第五步：处理工作负载组 ====================
             List<TPipelineWorkloadGroup> tWorkloadGroupList = null;
             // mysql load request not carry user info, need fix it later.
             boolean hasUserName = !StringUtils.isEmpty(request.getUser());
@@ -2067,33 +2075,47 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                         .map(e -> e.toThrift())
                         .collect(Collectors.toList());
             }
+            
+            // ==================== 第六步：处理不同类型的加载请求 ====================
             if (!Strings.isNullOrEmpty(request.getLoadSql())) {
+                // 如果有Load SQL，使用HTTP流式处理
                 httpStreamPutImpl(request, result);
                 if (tWorkloadGroupList != null && tWorkloadGroupList.size() > 0) {
                     result.pipeline_params.setWorkloadGroups(tWorkloadGroupList);
                 }
                 return result;
             } else {
+                // 否则，生成执行计划
+                // 这里调用StreamLoadHandler.generatePlan()方法
+                // 该方法会遍历所有表并为每个表调用generatePlan(OlapTable table)
                 streamLoadHandler.generatePlan();
+                // 获取生成的执行计划并设置到结果中
                 result.setPipelineParams((TPipelineFragmentParams) streamLoadHandler.getFragmentParams().get(0));
             }
+            
+            // ==================== 第七步：设置工作负载组 ====================
             if (tWorkloadGroupList != null && tWorkloadGroupList.size() > 0) {
                 result.pipeline_params.setWorkloadGroups(tWorkloadGroupList);
             }
         } catch (MetaNotFoundException e) {
+            // ==================== 异常处理：元数据未找到 ====================
             LOG.warn("failed to rollback txn, id: {}, label: {}", request.getTxnId(), request.getLabel(), e);
             status.setStatusCode(TStatusCode.NOT_FOUND);
             status.addToErrorMsgs(e.getMessage());
         } catch (UserException e) {
+            // ==================== 异常处理：用户异常 ====================
             LOG.warn("failed to get stream load plan, label: {}", request.getLabel(), e);
             status.setStatusCode(TStatusCode.ANALYSIS_ERROR);
             status.addToErrorMsgs(e.getMessage());
         } catch (Throwable e) {
+            // ==================== 异常处理：未知异常 ====================
             LOG.warn("stream load catch unknown result, label: {}", request.getLabel(), e);
             status.setStatusCode(TStatusCode.INTERNAL_ERROR);
             status.addToErrorMsgs(e.getClass().getSimpleName() + ": " + Strings.nullToEmpty(e.getMessage()));
             return result;
         } finally {
+            // ==================== 清理工作 ====================
+            // 清理连接上下文
             ConnectContext.remove();
         }
         return result;

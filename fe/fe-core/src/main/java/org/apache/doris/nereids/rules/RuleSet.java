@@ -265,36 +265,65 @@ public class RuleSet {
             .addAll(OTHER_REORDER_RULES)
             .build();
 
+    /**
+     * 物化视图重写规则集合，用于主查询的 CBO（基于成本的优化）阶段。
+     * 
+     * 这些规则用于将查询计划重写为使用物化视图，规则名称中的操作顺序表示从外到内的计划结构。
+     * 例如：MaterializedViewProjectJoinRule 匹配 "Project on Join" 模式。
+     */
     public static final List<Rule> MATERIALIZED_VIEW_IN_CBO_RULES = planRuleFactories()
-            .add(MaterializedViewProjectJoinRule.INSTANCE)
-            .add(MaterializedViewFilterJoinRule.INSTANCE)
-            .add(MaterializedViewFilterProjectJoinRule.INSTANCE)
-            .add(MaterializedViewProjectFilterJoinRule.INSTANCE)
-            .add(MaterializedViewAggregateRule.INSTANCE)
-            .add(MaterializedViewProjectAggregateRule.INSTANCE)
-            .add(MaterializedViewFilterAggregateRule.INSTANCE)
-            .add(MaterializedViewProjectFilterAggregateRule.INSTANCE)
-            .add(MaterializedViewFilterProjectAggregateRule.INSTANCE)
-            .add(MaterializedViewFilterScanRule.INSTANCE)
-            .add(MaterializedViewFilterProjectScanRule.INSTANCE)
-            .add(MaterializedViewProjectScanRule.INSTANCE)
-            .add(MaterializedViewProjectFilterScanRule.INSTANCE)
-            .add(MaterializedViewAggregateOnNoneAggregateRule.INSTANCE)
-            .add(MaterializedViewOnlyScanRule.INSTANCE)
-            .add(MaterializedViewLimitScanRule.INSTANCE)
-            .add(MaterializedViewLimitJoinRule.INSTANCE)
-            .add(MaterializedViewLimitAggregateRule.INSTANCE)
-            .add(MaterializedViewTopNAggregateRule.INSTANCE)
-            .add(MaterializedViewTopNJoinRule.INSTANCE)
-            .add(MaterializedViewTopNScanRule.INSTANCE)
-            .add(MaterializedViewWindowScanRule.INSTANCE)
-            .add(MaterializedViewWindowJoinRule.INSTANCE)
-            .add(MaterializedViewWindowAggregateRule.INSTANCE)
+            // ==================== Join 相关规则 ====================
+            // 匹配包含 Join 操作的查询，尝试用物化视图替换 Join 及其上层的操作
+            .add(MaterializedViewProjectJoinRule.INSTANCE)              // Project on Join：匹配 SELECT ... FROM t1 JOIN t2 模式
+            .add(MaterializedViewFilterJoinRule.INSTANCE)               // Filter on Join：匹配 WHERE ... FROM t1 JOIN t2 模式
+            .add(MaterializedViewFilterProjectJoinRule.INSTANCE)        // Filter on Project on Join：匹配 WHERE ... SELECT ... FROM t1 JOIN t2 模式
+            .add(MaterializedViewProjectFilterJoinRule.INSTANCE)        // Project on Filter on Join：匹配 SELECT ... WHERE ... FROM t1 JOIN t2 模式
+            
+            // ==================== Aggregate 相关规则 ====================
+            // 匹配包含聚合操作的查询，尝试用物化视图替换聚合及其上层的操作
+            .add(MaterializedViewAggregateRule.INSTANCE)                // Aggregate：匹配 SELECT SUM(...) FROM ... GROUP BY ... 模式
+            .add(MaterializedViewProjectAggregateRule.INSTANCE)         // Project on Aggregate：匹配 SELECT ... FROM (SELECT SUM(...) FROM ... GROUP BY ...) 模式
+            .add(MaterializedViewFilterAggregateRule.INSTANCE)          // Filter on Aggregate：匹配 WHERE ... SELECT SUM(...) FROM ... GROUP BY ... 模式
+            .add(MaterializedViewProjectFilterAggregateRule.INSTANCE)   // Project on Filter on Aggregate：匹配 SELECT ... WHERE ... SELECT SUM(...) FROM ... GROUP BY ... 模式
+            .add(MaterializedViewFilterProjectAggregateRule.INSTANCE)   // Filter on Project on Aggregate：匹配 WHERE ... SELECT ... FROM (SELECT SUM(...) FROM ... GROUP BY ...) 模式
+            
+            // ==================== Scan 相关规则 ====================
+            // 匹配包含表扫描的查询，尝试用物化视图替换扫描及其上层的操作
+            .add(MaterializedViewFilterScanRule.INSTANCE)               // Filter on Scan：匹配 SELECT * FROM table WHERE ... 模式
+            .add(MaterializedViewFilterProjectScanRule.INSTANCE)        // Filter on Project on Scan：匹配 WHERE ... SELECT ... FROM table 模式
+            .add(MaterializedViewProjectScanRule.INSTANCE)              // Project on Scan：匹配 SELECT col1, col2 FROM table 模式
+            .add(MaterializedViewProjectFilterScanRule.INSTANCE)        // Project on Filter on Scan：匹配 SELECT col1, col2 FROM table WHERE ... 模式
+            .add(MaterializedViewAggregateOnNoneAggregateRule.INSTANCE) // Aggregate on non-aggregate：匹配在非聚合查询上应用聚合的模式
+            .add(MaterializedViewOnlyScanRule.INSTANCE)                 // Only Scan：匹配直接扫描表的模式，用于直接使用物化视图替换基表
+            
+            // ==================== Limit 相关规则 ====================
+            // 匹配包含 LIMIT 操作的查询，尝试用物化视图替换 Limit 及其下层的操作
+            .add(MaterializedViewLimitScanRule.INSTANCE)                 // Limit on Scan：匹配 SELECT * FROM table LIMIT n 模式
+            .add(MaterializedViewLimitJoinRule.INSTANCE)                 // Limit on Join：匹配 SELECT * FROM t1 JOIN t2 LIMIT n 模式
+            .add(MaterializedViewLimitAggregateRule.INSTANCE)            // Limit on Aggregate：匹配 SELECT SUM(...) FROM ... GROUP BY ... LIMIT n 模式
+            
+            // ==================== TopN 相关规则 ====================
+            // 匹配包含 TopN（ORDER BY ... LIMIT）操作的查询，尝试用物化视图替换 TopN 及其下层的操作
+            .add(MaterializedViewTopNAggregateRule.INSTANCE)            // TopN on Aggregate：匹配 SELECT SUM(...) FROM ... GROUP BY ... ORDER BY ... LIMIT n 模式
+            .add(MaterializedViewTopNJoinRule.INSTANCE)                  // TopN on Join：匹配 SELECT * FROM t1 JOIN t2 ORDER BY ... LIMIT n 模式
+            .add(MaterializedViewTopNScanRule.INSTANCE)                  // TopN on Scan：匹配 SELECT * FROM table ORDER BY ... LIMIT n 模式
+            
+            // ==================== Window 相关规则 ====================
+            // 匹配包含窗口函数的查询，尝试用物化视图替换 Window 及其下层的操作
+            .add(MaterializedViewWindowScanRule.INSTANCE)                // Window on Scan：匹配 SELECT ROW_NUMBER() OVER(...) FROM table 模式
+            .add(MaterializedViewWindowJoinRule.INSTANCE)                // Window on Join：匹配 SELECT ROW_NUMBER() OVER(...) FROM t1 JOIN t2 模式
+            .add(MaterializedViewWindowAggregateRule.INSTANCE)          // Window on Aggregate：匹配 SELECT ROW_NUMBER() OVER(...) FROM (SELECT SUM(...) FROM ... GROUP BY ...) 模式
             .build();
 
+    /**
+     * 物化视图重写规则集合，用于 Pre-MV Rewrite 阶段（RBO 阶段相关的特殊优化阶段）。
+     * 
+     * 包含所有 MATERIALIZED_VIEW_IN_CBO_RULES 的规则，并额外添加一个规则用于处理
+     * Project-Filter-Project-Join 这种复杂的嵌套模式。
+     */
     public static final List<Rule> MATERIALIZED_VIEW_IN_RBO_RULES = planRuleFactories()
             .addAll(MATERIALIZED_VIEW_IN_CBO_RULES)
-            .add(MaterializedViewProjectFilterProjectJoinRule.INSTANCE)
+            .add(MaterializedViewProjectFilterProjectJoinRule.INSTANCE) // Project on Filter on Project on Join：匹配 SELECT ... WHERE ... SELECT ... FROM t1 JOIN t2 模式
             .build();
 
     public static final List<Rule> DPHYP_REORDER_RULES = ImmutableList.<Rule>builder()

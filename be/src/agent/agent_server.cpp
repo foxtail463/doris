@@ -263,49 +263,61 @@ void AgentServer::cloud_start_workers(CloudStorageEngine& engine, ExecEnv* exec_
             [&cluster_info = _cluster_info] { report_index_policy_callback(cluster_info); }));
 }
 
-// TODO(lingbin): each task in the batch may have it own status or FE must check and
-// resend request when something is wrong(BE may need some logic to guarantee idempotence.
+// TODO(lingbin): 批处理中的每个任务可能有自己的状态，或者FE必须检查
+// 当出现问题时重新发送请求（BE可能需要一些逻辑来保证幂等性）
 void AgentServer::submit_tasks(TAgentResult& agent_result,
                                const std::vector<TAgentTaskRequest>& tasks) {
-    Status ret_st;
+    Status ret_st;  // 返回状态
 
-    // TODO check cluster_info here if it is the same with that of heartbeat rpc
+    // TODO: 在这里检查cluster_info是否与心跳RPC中的相同
+    // 检查是否已经收到FE Master的心跳信息
     if (_cluster_info->master_fe_addr.hostname.empty() || _cluster_info->master_fe_addr.port == 0) {
         Status st = Status::Cancelled("Have not get FE Master heartbeat yet");
         st.to_thrift(&agent_result.status);
         return;
     }
 
+    // 遍历所有任务，逐个提交
     for (auto&& task : tasks) {
+        // 记录RPC日志，打印任务详情
         VLOG_RPC << "submit one task: " << apache::thrift::ThriftDebugString(task).c_str();
+        
         auto task_type = task.task_type;
+        // 特殊处理：将REALTIME_PUSH类型转换为PUSH类型
         if (task_type == TTaskType::REALTIME_PUSH) {
             task_type = TTaskType::PUSH;
         }
-        int64_t signature = task.signature;
+        
+        int64_t signature = task.signature;  // 获取任务签名
+        
+        // 根据任务类型查找对应的工作池
         if (auto it = _workers.find(task_type); it != _workers.end()) {
-            auto& worker = it->second;
-            ret_st = worker->submit_task(task);
+            auto& worker = it->second;  // 获取工作池引用
+            ret_st = worker->submit_task(task);  // 提交任务到工作池
         } else {
+            // 如果找不到对应的工作池，返回错误
             ret_st = Status::InvalidArgument("task(signature={}, type={}) has wrong task type",
                                              signature, task.task_type);
         }
 
+        // 处理任务提交失败的情况
         if (!ret_st.ok()) {
             LOG_WARNING("failed to submit task").tag("task", task).error(ret_st);
-            // For now, all tasks in the batch share one status, so if any task
-            // was failed to submit, we can only return error to FE(even when some
-            // tasks have already been successfully submitted).
-            // However, Fe does not check the return status of submit_tasks() currently,
-            // and it is not sure that FE will retry when something is wrong, so here we
-            // only print an warning log and go on(i.e. do not break current loop),
-            // to ensure every task can be submitted once. It is OK for now, because the
-            // ret_st can be error only when it encounters an wrong task_type and
-            // req-member in TAgentTaskRequest, which is basically impossible.
-            // TODO(lingbin): check the logic in FE again later.
+            
+            // 当前设计说明：
+            // 1. 批处理中的所有任务共享一个状态，所以如果任何任务提交失败，
+            //    我们只能向FE返回错误（即使某些任务已经成功提交）
+            // 2. 但是，FE目前不检查submit_tasks()的返回状态，
+            //    也不确定FE在出现问题时是否会重试
+            // 3. 因此这里只打印警告日志并继续执行（不中断当前循环），
+            //    确保每个任务都能被提交一次
+            // 4. 目前这样是可以的，因为ret_st只有在遇到错误的task_type和
+            //    TAgentTaskRequest中的req-member时才会出错，这基本上是不可能的
+            // TODO(lingbin): 稍后再次检查FE中的逻辑
         }
     }
 
+    // 将最终状态转换为Thrift格式并设置到结果中
     ret_st.to_thrift(&agent_result.status);
 }
 

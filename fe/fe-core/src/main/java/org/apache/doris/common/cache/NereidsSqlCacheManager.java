@@ -90,14 +90,20 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * NereidsSqlCacheManager
+ * Nereids SQL 缓存管理器。
+ * <p>
+ * 负责维护前端（FE）中 Nereids 引擎的 SQL 缓存，包括：缓存创建、命中检查、失效处理以及配置热更新。
+ * 缓存底层使用 Caffeine，支持基于访问时间的过期和容量限制，同时使用软引用配合 JVM 内存回收。
  */
 public class NereidsSqlCacheManager {
     private static final Logger LOG = LogManager.getLogger(NereidsSqlCacheManager.class);
-    // key: <ctl.db>:<user>:<sql>
+    /** 缓存键格式：<catalog.database>:<user>:<sql 或 md5>；值为对应的上下文信息。 */
     // value: SqlCacheContext
     private volatile Cache<String, SqlCacheContext> sqlCaches;
 
+    /**
+     * 构造函数：根据当前配置初始化 SQL 缓存。
+     */
     public NereidsSqlCacheManager() {
         sqlCaches = buildSqlCaches(
                 Config.sql_cache_manage_num,
@@ -105,11 +111,15 @@ public class NereidsSqlCacheManager {
         );
     }
 
+    /** 仅用于测试场景的访问入口。 */
     @VisibleForTesting
     public Cache<String, SqlCacheContext> getSqlCaches() {
         return sqlCaches;
     }
 
+    /**
+     * 使引用指定表的所有缓存失效。
+     */
     public void invalidateAboutTable(TableIf tableIf) {
         Set<String> invalidateKeys = new LinkedHashSet<>();
         FullTableName invalidateTableName = null;
@@ -126,6 +136,7 @@ public class NereidsSqlCacheManager {
         for (Entry<String, SqlCacheContext> kv : sqlCaches.asMap().entrySet()) {
             String key = kv.getKey();
             SqlCacheContext context = kv.getValue();
+            // 缓存中记录了查询涉及的表及其版本，逐个比对是否命中当前待失效的表
             for (Entry<FullTableName, TableVersion> nameToVersion : context.getUsedTables().entrySet()) {
                 FullTableName tableName = nameToVersion.getKey();
                 TableVersion tableVersion = nameToVersion.getValue();
@@ -149,6 +160,9 @@ public class NereidsSqlCacheManager {
         sqlCaches.invalidateAll();
     }
 
+    /**
+     * 在动态修改 SQL Cache 相关配置时调用，基于最新参数重建缓存实例并迁移旧数据。
+     */
     public static synchronized void updateConfig() {
         Env currentEnv = Env.getCurrentEnv();
         if (currentEnv == null) {
@@ -168,6 +182,12 @@ public class NereidsSqlCacheManager {
         sqlCacheManager.sqlCaches = sqlCaches;
     }
 
+    /**
+     * 根据配置构建 SQL 缓存实例。
+     *
+     * @param sqlCacheNum            最大缓存条数（小于等于 0 表示不限制）
+     * @param expireAfterAccessSeconds 访问超时秒数（小于等于 0 表示不过期）
+     */
     private static Cache<String, SqlCacheContext> buildSqlCaches(int sqlCacheNum, long expireAfterAccessSeconds) {
         Caffeine<Object, Object> cacheBuilder = Caffeine.newBuilder()
                 // auto evict cache when jvm memory too low
@@ -183,7 +203,9 @@ public class NereidsSqlCacheManager {
     }
 
     /**
-     * tryAddFeCache
+     * 尝试将 FE 端直接产生的结果集加入缓存。
+     * <p>
+     * 当查询在前端即可返回结果（例如常量语句、EXPLAIN 等）时，缓存结果方便后续重用。
      */
     public void tryAddFeSqlCache(ConnectContext connectContext, String sql) {
         switch (connectContext.getCommand()) {
@@ -215,7 +237,9 @@ public class NereidsSqlCacheManager {
     }
 
     /**
-     * tryAddBeCache
+     * 尝试将 BE 端执行完毕的查询加入缓存。
+     * <p>
+     * 在结果返回 FE 后，将查询使用到的表、分区等信息记录在上下文中，以便后续校验。
      */
     public void tryAddBeCache(ConnectContext connectContext, String sql, CacheAnalyzer analyzer) {
         switch (connectContext.getCommand()) {
@@ -244,6 +268,7 @@ public class NereidsSqlCacheManager {
                 );
         if (sqlCaches.getIfPresent(key) == null && sqlCacheContext.getOrComputeCacheKeyMd5(sessionVariable) != null) {
             SqlCache cache = (SqlCache) analyzer.getCache();
+            // 记录分区相关元信息，命中时用于校验数据是否变化
             sqlCacheContext.setSumOfPartitionNum(cache.getSumOfPartitionNum());
             sqlCacheContext.setLatestPartitionId(cache.getLatestId());
             sqlCacheContext.setLatestPartitionVersion(cache.getLatestVersion());
@@ -251,6 +276,7 @@ public class NereidsSqlCacheManager {
             sqlCacheContext.setCacheProxy(cache.getProxy());
             sqlCacheContext.setAffectQueryResultVariables(sessionVariable);
 
+            // 将分析阶段收集到的扫描表信息写入上下文，用于后续一致性校验
             for (Pair<ScanTable, TableIf> scanTable : analyzer.getScanTables()) {
                 sqlCacheContext.addScanTable(scanTable.first, scanTable.second);
             }
@@ -265,7 +291,12 @@ public class NereidsSqlCacheManager {
     }
 
     /**
-     * tryParseSql
+     * 尝试命中 SQL 缓存。
+     * <p>
+     * 步骤：先根据规范化 SQL 生成缓存键；若命中，则解析用户变量，判断是否需要改用带 MD5 的缓存键；
+     * 最后调用底层重载方法执行权限、元数据等详细校验。
+     *
+     * @return 命中缓存时返回封装好的逻辑缓存信息，否则返回 empty
      */
     public Optional<LogicalSqlCache> tryParseSql(ConnectContext connectContext, String sql) {
         switch (connectContext.getCommand()) {
@@ -274,6 +305,7 @@ public class NereidsSqlCacheManager {
                 return Optional.empty();
             default: { }
         }
+        // 1) 依据原始 SQL 生成缓存键，并尝试命中
         String key = generateCacheKey(connectContext, normalizeSql(sql.trim()));
         SqlCacheContext sqlCacheContext = sqlCaches.getIfPresent(key);
         if (sqlCacheContext == null) {
@@ -285,6 +317,7 @@ public class NereidsSqlCacheManager {
         List<Variable> currentVariables = resolveUserVariables(sqlCacheContext);
         SessionVariable sessionVariable = connectContext.getSessionVariable();
         if (usedVariablesChanged(currentVariables, sqlCacheContext, sessionVariable)) {
+            // 2) 若缓存涉及用户变量且值发生变化，改用 MD5 形式的 cache key
             String md5 = DebugUtil.printId(
                     sqlCacheContext.doComputeCacheKeyMd5(Utils.fastToImmutableSet(currentVariables), sessionVariable));
             String md5CacheKey = generateCacheKey(connectContext, md5);
@@ -303,10 +336,12 @@ public class NereidsSqlCacheManager {
                 return Optional.empty();
             }
         } else {
+            // 3) 否则直接使用原始 key 进入后续校验流程
             return tryParseSql(connectContext, key, sqlCacheContext, currentUserIdentity, false);
         }
     }
 
+    /** 基于当前 Catalog、数据库、用户及 SQL（或 MD5）生成缓存键。 */
     private String generateCacheKey(ConnectContext connectContext, String sqlOrMd5) {
         CatalogIf<?> currentCatalog = connectContext.getCurrentCatalog();
         String currentCatalogName = currentCatalog != null ? currentCatalog.getName() : "";
@@ -316,6 +351,7 @@ public class NereidsSqlCacheManager {
                 + ":" + sqlOrMd5;
     }
 
+    /** 规范化 SQL：去掉注释并裁剪首尾空白。 */
     private String normalizeSql(String sql) {
         return NereidsParser.removeCommentAndTrimBlank(sql);
     }
@@ -326,14 +362,16 @@ public class NereidsSqlCacheManager {
         try {
             Env env = connectContext.getEnv();
 
+            // 1) 锁定本次查询涉及的表/视图，避免校验过程中元数据被并发修改
             if (!tryLockTables(connectContext, env, sqlCacheContext)) {
                 return invalidateCache(key);
             }
 
-            // check table and view and their columns authority
+            // 2) 权限检查：若用户权限发生变化则不能复用缓存
             if (privilegeChanged(connectContext, env, sqlCacheContext)) {
                 return invalidateCache(key);
             }
+            // 3) 校验表、数据、视图、外部 Catalog 等是否发生变化
             IsChanged tableIsChanged = tablesOrDataChanged(env, sqlCacheContext);
             if (tableIsChanged.changed) {
                 if (tableIsChanged.invalidCache) {
@@ -360,6 +398,7 @@ public class NereidsSqlCacheManager {
             }
 
             // table structure and data not changed, now check policy
+            // 4) 校验行级、列级安全策略是否发生变化
             if (rowPoliciesChanged(currentUserIdentity, env, sqlCacheContext)) {
                 return invalidateCache(key);
             }
@@ -376,6 +415,7 @@ public class NereidsSqlCacheManager {
             boolean usedVariablesChanged
                     = checkUserVariable && usedVariablesChanged(currentVariables, sqlCacheContext, sessionVariable);
             if (resultSetInFe.isPresent() && !usedVariablesChanged) {
+                // 优先复用 FE 保存的结果集（无需访问 BE）
                 String cachedPlan = sqlCacheContext.getPhysicalPlan();
                 LogicalSqlCache logicalSqlCache = new LogicalSqlCache(
                         sqlCacheContext.getQueryId(), sqlCacheContext.getColLabels(), sqlCacheContext.getFieldInfos(),
@@ -420,6 +460,11 @@ public class NereidsSqlCacheManager {
         }
     }
 
+    /**
+     * 检查缓存记录的表/分区是否发生变化。
+     * <p>
+     * 包含：表 ID、版本号、分区集合、外部表更新时间等。
+     */
     private IsChanged tablesOrDataChanged(Env env, SqlCacheContext sqlCacheContext) {
         if (sqlCacheContext.hasUnsupportedTables()) {
             return IsChanged.CHANGED_AND_INVALIDATE_CACHE;
@@ -428,6 +473,7 @@ public class NereidsSqlCacheManager {
         // the query maybe scan empty partition of the table, we should check these table version too,
         // but the table not exists in sqlCacheContext.getScanTables(), so we need check here.
         // check table type and version
+        // 遍历缓存记录的所有表，逐一对比表类型、ID、版本等信息是否一致
         for (Entry<FullTableName, TableVersion> scanTable : sqlCacheContext.getUsedTables().entrySet()) {
             TableVersion tableVersion = scanTable.getValue();
             if (tableVersion.type != TableType.OLAP && tableVersion.type != TableType.MATERIALIZED_VIEW
@@ -452,8 +498,7 @@ public class NereidsSqlCacheManager {
                     return IsChanged.CHANGED_AND_INVALIDATE_CACHE;
                 }
                 long cacheTableVersion = tableVersion.version;
-                // some partitions have been dropped, or delete or updated or replaced,
-                // or insert rows into new partition?
+                // 表的版本号不一致，说明分区被新增/删除或数据被更新
                 if (currentTableVersion != cacheTableVersion) {
                     return IsChanged.CHANGED_AND_INVALIDATE_CACHE;
                 }
@@ -474,7 +519,7 @@ public class NereidsSqlCacheManager {
             }
         }
 
-        // check partition whether exists
+        // 检查缓存记录的具体分区是否仍然存在，防止使用已被删除的分区
         for (ScanTable scanTable : sqlCacheContext.getScanTables()) {
             FullTableName fullTableName = scanTable.fullTableName;
             TableIf tableIf = findTableIf(env, fullTableName);
@@ -502,7 +547,9 @@ public class NereidsSqlCacheManager {
         return IsChanged.NOT_CHANGED;
     }
 
+    /** 检查缓存依赖的视图定义是否发生变化。 */
     private IsChanged viewsChanged(Env env, SqlCacheContext sqlCacheContext) {
+        // 遍历缓存使用到的每个视图，校验视图是否仍存在且定义未变
         for (Entry<FullTableName, String> cacheView : sqlCacheContext.getUsedViews().entrySet()) {
             TableIf currentView = findTableIf(env, cacheView.getKey());
             if (currentView == null) {
@@ -523,6 +570,7 @@ public class NereidsSqlCacheManager {
         return IsChanged.NOT_CHANGED;
     }
 
+    /** 检查行级安全策略是否变化。 */
     private boolean rowPoliciesChanged(UserIdentity currentUserIdentity, Env env, SqlCacheContext sqlCacheContext) {
         for (Entry<FullTableName, List<RowFilterPolicy>> kv : sqlCacheContext.getRowPolicies().entrySet()) {
             FullTableName qualifiedTable = kv.getKey();
@@ -537,6 +585,7 @@ public class NereidsSqlCacheManager {
         return false;
     }
 
+    /** 检查列脱敏策略是否变化。 */
     private boolean dataMaskPoliciesChanged(
             UserIdentity currentUserIdentity, Env env, SqlCacheContext sqlCacheContext) {
         for (Entry<FullColumnName, Optional<DataMaskPolicy>> kv : sqlCacheContext.getDataMaskPolicies().entrySet()) {
@@ -558,6 +607,11 @@ public class NereidsSqlCacheManager {
      *
      * @return true if obtain all tables lock.
      */
+    /**
+     * 按照查询涉及的对象加锁，保证缓存校验期间元数据一致。
+     *
+     * @return 是否成功锁定全部对象
+     */
     private boolean tryLockTables(ConnectContext connectContext, Env env, SqlCacheContext sqlCacheContext) {
         StatementContext currentStatementContext = connectContext.getStatementContext();
         for (FullTableName fullTableName : sqlCacheContext.getUsedTables().keySet()) {
@@ -578,6 +632,7 @@ public class NereidsSqlCacheManager {
         return true;
     }
 
+    /** 校验缓存记录的权限信息是否仍旧有效。 */
     private boolean privilegeChanged(ConnectContext connectContext, Env env, SqlCacheContext sqlCacheContext) {
         for (Entry<FullTableName, Set<String>> kv : sqlCacheContext.getCheckPrivilegeTablesOrViews().entrySet()) {
             Set<String> usedColumns = kv.getValue();
@@ -594,6 +649,7 @@ public class NereidsSqlCacheManager {
         return false;
     }
 
+    /** 重新解析缓存中记录的用户变量，获取当前实际值。 */
     private List<Variable> resolveUserVariables(SqlCacheContext sqlCacheContext) {
         List<Variable> cachedUsedVariables = sqlCacheContext.getUsedVariables();
         List<Variable> currentVariables = Lists.newArrayListWithCapacity(cachedUsedVariables.size());
@@ -605,6 +661,7 @@ public class NereidsSqlCacheManager {
         return currentVariables;
     }
 
+    /** 检查缓存涉及的用户变量是否发生变化。 */
     private boolean usedVariablesChanged(
             List<Variable> currentVariables, SqlCacheContext sqlCacheContext, SessionVariable sessionVariable) {
         List<Variable> cachedUsedVariables = sqlCacheContext.getUsedVariables();
@@ -622,6 +679,7 @@ public class NereidsSqlCacheManager {
         return !StringUtils.equals(cachedAffectQueryResultVariables, currentAffectQueryResultVariables);
     }
 
+    /** 判断缓存中存在的非确定性函数结果是否仍可复用。 */
     private boolean nondeterministicFunctionChanged(
             Plan plan, ConnectContext connectContext, SqlCacheContext sqlCacheContext) {
         if (sqlCacheContext.containsCannotProcessExpression()) {
@@ -648,6 +706,7 @@ public class NereidsSqlCacheManager {
         return false;
     }
 
+    /** 检查外部 Catalog 的配置是否变化（例如连接信息）。 */
     private boolean externalCatalogChanged(Env env, SqlCacheContext sqlCacheContext) {
         Map<String, String> externalCatalogConfigs = sqlCacheContext.getExternalCatalogConfigs();
         CatalogMgr catalogMgr = env.getCatalogMgr();
@@ -664,11 +723,13 @@ public class NereidsSqlCacheManager {
         return false;
     }
 
+    /** 清除指定 key 的缓存，并返回 empty，便于链式调用。 */
     private Optional<LogicalSqlCache> invalidateCache(String key) {
         sqlCaches.invalidate(key);
         return Optional.empty();
     }
 
+    /** 根据全限定名查找表对象，找不到返回 null。 */
     private TableIf findTableIf(Env env, FullTableName fullTableName) {
         CatalogIf<DatabaseIf<TableIf>> catalog = env.getCatalogMgr().getCatalog(fullTableName.catalog);
         if (catalog == null) {
@@ -692,10 +753,12 @@ public class NereidsSqlCacheManager {
         }
     }
 
+    /** 返回当前缓存条目估算数量。 */
     public long getSqlCacheNum() {
         return sqlCaches.estimatedSize();
     }
 
+    /** 表示对象是否发生变化以及是否需要直接失效缓存的返回值封装。 */
     private static class IsChanged {
         public static final IsChanged NOT_CHANGED = new IsChanged(false, false);
         public static final IsChanged CHANGED_AND_INVALIDATE_CACHE = new IsChanged(true, true);

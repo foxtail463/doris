@@ -110,17 +110,14 @@ public class MetastoreEventsProcessor extends MasterDaemon {
     }
 
     private void realRun() {
+        // 遍历所有 catalog，仅对 HMSExternalCatalog 进行增量事件同步
         List<Long> catalogIds = Env.getCurrentEnv().getCatalogMgr().getCatalogIds();
         for (Long catalogId : catalogIds) {
             CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(catalogId);
             if (catalog instanceof HMSExternalCatalog) {
                 HMSExternalCatalog hmsExternalCatalog = (HMSExternalCatalog) catalog;
                 try {
-                    // Check if HMS incremental events synchronization is enabled.
-                    // In the past, this value was a constant and always available.
-                    // Now it is retrieved from HmsProperties, which requires initialization.
-                    // In some scenarios, essential HMS parameters may be missing.
-                    // If so, isHmsEventsIncrementalSyncEnabled() may throw Exception.
+                    // 检查是否开启 HMS 增量同步，必要配置缺失时直接跳过
                     if (!hmsExternalCatalog.getHmsProperties().isHmsEventsIncrementalSyncEnabled()) {
                         continue;
                     }
@@ -170,6 +167,7 @@ public class MetastoreEventsProcessor extends MasterDaemon {
     }
 
     private void doExecute(List<MetastoreEvent> events, HMSExternalCatalog hmsExternalCatalog) {
+        // 顺序处理事件，遇到不可恢复的异常会回退 lastSyncedEventId 供下次重试
         for (MetastoreEvent event : events) {
             try {
                 event.process();
@@ -200,6 +198,7 @@ public class MetastoreEventsProcessor extends MasterDaemon {
 
     private NotificationEventResponse getNextEventResponseForMaster(HMSExternalCatalog hmsExternalCatalog)
             throws MetastoreNotificationFetchException {
+        // master 直接与 HMS 交互，必要时触发全量刷新以自愈
         long lastSyncedEventId = getLastSyncedEventId(hmsExternalCatalog);
         long currentEventId = getCurrentHmsEventId(hmsExternalCatalog);
         if (lastSyncedEventId < 0) {
@@ -249,6 +248,7 @@ public class MetastoreEventsProcessor extends MasterDaemon {
 
     private NotificationEventResponse getNextEventResponseForSlave(HMSExternalCatalog hmsExternalCatalog)
             throws Exception {
+        // slave 仅消费 master 已同步的事件，避免越界读取
         long lastSyncedEventId = getLastSyncedEventId(hmsExternalCatalog);
         long masterLastSyncedEventId = getMasterLastSyncedEventId(hmsExternalCatalog);
         // do nothing if masterLastSyncedEventId has not been synced

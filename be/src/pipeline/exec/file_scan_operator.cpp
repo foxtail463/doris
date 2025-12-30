@@ -70,11 +70,14 @@ vectorized::ScannerScheduler* FileScanLocalState::scan_scheduler(RuntimeState* s
 }
 
 Status FileScanLocalState::_init_scanners(std::list<vectorized::ScannerSPtr>* scanners) {
+    // 1) 没有任何 scan range：直接标记 EOS，后续不会创建 scanner
     if (_split_source->num_scan_ranges() == 0) {
         _eos = true;
         return Status::OK();
     }
 
+    // 2) 若存在 GLOBAL_ROWID 等需要外部扫描参数的场景，这里把 scan 相关参数下发到 id_file_map
+    //   （用于外部数据源扫描/回表等能力，具体取决于 id_file_map 的实现）
     auto& id_file_map = state()->get_id_file_map();
     if (id_file_map != nullptr) {
         id_file_map->set_external_scan_params(state()->get_query_ctx(), _max_scanners);
@@ -82,15 +85,21 @@ Status FileScanLocalState::_init_scanners(std::list<vectorized::ScannerSPtr>* sc
 
     auto& p = _parent->cast<FileScanOperatorX>();
     // There's only one scan range for each backend in batch split mode. Each backend only starts up one ScanNode instance.
+    // 3) 为文件扫描的 KV cache 计算分片数（ShardedKVCache）：
+    //    - 默认远端扫描线程数 / 本算子的并行度，得到“每个 instance 大致可用的扫描线程份额”
+    //    - 再与 _max_scanners 取 min，避免分片数超过 scanner 数
+    //    - 最少为 1
     uint32_t shard_num = std::min(
             vectorized::ScannerScheduler::default_remote_scan_thread_num() / p.parallelism(state()),
             _max_scanners);
     shard_num = std::max(shard_num, 1U);
     _kv_cache.reset(new vectorized::ShardedKVCache(shard_num));
+    // 4) 创建 _max_scanners 个 FileScanner，并初始化谓词/下推表达式等，然后加入 scanners 列表
     for (int i = 0; i < _max_scanners; ++i) {
         std::unique_ptr<vectorized::FileScanner> scanner = vectorized::FileScanner::create_unique(
                 state(), this, p._limit, _split_source, _scanner_profile.get(), _kv_cache.get(),
                 &p._colname_to_slot_id);
+        // init() 会完成 scanner 的参数绑定与谓词初始化（如 conjuncts 下推、列裁剪等）
         RETURN_IF_ERROR(scanner->init(state(), _conjuncts));
         scanners->push_back(std::move(scanner));
     }

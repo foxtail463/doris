@@ -841,6 +841,14 @@ Status BufferedFileStreamReader::read_bytes(Slice& slice, uint64_t offset,
     return read_bytes((const uint8_t**)&slice.data, offset, slice.size, io_ctx);
 }
 
+// 创建统一的文件读取器封装：根据文件大小、介质类型与访问模式选择最佳Reader
+// 策略：
+// 1) 小文件且来自S3 -> InMemoryFileReader（一次性加载，减少多次网络IO）
+// 2) 顺序访问且底层Reader线程安全（S3或带S3的缓存Reader）-> PrefetchBufferedReader（并发预取，提高吞吐）
+// 3) 其他情况 -> 原始Reader
+// 说明：
+// - access_mode 决定是否允许预取（仅 SEQUENTIAL 才会包裹 PrefetchBufferedReader）
+// - file_range 用于预取范围控制
 Result<io::FileReaderSPtr> DelegateReader::create_file_reader(
         RuntimeProfile* profile, const FileSystemProperties& system_properties,
         const FileDescription& file_description, const io::FileReaderOptions& reader_options,
@@ -848,6 +856,7 @@ Result<io::FileReaderSPtr> DelegateReader::create_file_reader(
     return FileFactory::create_file_reader(system_properties, file_description, reader_options,
                                            profile)
             .transform([&](auto&& reader) -> io::FileReaderSPtr {
+                // 小S3文件直接放内存，避免频繁远程拉取
                 if (reader->size() < config::in_memory_file_size &&
                     typeid_cast<io::S3FileReader*>(reader.get())) {
                     return std::make_shared<InMemoryFileReader>(std::move(reader));
@@ -855,16 +864,18 @@ Result<io::FileReaderSPtr> DelegateReader::create_file_reader(
 
                 if (access_mode == AccessMode::SEQUENTIAL) {
                     bool is_thread_safe = false;
+                    // S3Reader 是线程安全的，可被预取包装
                     if (typeid_cast<io::S3FileReader*>(reader.get())) {
                         is_thread_safe = true;
                     } else if (auto* cached_reader =
                                        typeid_cast<io::CachedRemoteFileReader*>(reader.get());
                                cached_reader &&
                                typeid_cast<io::S3FileReader*>(cached_reader->get_remote_reader())) {
+                        // 缓存Reader的底层是S3Reader，同样视为线程安全
                         is_thread_safe = true;
                     }
                     if (is_thread_safe) {
-                        // PrefetchBufferedReader needs thread-safe reader to prefetch data concurrently.
+                        // 线程安全Reader可并发预取，提升顺序读取吞吐
                         return std::make_shared<io::PrefetchBufferedReader>(
                                 profile, std::move(reader), file_range, io_ctx);
                     }
@@ -874,19 +885,41 @@ Result<io::FileReaderSPtr> DelegateReader::create_file_reader(
             });
 }
 
+/**
+ * 根据期望的偏移量查找对应的预取区间
+ * 
+ * 使用线性探测策略：从当前位置（index）开始顺序扫描已排序的区间列表，
+ * 找到第一个包含目标偏移量的区间。由于区间已排序且访问模式通常是顺序的，
+ * 这种策略在大多数情况下只需要检查很少的区间。
+ * 
+ * @param desired_offset 期望读取的文件偏移量
+ * @param result_range 输出参数，存储找到的预取区间
+ * @return 操作状态，如果找到匹配区间返回OK，否则返回InvalidArgument
+ */
 Status LinearProbeRangeFinder::get_range_for(int64_t desired_offset,
                                              io::PrefetchRange& result_range) {
+    // 从当前位置开始线性扫描区间列表（_ranges 已按偏移量排序）
     while (index < _ranges.size()) {
         io::PrefetchRange& range = _ranges[index];
+        // 检查当前区间的结束偏移量是否大于目标偏移量
+        // 如果 end_offset <= desired_offset，说明目标偏移量在当前区间之后，继续查找下一个区间
         if (range.end_offset > desired_offset) {
+            // 找到了可能的匹配区间，但需要验证起始偏移量
+            // 如果 start_offset > desired_offset，说明区间之间有间隙，目标偏移量不在任何区间内
+            // 这种情况不应该发生（因为区间应该覆盖所有需要的范围），但作为防御性检查
             if (range.start_offset > desired_offset) [[unlikely]] {
                 return Status::InvalidArgument("Invalid desiredOffset");
             }
+            // 确认匹配：start_offset <= desired_offset < end_offset
             result_range = range;
             return Status::OK();
         }
+        // 当前区间不包含目标偏移量，移动到下一个区间
+        // 注意：index 是成员变量，会保持当前位置，下次调用时从上次停止的位置继续
+        // 这对于顺序访问模式非常高效（接近 O(1)）
         ++index;
     }
+    // 所有区间都检查完毕，仍未找到包含目标偏移量的区间
     return Status::InvalidArgument("Invalid desiredOffset");
 }
 

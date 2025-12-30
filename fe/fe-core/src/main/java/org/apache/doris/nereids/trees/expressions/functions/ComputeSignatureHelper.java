@@ -447,13 +447,17 @@ public class ComputeSignatureHelper {
     /** computePrecision */
     public static FunctionSignature computePrecision(
             ComputeSignature computeSignature, FunctionSignature signature, List<Expression> arguments) {
+        // 若是时间带精度函数（如 now(3) 一类），这里不做统一处理
         if (computeSignature instanceof DateTimeWithPrecision) {
             return signature;
         }
+        // 若函数实现了 ComputePrecision（例如 Sum 实现了 ComputePrecisionForSum），
+        // 则调用其专用的精度推导逻辑（如 DecimalV3 的 precision/scale 决定）。
         if (computeSignature instanceof ComputePrecision) {
             return ((ComputePrecision) computeSignature).computePrecision(signature);
         }
 
+        // 否则，走默认的精度提升策略：根据参数中是否含有 DateTimeV2/TimeV2/DecimalV3 做统一规则处理
         boolean hasDateTimeV2Type = false;
         boolean hasTimeV2Type = false;
         boolean hasDecimalV3Type = false;

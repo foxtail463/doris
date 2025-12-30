@@ -41,7 +41,6 @@ Scanner::Scanner(RuntimeState* state, pipeline::ScanLocalStateBase* local_state,
           _output_tuple_desc(_local_state->output_tuple_desc()),
           _output_row_descriptor(_local_state->_parent->output_row_descriptor()),
           _has_prepared(false) {
-    _total_rf_num = cast_set<int>(_local_state->_helper.runtime_filter_nums());
     DorisMetrics::instance()->scanner_cnt->increment(1);
 }
 
@@ -87,12 +86,18 @@ Status Scanner::get_block_after_projects(RuntimeState* state, vectorized::Block*
     }
 }
 
+// Scanner读取数据的核心入口函数
+// state: 运行时状态
+// block: 输出数据块，用于存储读取的数据
+// eof: 输出参数，标记是否读取结束
 Status Scanner::get_block(RuntimeState* state, Block* block, bool* eof) {
-    // only empty block should be here
+    // 输入的block必须是空的
     DCHECK(block->rows() == 0);
-    // scanner running time
+    // 计时：scanner整体运行时间
     SCOPED_RAW_TIMER(&_per_scanner_timer);
+    // 单次调度最多读取的行数阈值，避免单个scanner长时间占用线程
     int64_t rows_read_threshold = _num_rows_read + config::doris_scanner_row_num;
+    // 如果block不能复用内存，则按输出schema初始化列
     if (!block->mem_reuse()) {
         for (auto* const slot_desc : _output_tuple_desc->slots()) {
             block->insert(ColumnWithTypeAndName(slot_desc->get_empty_mutable_column(),
@@ -102,38 +107,43 @@ Status Scanner::get_block(RuntimeState* state, Block* block, bool* eof) {
     }
 
     {
+        // 循环读取数据，直到满足退出条件
         do {
-            // 1. Get input block from scanner
+            // 1. 从底层存储读取数据到block
             {
-                // get block time
                 SCOPED_TIMER(_local_state->_scan_timer);
+                // 调用子类实现的_get_block_impl读取数据（如OlapScanner从tablet读取）
                 RETURN_IF_ERROR(_get_block_impl(state, block, eof));
                 if (*eof) {
                     DCHECK(block->rows() == 0);
                     break;
                 }
+                // 累计已读取的行数和字节数
                 _num_rows_read += block->rows();
                 _num_byte_read += block->allocated_bytes();
             }
 
-            // 2. Filter the output block finally.
+            // 2. 对读取的数据进行过滤（如WHERE条件过滤）
             {
                 SCOPED_TIMER(_local_state->_filter_timer);
                 RETURN_IF_ERROR(_filter_output_block(block));
             }
-            // record rows return (after filter) for _limit check
+            // 记录过滤后返回的行数，用于limit检查
             _num_rows_return += block->rows();
-        } while (!_should_stop && !state->is_cancelled() && block->rows() == 0 && !(*eof) &&
-                 _num_rows_read < rows_read_threshold);
+        } while (!_should_stop &&              // 未被标记停止
+                 !state->is_cancelled() &&     // 查询未被取消
+                 block->rows() == 0 &&         // 当前block为空（被过滤掉了），继续读
+                 !(*eof) &&                    // 未到文件末尾
+                 _num_rows_read < rows_read_threshold);  // 未超过单次读取行数阈值
     }
 
+    // 检查查询是否被取消
     if (state->is_cancelled()) {
-        // TODO: Should return the specific ErrorStatus instead of just Cancelled.
         return Status::Cancelled("cancelled");
     }
     *eof = *eof || _should_stop;
-    // set eof to true if per scanner limit is reached
-    // currently for query: ORDER BY key LIMIT n
+    // 检查是否达到scanner级别的limit限制
+    // 用于 ORDER BY key LIMIT n 这类查询的优化
     *eof = *eof || (_limit > 0 && _num_rows_return >= _limit);
 
     return Status::OK();
@@ -146,6 +156,18 @@ Status Scanner::_filter_output_block(Block* block) {
     return st;
 }
 
+// 执行投影操作，将origin_block中的数据投影到output_block
+// 
+// 例如SQL: SELECT a, (b+c)*d AS result FROM table WHERE e > 10
+// 表有列: a, b, c, d, e
+// 
+// origin_block: 存储层读取的原始数据，包含列 [a, b, c, d]（e用于过滤已处理）
+// output_block: 最终输出，只包含 [a, result] 两列
+// 
+// _intermediate_projections: 中间投影表达式列表，用于分步计算复杂表达式
+//   例如第一步: [a, b+c, d] -> 先计算b+c得到临时列tmp
+// _projections: 最终投影表达式列表，生成SELECT中的输出列
+//   例如: [a, tmp*d] -> 输出 [a, result]
 Status Scanner::_do_projections(vectorized::Block* origin_block, vectorized::Block* output_block) {
     SCOPED_RAW_TIMER(&_per_scanner_timer);
     SCOPED_RAW_TIMER(&_projection_timer);
@@ -154,18 +176,29 @@ Status Scanner::_do_projections(vectorized::Block* origin_block, vectorized::Blo
     if (rows == 0) {
         return Status::OK();
     }
+    // 复制原始block作为输入
+    // 例如: input_block = [a, b, c, d]
     vectorized::Block input_block = *origin_block;
 
+    // ========== 执行中间投影 ==========
+    // 处理复杂表达式的分步计算
+    // 例如 (b+c)*d 需要先算 b+c，再乘 d
     std::vector<int> result_column_ids;
     for (auto& projections : _intermediate_projections) {
         result_column_ids.resize(projections.size());
+        // 执行每个投影表达式，结果列ID存入result_column_ids
+        // 例如: 执行 [a, b+c, d]，b+c的结果追加到block末尾
         for (int i = 0; i < projections.size(); i++) {
             RETURN_IF_ERROR(projections[i]->execute(&input_block, &result_column_ids[i]));
         }
+        // 重排列顺序，只保留投影结果列
+        // 例如: [a, b, c, d, tmp] -> shuffle后变成 [a, tmp, d]
         input_block.shuffle_columns(result_column_ids);
     }
 
     DCHECK_EQ(rows, input_block.rows());
+    // 构建可复用的输出block，按照输出schema初始化列
+    // 例如: output_block的schema是 [a, result]
     MutableBlock mutable_block =
             VectorizedUtils::build_mutable_mem_reuse_block(output_block, *_output_row_descriptor);
 
@@ -173,22 +206,27 @@ Status Scanner::_do_projections(vectorized::Block* origin_block, vectorized::Blo
 
     DCHECK_EQ(mutable_columns.size(), _projections.size());
 
+    // ========== 执行最终投影 ==========
+    // _projections[0] = a (直接引用列a)
+    // _projections[1] = tmp*d (计算表达式得到result)
     for (int i = 0; i < mutable_columns.size(); ++i) {
         ColumnPtr column_ptr;
+        // 执行投影表达式计算
+        // 例如: _projections[1]->execute 计算 tmp*d
         RETURN_IF_ERROR(_projections[i]->execute(&input_block, column_ptr));
+        // 如果是常量列（如 SELECT 1），转换为完整列
         column_ptr = column_ptr->convert_to_full_column_if_const();
+        // 检查nullable属性一致性
         if (mutable_columns[i]->is_nullable() != column_ptr->is_nullable()) {
             throw Exception(ErrorCode::INTERNAL_ERROR, "Nullable mismatch");
         }
-        mutable_columns[i] = column_ptr->assume_mutable();
+        // 将计算结果插入到输出列
+        // 例如: mutable_columns[1]插入result列的所有行
+        mutable_columns[i]->insert_range_from(*column_ptr, 0, rows);
     }
-
+    DCHECK(mutable_block.rows() == rows);
+    // 设置输出block的列，最终 output_block = [a, result]
     output_block->set_columns(std::move(mutable_columns));
-
-    // origin columns was moved into output_block, so we need to set origin_block to empty columns
-    auto empty_columns = origin_block->clone_empty_columns();
-    origin_block->set_columns(std::move(empty_columns));
-    DCHECK_EQ(output_block->rows(), rows);
 
     return Status::OK();
 }

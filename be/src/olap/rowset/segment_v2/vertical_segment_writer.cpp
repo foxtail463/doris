@@ -17,7 +17,6 @@
 
 #include "olap/rowset/segment_v2/vertical_segment_writer.h"
 
-#include <crc32c/crc32c.h>
 #include <gen_cpp/olap_file.pb.h>
 #include <gen_cpp/segment_v2.pb.h>
 #include <parallel_hashmap/phmap.h>
@@ -64,6 +63,7 @@
 #include "runtime/memory/mem_tracker.h"
 #include "service/point_query_executor.h"
 #include "util/coding.h"
+#include "util/crc32c.h"
 #include "util/debug_points.h"
 #include "util/faststring.h"
 #include "util/key_util.h"
@@ -303,15 +303,12 @@ Status VerticalSegmentWriter::_create_column_writer(uint32_t cid, const TabletCo
     opts.footer = &_footer;
     opts.input_rs_readers = _opts.rowset_ctx->input_rs_readers;
 
-    opts.encoding_preference = {.integer_type_default_use_plain_encoding =
-                                        _tablet_schema->integer_type_default_use_plain_encoding(),
-                                .binary_plain_encoding_default_impl =
-                                        _tablet_schema->binary_plain_encoding_default_impl()};
     std::unique_ptr<ColumnWriter> writer;
     RETURN_IF_ERROR(ColumnWriter::create(opts, &column, _file_writer, &writer));
     RETURN_IF_ERROR(writer->init());
-    _column_writers[cid] = std::move(writer);
-    _olap_data_convertor->add_column_data_convertor_at(column, cid);
+    _column_writers.push_back(std::move(writer));
+
+    _olap_data_convertor->add_column_data_convertor(column);
     return Status::OK();
 };
 
@@ -321,8 +318,8 @@ Status VerticalSegmentWriter::init() {
         _opts.compression_type = _tablet_schema->compression_type();
     }
     _olap_data_convertor = std::make_unique<vectorized::OlapBlockDataConvertor>();
-    _olap_data_convertor->resize(_tablet_schema->num_columns());
-    _column_writers.resize(_tablet_schema->num_columns());
+    _olap_data_convertor->reserve(_tablet_schema->num_columns());
+    _column_writers.reserve(_tablet_schema->columns().size());
     // we don't need the short key index for unique key merge on write table.
     if (_is_mow()) {
         size_t seq_col_length = 0;
@@ -508,42 +505,75 @@ Status VerticalSegmentWriter::_partial_update_preconditions_check(size_t row_pos
     return Status::OK();
 }
 
-// for partial update, we should do following steps to fill content of block:
-// 1. set block data to data convertor, and get all key_column's converted slice
-// 2. get pk of input block, and read missing columns
-//       2.1 first find key location{rowset_id, segment_id, row_id}
-//       2.2 build read plan to read by batch
-//       2.3 fill block
-// 3. set columns to data convertor and then write all columns
+/**
+ * VerticalSegmentWriter::_append_block_with_partial_content：固定部分更新的核心处理函数
+ * 
+ * 功能说明：
+ * 在固定部分更新（UPDATE_FIXED_COLUMNS）模式下，处理部分列更新的数据写入。
+ * 所有行更新相同的列集合（update_cids），缺失列（missing_cids）需要从历史数据中读取。
+ * 
+ * 处理流程（按照注释中的步骤）：
+ * 1. 设置 Block 数据到数据转换器，获取所有键列的转换后切片
+ * 2. 获取输入 Block 的主键，读取缺失列：
+ *    2.1 首先查找键的位置 {rowset_id, segment_id, row_id}
+ *    2.2 构建读取计划，批量读取
+ *    2.3 填充 Block
+ * 3. 设置列到数据转换器，然后写入所有列
+ * 
+ * 详细步骤：
+ * 1. 创建 full_block 并填充输入列（update_cids）
+ * 2. 写入包括的列（including columns）到 Segment
+ * 3. 查找历史数据位置（probe key for MOW）
+ * 4. 读取并填充缺失列到 full_block
+ * 5. 序列化 full_block 到行存储列格式
+ * 6. 写入缺失列到 Segment
+ * 7. 生成主键索引（如果需要）
+ * 
+ * @param data 输入数据块信息（包含 Block、行位置、行数）
+ * @param full_block 完整 Block（输出），包含所有列的数据
+ * @return 操作状态
+ */
 Status VerticalSegmentWriter::_append_block_with_partial_content(RowsInBlock& data,
                                                                  vectorized::Block& full_block) {
     DBUG_EXECUTE_IF("_append_block_with_partial_content.block", DBUG_BLOCK);
 
+    // 1. 检查部分更新的前置条件
     RETURN_IF_ERROR(_partial_update_preconditions_check(data.row_pos, false));
-    // create full block and fill with input columns
+    
+    // 2. 创建完整 Block 并填充输入列（update_cids）
+    // full_block 将包含所有列，目前先填充部分更新的列
     full_block = _tablet_schema->create_block();
     const auto& including_cids = _opts.rowset_ctx->partial_update_info->update_cids;
     size_t input_id = 0;
+    // 将输入 Block 中的列按位置替换到 full_block 的对应位置
     for (auto i : including_cids) {
         full_block.replace_by_position(i, data.block->get_by_position(input_id++).column);
     }
 
+    // 3. 写入包括的列（including columns）到 Segment
+    // 这部分列已经在输入数据中提供，可以直接写入
     bool have_input_seq_column = false;
-    // write including columns
     std::vector<vectorized::IOlapColumnDataAccessor*> key_columns;
     vectorized::IOlapColumnDataAccessor* seq_column = nullptr;
     uint32_t segment_start_pos = 0;
+    
     for (auto cid : including_cids) {
-        RETURN_IF_ERROR(_create_column_writer(cid, _tablet_schema->column(cid), _tablet_schema));
+        // 3.1 设置数据转换器的源内容（指定当前列）
         RETURN_IF_ERROR(_olap_data_convertor->set_source_content_with_specifid_columns(
                 &full_block, data.row_pos, data.num_rows, std::vector<uint32_t> {cid}));
-        // here we get segment column row num before append data.
+        
+        // 3.2 获取 Segment 中当前列的行数（在追加数据之前）
+        // 这用于后续计算 segment_pos，定位历史数据中的行位置
         segment_start_pos = cast_set<uint32_t>(_column_writers[cid]->get_next_rowid());
-        // olap data convertor alway start from id = 0
+        
+        // 3.3 将列数据从引擎格式转换为存储层格式
+        // olap data convertor 总是从 id = 0 开始
         auto [status, column] = _olap_data_convertor->convert_column_data(cid);
         if (!status.ok()) {
             return status;
         }
+        
+        // 3.4 收集键列和序列列的访问器（用于后续生成索引）
         if (cid < _num_sort_key_columns) {
             key_columns.push_back(column);
         } else if (_tablet_schema->has_sequence_col() &&
@@ -551,12 +581,16 @@ Status VerticalSegmentWriter::_append_block_with_partial_content(RowsInBlock& da
             seq_column = column;
             have_input_seq_column = true;
         }
+        
+        // 3.5 将列数据追加到列写入器
         RETURN_IF_ERROR(_column_writers[cid]->append(column->get_nullmap(), column->get_data(),
                                                      data.num_rows));
+        // 3.6 完成列写入并更新元数据
         RETURN_IF_ERROR(_finalize_column_writer_and_update_meta(cid));
-        // Don't clear source content for key columns and sequence column here,
-        // as they will be used later in _full_encode_keys() and _generate_primary_key_index().
-        // They will be cleared at the end of this method.
+        
+        // 3.7 清理数据转换器的源内容（键列和序列列除外）
+        // 键列和序列列稍后会在 _full_encode_keys() 和 _generate_primary_key_index() 中使用
+        // 它们将在方法结束时被清理
         bool is_key_column = (cid < _num_sort_key_columns);
         bool is_seq_column = (_tablet_schema->has_sequence_col() &&
                               cid == _tablet_schema->sequence_col_idx() && have_input_seq_column);
@@ -565,9 +599,11 @@ Status VerticalSegmentWriter::_append_block_with_partial_content(RowsInBlock& da
         }
     }
 
+    // 4. 准备查找历史数据的相关变量
     bool has_default_or_nullable = false;
     std::vector<bool> use_default_or_null_flag;
     use_default_or_null_flag.reserve(data.num_rows);
+    // 获取删除标记列数据（用于判断行是否被删除）
     const auto* delete_signs =
             BaseTablet::get_delete_sign_column_data(full_block, data.row_pos + data.num_rows);
 
@@ -576,35 +612,45 @@ Status VerticalSegmentWriter::_append_block_with_partial_content(RowsInBlock& da
     const std::vector<RowsetSharedPtr>& specified_rowsets = _mow_context->rowset_ptrs;
     std::vector<std::unique_ptr<SegmentCacheHandle>> segment_caches(specified_rowsets.size());
 
+    // 5. 构建读取计划，用于批量读取历史数据
     FixedReadPlan read_plan;
 
-    // locate rows in base data
+    // 6. 定位历史数据中的行位置（probe key for MOW）
     PartialUpdateStats stats;
 
     for (size_t block_pos = data.row_pos; block_pos < data.row_pos + data.num_rows; block_pos++) {
+        // 6.1 计算位置映射
+        // block_pos 是输入 Block 中的位置，segment_pos 是 Segment 中的位置
+        // 示例映射关系：
         // block   segment
         //   2   ->   0
         //   3   ->   1
         //   4   ->   2
         //   5   ->   3
-        // here row_pos = 2, num_rows = 4.
+        // 这里 row_pos = 2, num_rows = 4
         size_t delta_pos = block_pos - data.row_pos;
         size_t segment_pos = segment_start_pos + delta_pos;
+        
+        // 6.2 编码主键（用于查找历史数据）
         std::string key = _full_encode_keys(key_columns, delta_pos);
         _maybe_invalid_row_cache(key);
+        // 如果输入包含序列列，将其编码到主键中
         if (have_input_seq_column) {
             _encode_seq_column(seq_column, delta_pos, &key);
         }
-        // If the table have sequence column, and the include-cids don't contain the sequence
-        // column, we need to update the primary key index builder at the end of this method.
-        // At that time, we have a valid sequence column to encode the key with seq col.
+        
+        // 6.3 添加主键到主键索引构建器
+        // 如果表有序列列，但输入不包括序列列，需要在方法结束时更新主键索引构建器
+        // 那时我们将有一个有效的序列列来编码包含序列列的主键
         if (!_tablet_schema->has_sequence_col() || have_input_seq_column) {
             RETURN_IF_ERROR(_primary_key_index_builder->add_item(key));
         }
 
-        // mark key with delete sign as deleted.
+        // 6.4 检查删除标记
+        // 标记带有删除标记的键为已删除
         bool have_delete_sign = (delete_signs != nullptr && delete_signs[block_pos] != 0);
 
+        // 6.5 定义回调函数：当键未找到时的处理（新键）
         auto not_found_cb = [&]() {
             return _opts.rowset_ctx->partial_update_info->handle_new_key(
                     *_tablet_schema, [&]() -> std::string {
@@ -612,9 +658,14 @@ Status VerticalSegmentWriter::_append_block_with_partial_content(RowsInBlock& da
                                                          cast_set<int>(_num_sort_key_columns));
                     });
         };
+        
+        // 6.6 定义回调函数：更新读取计划（当键找到时）
         auto update_read_plan = [&](const RowLocation& loc) {
             read_plan.prepare_to_read(loc, segment_pos);
         };
+        
+        // 6.7 查找历史数据中的键位置（probe key for MOW）
+        // 这会填充 read_plan、use_default_or_null_flag 等
         RETURN_IF_ERROR(_probe_key_for_mow(std::move(key), segment_pos, have_input_seq_column,
                                            have_delete_sign, specified_rowsets, segment_caches,
                                            has_default_or_nullable, use_default_or_null_flag,
@@ -622,40 +673,52 @@ Status VerticalSegmentWriter::_append_block_with_partial_content(RowsInBlock& da
     }
     CHECK_EQ(use_default_or_null_flag.size(), data.num_rows);
 
+    // 7. 正确性检查：添加哨兵标记到删除位图（如果启用）
     if (config::enable_merge_on_write_correctness_check) {
         _tablet->add_sentinel_mark_to_delete_bitmap(_mow_context->delete_bitmap.get(),
                                                     *_mow_context->rowset_ids);
     }
 
-    // read to fill full_block
+    // 8. 读取历史数据并填充缺失列到 full_block
+    // 根据 read_plan 批量读取缺失列，填充到 full_block 中
     RETURN_IF_ERROR(read_plan.fill_missing_columns(
             _opts.rowset_ctx, _rsid_to_rowset, *_tablet_schema, full_block,
             use_default_or_null_flag, has_default_or_nullable, segment_start_pos, data.block));
 
-    // row column should be filled here
-    // convert block to row store format
+    // 9. 序列化 full_block 到行存储列格式
+    // 行存储列应该在这里填充
+    // 将 Block 转换为行存储格式
     _serialize_block_to_row_column(full_block);
 
-    // convert missing columns and send to column writer
+    // 10. 转换缺失列并发送到列写入器
+    // 将缺失列（missing_cids）写入到 Segment
     const auto& missing_cids = _opts.rowset_ctx->partial_update_info->missing_cids;
     for (auto cid : missing_cids) {
-        RETURN_IF_ERROR(_create_column_writer(cid, _tablet_schema->column(cid), _tablet_schema));
+        // 10.1 设置数据转换器的源内容（指定当前缺失列）
         RETURN_IF_ERROR(_olap_data_convertor->set_source_content_with_specifid_columns(
                 &full_block, data.row_pos, data.num_rows, std::vector<uint32_t> {cid}));
+        
+        // 10.2 转换列数据格式
         auto [status, column] = _olap_data_convertor->convert_column_data(cid);
         if (!status.ok()) {
             return status;
         }
+        
+        // 10.3 如果表有序列列但输入不包括，且当前列是序列列，保存序列列访问器
         if (_tablet_schema->has_sequence_col() && !have_input_seq_column &&
             cid == _tablet_schema->sequence_col_idx()) {
             DCHECK_EQ(seq_column, nullptr);
             seq_column = column;
         }
+        
+        // 10.4 将缺失列数据追加到列写入器
         RETURN_IF_ERROR(_column_writers[cid]->append(column->get_nullmap(), column->get_data(),
                                                      data.num_rows));
+        // 10.5 完成列写入并更新元数据
         RETURN_IF_ERROR(_finalize_column_writer_and_update_meta(cid));
-        // Don't clear source content for sequence column here if it will be used later
-        // in _generate_primary_key_index(). It will be cleared at the end of this method.
+        
+        // 10.6 清理数据转换器的源内容（序列列除外，如果稍后会在 _generate_primary_key_index() 中使用）
+        // 序列列将在方法结束时被清理
         bool is_seq_column = (_tablet_schema->has_sequence_col() && !have_input_seq_column &&
                               cid == _tablet_schema->sequence_col_idx());
         if (!is_seq_column) {
@@ -663,12 +726,17 @@ Status VerticalSegmentWriter::_append_block_with_partial_content(RowsInBlock& da
         }
     }
 
+    // 11. 更新部分更新统计信息
     _num_rows_updated += stats.num_rows_updated;
     _num_rows_deleted += stats.num_rows_deleted;
     _num_rows_new_added += stats.num_rows_new_added;
     _num_rows_filtered += stats.num_rows_filtered;
+    
+    // 12. 生成主键索引（如果表有序列列但输入不包括序列列）
+    // 此时我们已经从历史数据中读取了序列列，可以生成完整的主键索引
     if (_tablet_schema->has_sequence_col() && !have_input_seq_column) {
         DCHECK_NE(seq_column, nullptr);
+        // 正确性检查：确保行数和主键索引行数一致
         if (_num_rows_written != data.row_pos ||
             _primary_key_index_builder->num_rows() != _num_rows_written) {
             return Status::InternalError(
@@ -680,10 +748,14 @@ Status VerticalSegmentWriter::_append_block_with_partial_content(RowsInBlock& da
                                                     data.num_rows, false));
     }
 
+    // 13. 更新已写入行数
     _num_rows_written += data.num_rows;
+    // 正确性检查：确保主键索引构建器的行数与已写入行数一致
     DCHECK_EQ(_primary_key_index_builder->num_rows(), _num_rows_written)
             << "primary key index builder num rows(" << _primary_key_index_builder->num_rows()
             << ") not equal to segment writer's num rows written(" << _num_rows_written << ")";
+    
+    // 14. 清理数据转换器的源内容
     _olap_data_convertor->clear_source_content();
     return Status::OK();
 }
@@ -698,9 +770,7 @@ Status VerticalSegmentWriter::_append_block_with_flexible_partial_content(
     // create full block and fill with sort key columns
     full_block = _tablet_schema->create_block();
 
-    // Use _num_rows_written instead of creating column writer 0, since all column writers
-    // should have the same row count, which equals _num_rows_written.
-    uint32_t segment_start_pos = cast_set<uint32_t>(_num_rows_written);
+    uint32_t segment_start_pos = cast_set<uint32_t>(_column_writers.front()->get_next_rowid());
 
     DCHECK(_tablet_schema->has_skip_bitmap_col());
     auto skip_bitmap_col_idx = _tablet_schema->skip_bitmap_col_idx();
@@ -716,17 +786,6 @@ Status VerticalSegmentWriter::_append_block_with_flexible_partial_content(
                     { sleep(60); })
     const std::vector<RowsetSharedPtr>& specified_rowsets = _mow_context->rowset_ptrs;
     std::vector<std::unique_ptr<SegmentCacheHandle>> segment_caches(specified_rowsets.size());
-
-    // Ensure all primary key column writers and sequence column writer are created before
-    // aggregate_for_flexible_partial_update, because it internally calls convert_pk_columns
-    // and convert_seq_column which need the convertors in _olap_data_convertor
-    for (uint32_t cid = 0; cid < _tablet_schema->num_key_columns(); ++cid) {
-        RETURN_IF_ERROR(_create_column_writer(cid, _tablet_schema->column(cid), _tablet_schema));
-    }
-    if (schema_has_sequence_col) {
-        uint32_t cid = _tablet_schema->sequence_col_idx();
-        RETURN_IF_ERROR(_create_column_writer(cid, _tablet_schema->column(cid), _tablet_schema));
-    }
 
     // 1. aggregate duplicate rows in block
     RETURN_IF_ERROR(_block_aggregator.aggregate_for_flexible_partial_update(
@@ -802,10 +861,6 @@ Status VerticalSegmentWriter::_append_block_with_flexible_partial_content(
 
     // 8. encode and write all non-primary key columns(including sequence column if exists)
     for (auto cid = _tablet_schema->num_key_columns(); cid < _tablet_schema->num_columns(); cid++) {
-        if (cid != _tablet_schema->sequence_col_idx()) {
-            RETURN_IF_ERROR(_create_column_writer(cast_set<uint32_t>(cid),
-                                                  _tablet_schema->column(cid), _tablet_schema));
-        }
         RETURN_IF_ERROR(_olap_data_convertor->set_source_content_with_specifid_column(
                 full_block.get_by_position(cid), data.row_pos, data.num_rows,
                 cast_set<uint32_t>(cid)));
@@ -964,25 +1019,60 @@ Status VerticalSegmentWriter::batch_block(const vectorized::Block* block, size_t
     return Status::OK();
 }
 
+/**
+ * VerticalSegmentWriter::write_batch：批量写入数据到 Segment（垂直写入模式）
+ * 
+ * 功能说明：
+ * 这是垂直段写入器的核心方法，负责将批量缓存的 Block 数据写入到 Segment 文件中。
+ * 采用垂直写入模式：按列组织数据，先写入所有行的 key columns，再写入所有行的 value columns。
+ * 
+ * 主要处理两种场景：
+ * 1. 部分更新场景：需要读取历史数据填充缺失列，然后写入完整数据
+ * 2. 普通写入场景：直接写入所有列的数据
+ * 
+ * 写入流程：
+ * 1. 如果是部分更新：调用相应的部分更新处理函数（固定或灵活）
+ * 2. 如果是直接写入或 schema change：序列化行存储列（如果需要）
+ * 3. 按列写入：遍历每列，将数据转换为存储格式并写入
+ * 4. 生成键索引：为主键列生成索引
+ * 
+ * @return 操作状态
+ */
 Status VerticalSegmentWriter::write_batch() {
+    // 1. 处理部分更新场景
+    // 部分更新需要读取历史数据填充缺失列，然后写入完整数据
     if (_opts.rowset_ctx->partial_update_info &&
         _opts.rowset_ctx->partial_update_info->is_partial_update() &&
         _opts.write_type == DataWriteType::TYPE_DIRECT &&
         !_opts.rowset_ctx->is_transient_rowset_writer) {
+        // 1.1 判断是灵活部分更新还是固定部分更新
         bool is_flexible_partial_update =
                 _opts.rowset_ctx->partial_update_info->is_flexible_partial_update();
+        
+        // 1.2 为所有列创建列写入器（部分更新需要写入完整数据）
+        for (uint32_t cid = 0; cid < _tablet_schema->num_columns(); ++cid) {
+            RETURN_IF_ERROR(
+                    _create_column_writer(cid, _tablet_schema->column(cid), _tablet_schema));
+        }
+        
+        // 1.3 处理每个批次的 Block
         vectorized::Block full_block;
         for (auto& data : _batched_blocks) {
             if (is_flexible_partial_update) {
+                // 灵活部分更新：使用 skip_bitmap 标记哪些列被指定
                 RETURN_IF_ERROR(_append_block_with_flexible_partial_content(data, full_block));
             } else {
+                // 固定部分更新：所有行更新相同的列集合
                 RETURN_IF_ERROR(_append_block_with_partial_content(data, full_block));
             }
         }
         return Status::OK();
     }
-    // Row column should be filled here when it's a directly write from memtable
-    // or it's schema change write(since column data type maybe changed, so we should reubild)
+    
+    // 2. 处理普通写入场景（非部分更新）
+    // 2.1 序列化行存储列（如果需要）
+    // 当是直接写入（从 MemTable）或 Schema Change 写入时，需要序列化行存储列
+    // Schema Change 时列数据类型可能改变，需要重新构建行存储列
     if (_opts.write_type == DataWriteType::TYPE_DIRECT ||
         _opts.write_type == DataWriteType::TYPE_SCHEMA_CHANGE) {
         for (auto& data : _batched_blocks) {
@@ -991,27 +1081,41 @@ Status VerticalSegmentWriter::write_batch() {
         }
     }
 
+    // 2.2 按列写入数据（垂直写入模式）
+    // 准备键列和序列列的访问器，用于后续生成索引
     std::vector<vectorized::IOlapColumnDataAccessor*> key_columns;
     vectorized::IOlapColumnDataAccessor* seq_column = nullptr;
-    // the key is cluster key column unique id
+    // 集群键列映射：key 是集群键列的唯一 ID，value 是列数据访问器
     std::map<uint32_t, vectorized::IOlapColumnDataAccessor*> cid_to_column;
+    
+    // 2.3 遍历每列，按列写入数据
     for (uint32_t cid = 0; cid < _tablet_schema->num_columns(); ++cid) {
+        // 2.3.1 创建列写入器
         RETURN_IF_ERROR(_create_column_writer(cid, _tablet_schema->column(cid), _tablet_schema));
+        
+        // 2.3.2 处理每个批次的 Block
         for (auto& data : _batched_blocks) {
+            // 设置数据转换器的源内容（指定当前列）
             RETURN_IF_ERROR(_olap_data_convertor->set_source_content_with_specifid_columns(
                     data.block, data.row_pos, data.num_rows, std::vector<uint32_t> {cid}));
 
-            // convert column data from engine format to storage layer format
+            // 2.3.3 将列数据从引擎格式转换为存储层格式
             auto [status, column] = _olap_data_convertor->convert_column_data(cid);
             if (!status.ok()) {
                 return status;
             }
+            
+            // 2.3.4 收集键列访问器（用于后续生成索引）
             if (cid < _tablet_schema->num_key_columns()) {
                 key_columns.push_back(column);
             }
+            
+            // 2.3.5 收集序列列访问器（如果存在）
             if (_tablet_schema->has_sequence_col() && cid == _tablet_schema->sequence_col_idx()) {
                 seq_column = column;
             }
+            
+            // 2.3.6 收集集群键列访问器（如果存在）
             auto column_unique_id = _tablet_schema->column(cid).unique_id();
             if (_is_mow_with_cluster_key() &&
                 std::find(_tablet_schema->cluster_key_uids().begin(),
@@ -1019,25 +1123,39 @@ Status VerticalSegmentWriter::write_batch() {
                           column_unique_id) != _tablet_schema->cluster_key_uids().end()) {
                 cid_to_column[column_unique_id] = column;
             }
+            
+            // 2.3.7 将列数据追加到列写入器
             RETURN_IF_ERROR(_column_writers[cid]->append(column->get_nullmap(), column->get_data(),
                                                          data.num_rows));
+            // 清除数据转换器的源内容，释放内存
             _olap_data_convertor->clear_source_content();
         }
+        
+        // 2.3.8 检查磁盘容量限制
         if (_data_dir != nullptr &&
             _data_dir->reach_capacity_limit(_column_writers[cid]->estimate_buffer_size())) {
             return Status::Error<DISK_REACH_CAPACITY_LIMIT>("disk {} exceed capacity limit.",
                                                             _data_dir->path_hash());
         }
+        
+        // 2.3.9 完成列写入并更新元数据
         RETURN_IF_ERROR(_finalize_column_writer_and_update_meta(cid));
     }
 
+    // 3. 生成键索引
+    // 为每个批次的 Block 生成主键索引、短键索引等
     for (auto& data : _batched_blocks) {
+        // 设置数据转换器的源内容（所有列）
         _olap_data_convertor->set_source_content(data.block, data.row_pos, data.num_rows);
+        // 生成键索引（主键索引、短键索引等）
         RETURN_IF_ERROR(_generate_key_index(data, key_columns, seq_column, cid_to_column));
+        // 清除数据转换器的源内容
         _olap_data_convertor->clear_source_content();
+        // 更新已写入行数
         _num_rows_written += data.num_rows;
     }
 
+    // 4. 清空批次缓存
     _batched_blocks.clear();
     return Status::OK();
 }
@@ -1389,7 +1507,7 @@ Status VerticalSegmentWriter::_write_footer() {
     // footer's size
     put_fixed32_le(&fixed_buf, cast_set<uint32_t>(footer_buf.size()));
     // footer's checksum
-    uint32_t checksum = crc32c::Crc32c(footer_buf.data(), footer_buf.size());
+    uint32_t checksum = crc32c::Value(footer_buf.data(), footer_buf.size());
     put_fixed32_le(&fixed_buf, checksum);
     // Append magic number. we don't write magic number in the header because
     // that will need an extra seek when reading

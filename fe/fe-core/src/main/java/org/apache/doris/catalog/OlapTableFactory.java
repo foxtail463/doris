@@ -80,23 +80,43 @@ public class OlapTableFactory {
         return this;
     }
 
+    /**
+     * 构建并返回表对象
+     * 
+     * 这是工厂模式的核心方法，根据不同的参数类型创建相应的表对象：
+     * 1. OlapTableParams -> 创建标准的OLAP表
+     * 2. MTMVParams -> 创建物化视图表
+     * 
+     * @return 返回创建的表对象（OlapTable或MTMV）
+     * @throws IllegalStateException 如果工厂未初始化（params为null）
+     */
     public Table build() {
+        // 验证工厂是否已初始化：params不能为null
         Preconditions.checkNotNull(params, "The factory isn't initialized.");
 
+        // 根据参数类型选择创建策略
         if (params instanceof OlapTableParams) {
+            // 分支1：创建标准OLAP表
             OlapTableParams olapTableParams = (OlapTableParams) params;
+            
+            // 使用参数创建新的OlapTable实例
+            // 包含：表ID、表名、临时表标志、列Schema、键类型、分区信息、分布信息、索引信息
             return new OlapTable(
-                    olapTableParams.tableId,
-                    olapTableParams.tableName,
-                    olapTableParams.isTemporary,
-                    olapTableParams.schema,
-                    olapTableParams.keysType,
-                    olapTableParams.partitionInfo,
-                    olapTableParams.distributionInfo,
-                    olapTableParams.indexes
+                    olapTableParams.tableId,                    // 表唯一标识符
+                    olapTableParams.tableName,                  // 表名
+                    olapTableParams.isTemporary,                // 是否为临时表
+                    olapTableParams.schema,                     // 列定义Schema
+                    olapTableParams.keysType,                   // 键类型（DUP/UNIQUE/AGG）
+                    olapTableParams.partitionInfo,              // 分区策略信息
+                    olapTableParams.distributionInfo,           // 数据分布策略
+                    olapTableParams.indexes                     // 索引信息（包括物化视图）
             );
         } else {
+            // 分支2：创建物化视图表（MTMV）
             MTMVParams mtmvParams = (MTMVParams) params;
+            
+            // 使用MTMV参数创建物化视图表
+            // MTMV是Materialized Table Materialized View的缩写
             return new MTMV(mtmvParams);
         }
     }

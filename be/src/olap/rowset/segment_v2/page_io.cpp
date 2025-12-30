@@ -17,7 +17,6 @@
 
 #include "olap/rowset/segment_v2/page_io.h"
 
-#include <crc32c/crc32c.h>
 #include <gen_cpp/segment_v2.pb.h>
 #include <stdint.h>
 
@@ -42,6 +41,7 @@
 #include "olap/rowset/segment_v2/page_handle.h"
 #include "util/block_compression.h"
 #include "util/coding.h"
+#include "util/crc32c.h"
 #include "util/faststring.h"
 #include "util/runtime_profile.h"
 
@@ -71,50 +71,72 @@ Status PageIO::compress_page_body(BlockCompressionCodec* codec, double min_space
     return Status::OK();
 }
 
+/**
+ * 将页面写入到文件
+ * 这是页面I/O的核心方法，负责将页面数据、页脚和校验和写入磁盘
+ * 页面格式：页面数据 + 页脚 + 页脚大小 + 校验和
+ * 
+ * @param writer 文件写入器，用于写入数据到磁盘
+ * @param body 页面主体数据，包含实际的页面内容
+ * @param footer 页面页脚，包含页面的元数据信息
+ * @param result 输出参数，返回页面在文件中的位置和大小信息
+ * @return 写入结果状态
+ */
 Status PageIO::write_page(io::FileWriter* writer, const std::vector<Slice>& body,
                           const PageFooterPB& footer, PagePointer* result) {
-    // sanity check of page footer
-    CHECK(footer.has_type()) << "type must be set";
-    CHECK(footer.has_uncompressed_size()) << "uncompressed_size must be set";
+    // 页脚完整性检查：确保页脚包含必要的基本信息
+    CHECK(footer.has_type()) << "type must be set";                    // 页面类型必须设置
+    CHECK(footer.has_uncompressed_size()) << "uncompressed_size must be set";  // 未压缩大小必须设置
+    
+    // 根据页面类型验证页脚的具体内容
     switch (footer.type()) {
     case DATA_PAGE:
+        // 数据页：必须包含数据页页脚信息
         CHECK(footer.has_data_page_footer());
         break;
     case INDEX_PAGE:
+        // 索引页：必须包含索引页页脚信息
         CHECK(footer.has_index_page_footer());
         break;
     case DICTIONARY_PAGE:
+        // 字典页：必须包含字典页页脚信息
         CHECK(footer.has_dict_page_footer());
         break;
     case SHORT_KEY_PAGE:
+        // 短键页：必须包含短键页页脚信息
         CHECK(footer.has_short_key_page_footer());
         break;
     default:
+        // 无效的页面类型
         CHECK(false) << "Invalid page footer type: " << footer.type();
         break;
     }
 
-    std::string footer_buf; // serialized footer + footer size
-    footer.SerializeToString(&footer_buf);
-    put_fixed32_le(&footer_buf, static_cast<uint32_t>(footer_buf.size()));
+    // 序列化页脚并添加页脚大小信息
+    std::string footer_buf; // 序列化后的页脚 + 页脚大小
+    footer.SerializeToString(&footer_buf);  // 将protobuf对象序列化为字符串
+    put_fixed32_le(&footer_buf, static_cast<uint32_t>(footer_buf.size()));  // 在页脚后添加4字节的小端序大小
 
-    std::vector<Slice> page = body;
-    page.emplace_back(footer_buf);
+    // 构建完整的页面结构：页面数据 + 页脚
+    std::vector<Slice> page = body;        // 复制页面主体数据
+    page.emplace_back(footer_buf);         // 添加页脚数据
 
-    // checksum
-    uint8_t checksum_buf[sizeof(uint32_t)];
-    uint32_t checksum = 0;
-    for (const auto& slice : page) {
-        checksum = crc32c::Extend(checksum, (const uint8_t*)slice.data, slice.size);
-    }
-    encode_fixed32_le(checksum_buf, checksum);
-    page.emplace_back(checksum_buf, sizeof(uint32_t));
+    // 计算并添加校验和：使用CRC32C算法确保数据完整性
+    uint8_t checksum_buf[sizeof(uint32_t)];                    // 校验和缓冲区（4字节）
+    uint32_t checksum = crc32c::Value(page);                   // 计算整个页面的CRC32C校验和
+    encode_fixed32_le(checksum_buf, checksum);                 // 将校验和编码为小端序格式
+    page.emplace_back(checksum_buf, sizeof(uint32_t));         // 将校验和添加到页面末尾
 
+    // 记录页面在文件中的起始位置
     uint64_t offset = writer->bytes_appended();
+    
+    // 将完整的页面写入磁盘：使用向量化写入提高性能
     RETURN_IF_ERROR(writer->appendv(&page[0], page.size()));
 
-    result->offset = offset;
-    result->size = cast_set<uint32_t>(writer->bytes_appended() - offset);
+    // 设置返回结果：页面在文件中的位置和大小信息
+    result->offset = offset;                                    // 页面起始偏移量
+    result->size = cast_set<uint32_t>(writer->bytes_appended() - offset);  // 页面总大小
+    
     return Status::OK();
 }
 
@@ -178,7 +200,7 @@ Status PageIO::read_and_decompress_page_(const PageReadOptions& opts, PageHandle
 
     if (opts.verify_checksum) {
         uint32_t expect = decode_fixed32_le((uint8_t*)page_slice.data + page_slice.size - 4);
-        uint32_t actual = crc32c::Crc32c(page_slice.data, page_slice.size - 4);
+        uint32_t actual = crc32c::Value(page_slice.data, page_slice.size - 4);
         // here const_cast is used for testing.
         InjectionContext ctx = {&actual, const_cast<PageReadOptions*>(&opts)};
         (void)ctx;
@@ -234,7 +256,7 @@ Status PageIO::read_and_decompress_page_(const PageReadOptions& opts, PageHandle
             // for dict page, we need to use encoding_info based on footer->dict_page_footer().encoding()
             // to get its pre_decoder
             RETURN_IF_ERROR(EncodingInfo::get(FieldType::OLAP_FIELD_TYPE_VARCHAR,
-                                              footer->dict_page_footer().encoding(), {},
+                                              footer->dict_page_footer().encoding(),
                                               &encoding_info));
         }
         if (encoding_info) {

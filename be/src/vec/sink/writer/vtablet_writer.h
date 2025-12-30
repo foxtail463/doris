@@ -621,159 +621,319 @@ private:
 } // namespace doris
 
 namespace doris::vectorized {
-//
-// write result to file
+/**
+ * VTabletWriter：负责将数据写入 OLAP 表的异步写入器
+ * 
+ * 核心功能：
+ * 1. 接收上游算子的 Block，进行数据分区和路由
+ * 2. 将数据分发到各个 BE 节点的 NodeChannel
+ * 3. 通过 RPC 将数据发送到目标 BE，最终写入 MemTable
+ * 4. 支持多副本写入、自动分区创建、流控等特性
+ * 
+ * 架构：
+ * - VTabletWriter（顶层写入器）
+ *   - IndexChannel（每个表/索引对应一个，包含多个 NodeChannel）
+ *     - VNodeChannel（每个 BE 节点对应一个，负责 RPC 通信）
+ *       - DeltaWriter（目标 BE 上的写入器，写入 MemTable）
+ */
 class VTabletWriter final : public AsyncResultWriter {
 public:
+    /**
+     * 构造函数
+     * @param t_sink FE 下发的数据写入配置
+     * @param output_exprs 输出表达式上下文列表（用于列转换）
+     * @param dep 异步写入依赖（用于流控）
+     * @param fin_dep 完成依赖（用于等待写入完成）
+     */
     VTabletWriter(const TDataSink& t_sink, const VExprContextSPtrs& output_exprs,
                   std::shared_ptr<pipeline::Dependency> dep,
                   std::shared_ptr<pipeline::Dependency> fin_dep);
 
+    /**
+     * 写入一个 Block 到目标表
+     * 主要流程：
+     * 1. 数据分区和路由（根据分区键计算每个行属于哪个 tablet）
+     * 2. 数据转换（Block 格式转换、列映射、过滤等）
+     * 3. 将数据分发到对应的 NodeChannel（按 tablet 分组）
+     * 4. NodeChannel 异步发送数据到目标 BE
+     * 
+     * @param state 运行时状态
+     * @param block 待写入的数据块
+     * @return 写入状态
+     */
     Status write(RuntimeState* state, Block& block) override;
 
+    /**
+     * 关闭写入器，等待所有数据写入完成
+     * 主要流程：
+     * 1. 标记所有 NodeChannel 为关闭状态
+     * 2. 等待所有 RPC 完成
+     * 3. 收集写入结果和统计信息
+     * 
+     * @param exec_status 执行状态（如果出错，会取消写入）
+     * @return 关闭状态
+     */
     Status close(Status) override;
 
+    /**
+     * 初始化写入器
+     * 主要流程：
+     * 1. 解析表结构、分区信息、副本信息等
+     * 2. 创建 IndexChannel 和 NodeChannel
+     * 3. 初始化行分布器（用于数据路由）
+     * 4. 启动后台发送线程（_send_batch_process）
+     * 
+     * @param state 运行时状态
+     * @param profile 性能分析器
+     * @return 初始化状态
+     */
     Status open(RuntimeState* state, RuntimeProfile* profile) override;
 
-    // the consumer func of sending pending batches in every NodeChannel.
-    // use polling & NodeChannel::try_send_and_fetch_status() to achieve nonblocking sending.
-    // only focus on pending batches and channel status, the internal errors of NodeChannels will be handled by the producer
+    /**
+     * 后台发送线程的主循环函数
+     * 
+     * 功能：
+     * - 轮询所有 NodeChannel，检查是否有待发送的数据块
+     * - 调用 NodeChannel::try_send_and_fetch_status() 非阻塞发送
+     * - 只关注待发送批次和通道状态，NodeChannel 的内部错误由生产者处理
+     * 
+     * 实现方式：
+     * - 使用轮询 + NodeChannel::try_send_and_fetch_status() 实现非阻塞发送
+     * - 避免阻塞主线程，提高并发性能
+     */
     void _send_batch_process();
 
+    /**
+     * 处理自动分区创建的结果
+     * 当检测到新分区需要创建时，会调用 FE 创建分区，然后通过此函数处理结果
+     * 
+     * @param result 分区创建结果
+     * @return 处理状态
+     */
     Status on_partitions_created(TCreatePartitionResult* result);
 
+    /**
+     * 发送新创建分区的数据批次
+     * 在分区创建成功后，将之前缓存的数据发送到新分区
+     * 
+     * @return 发送状态
+     */
     Status _send_new_partition_batch();
 
 private:
     friend class VNodeChannel;
     friend class IndexChannel;
 
+    // 通道分发负载：将数据按 NodeChannel 分组，每个 NodeChannel 对应一个 Payload（行选择器和 tablet_id 列表）
     using ChannelDistributionPayload = std::unordered_map<VNodeChannel*, Payload>;
+    // 多个索引通道的分发负载（用于支持物化视图等）
     using ChannelDistributionPayloadVec = std::vector<std::unordered_map<VNodeChannel*, Payload>>;
 
+    /**
+     * 初始化行分布器（VRowDistribution）
+     * 行分布器负责根据分区键计算每行数据属于哪个分区和 tablet
+     */
     Status _init_row_distribution();
 
+    /**
+     * 内部初始化函数，由 open() 调用
+     * 负责解析配置、创建通道、初始化各种组件
+     */
     Status _init(RuntimeState* state, RuntimeProfile* profile);
 
+    /**
+     * 为单个索引通道生成分发负载
+     * 将行分区 tablet 信息转换为按 NodeChannel 分组的数据负载
+     * 
+     * @param row_part_tablet_tuple 行对应的分区和 tablet 信息
+     * @param index_idx 索引索引（0 为主表，>0 为物化视图）
+     * @param channel_payload 输出的通道负载（按 NodeChannel 分组）
+     */
     void _generate_one_index_channel_payload(RowPartTabletIds& row_part_tablet_tuple,
                                              int32_t index_idx,
                                              ChannelDistributionPayload& channel_payload);
 
+    /**
+     * 为所有索引通道生成分发负载
+     * 批量处理多行数据，生成每个索引通道对应的负载
+     * 
+     * @param row_part_tablet_ids 多行数据的分区 tablet 信息
+     * @param payload 输出的负载向量（每个元素对应一个索引通道）
+     */
     void _generate_index_channels_payloads(std::vector<RowPartTabletIds>& row_part_tablet_ids,
                                            ChannelDistributionPayloadVec& payload);
 
+    /**
+     * 取消所有通道的写入操作
+     * 当发生错误时，通知所有 NodeChannel 停止写入
+     * 
+     * @param status 取消原因
+     */
     void _cancel_all_channel(Status status);
 
+    /**
+     * 增量打开 NodeChannel（用于自动分区场景）
+     * 当检测到新分区时，需要为新分区创建对应的 NodeChannel 并打开连接
+     * 
+     * @param partitions 新创建的分区列表
+     * @return 打开状态
+     */
     Status _incremental_open_node_channel(const std::vector<TOlapTablePartition>& partitions);
 
+    /**
+     * 尝试关闭写入器（内部实现）
+     * 标记所有通道为关闭状态，但不等待完成
+     * 
+     * @param state 运行时状态
+     * @param exec_status 执行状态
+     */
     void _do_try_close(RuntimeState* state, const Status& exec_status);
 
+    /**
+     * 构建 tablet 的副本信息
+     * 记录每个 tablet 的总副本数和写入所需的副本数（用于 quorum 判断）
+     * 
+     * @param tablet_id tablet ID
+     * @param partition 分区信息
+     */
     void _build_tablet_replica_info(const int64_t tablet_id, VOlapTablePartition* partition);
 
+    // FE 下发的数据写入配置（包含表信息、分区信息、副本信息等）
     TDataSink _t_sink;
 
+    // 内存跟踪器，用于监控写入过程中的内存使用
     std::shared_ptr<MemTracker> _mem_tracker;
 
+    // 对象池，用于管理临时对象的生命周期
     ObjectPool* _pool = nullptr;
 
+    // 后台发送线程 ID（用于发送待发送的数据批次）
     bthread_t _sender_thread = 0;
 
-    // unique load id
+    // 本次导入的唯一标识（由 FE 生成，用于标识一次导入任务）
     PUniqueId _load_id;
+    // 事务 ID（用于 2PC 事务提交）
     int64_t _txn_id = -1;
+    // 副本数量（每个 tablet 的副本数）
     int _num_replicas = -1;
+    // 输出元组的描述符 ID
     int _tuple_desc_id = -1;
 
-    // this is tuple descriptor of destination OLAP table
+    // 目标 OLAP 表的元组描述符（定义表的结构）
     TupleDescriptor* _output_tuple_desc = nullptr;
+    // 输出行描述符（用于行格式转换）
     RowDescriptor* _output_row_desc = nullptr;
 
-    // number of senders used to insert into OlapTable, if we only support single node insert,
-    // all data from select should collectted and then send to OlapTable.
-    // To support multiple senders, we maintain a channel for each sender.
+    // 发送者 ID（用于多发送者场景，每个发送者负责一部分数据）
+    // 如果只支持单节点插入，所有数据需要先收集再发送
+    // 为了支持多发送者，为每个发送者维护一个通道
     int _sender_id = -1;
+    // 发送者总数
     int _num_senders = -1;
+    // 是否为高优先级任务
     bool _is_high_priority = false;
 
+    // 表结构参数（包含列信息、索引信息等）
     // TODO(zc): think about cache this data
     std::shared_ptr<OlapTableSchemaParam> _schema;
+    // 主副本位置参数（用于路由数据到正确的 BE）
     OlapTableLocationParam* _location = nullptr;
+    // 是否只写入单个副本（性能优化选项）
     bool _write_single_replica = false;
+    // 从副本位置参数（用于单副本写入时的备份）
     OlapTableLocationParam* _slave_location = nullptr;
+    // BE 节点信息（包含所有 BE 的地址、端口等）
     DorisNodesInfo* _nodes_info = nullptr;
 
+    // Tablet 查找器（根据分区键快速定位 tablet）
     std::unique_ptr<OlapTabletFinder> _tablet_finder;
 
-    // index_channel
+    // 索引通道相关
+    // 保护通道操作的互斥锁（防止并发修改通道状态）
     bthread::Mutex _stop_check_channel;
+    // 所有索引通道列表（每个表/物化视图对应一个 IndexChannel）
     std::vector<std::shared_ptr<IndexChannel>> _channels;
+    // 索引 ID 到通道的映射（快速查找）
     std::unordered_map<int64_t, std::shared_ptr<IndexChannel>> _index_id_to_channel;
 
+    // 发送批次的线程池令牌（用于控制并发发送）
     std::unique_ptr<ThreadPoolToken> _send_batch_thread_pool_token;
 
-    // support only one partition column now
+    // 需要创建的分区列表（用于自动分区场景）
+    // 目前只支持单个分区列
     std::vector<std::vector<TStringLiteral>> _partitions_need_create;
 
+    // Block 转换器（负责 Block 格式转换、列映射、数据验证等）
     std::unique_ptr<OlapTableBlockConvertor> _block_convertor;
-    // Stats for this
-    int64_t _send_data_ns = 0;
-    int64_t _number_input_rows = 0;
-    int64_t _number_output_rows = 0;
-    int64_t _filter_ns = 0;
+    // 统计信息
+    int64_t _send_data_ns = 0;              // 发送数据耗时（纳秒）
+    int64_t _number_input_rows = 0;        // 输入行数
+    int64_t _number_output_rows = 0;        // 输出行数（过滤后）
+    int64_t _filter_ns = 0;                 // 过滤耗时（纳秒）
 
+    // 行分布计时器（用于性能分析）
     MonotonicStopWatch _row_distribution_watch;
 
-    RuntimeProfile::Counter* _input_rows_counter = nullptr;
-    RuntimeProfile::Counter* _output_rows_counter = nullptr;
-    RuntimeProfile::Counter* _filtered_rows_counter = nullptr;
-    RuntimeProfile::Counter* _send_data_timer = nullptr;
-    RuntimeProfile::Counter* _row_distribution_timer = nullptr;
-    RuntimeProfile::Counter* _append_node_channel_timer = nullptr;
-    RuntimeProfile::Counter* _filter_timer = nullptr;
-    RuntimeProfile::Counter* _where_clause_timer = nullptr;
-    RuntimeProfile::Counter* _add_partition_request_timer = nullptr;
-    RuntimeProfile::Counter* _wait_mem_limit_timer = nullptr;
-    RuntimeProfile::Counter* _validate_data_timer = nullptr;
-    RuntimeProfile::Counter* _open_timer = nullptr;
-    RuntimeProfile::Counter* _close_timer = nullptr;
-    RuntimeProfile::Counter* _non_blocking_send_timer = nullptr;
-    RuntimeProfile::Counter* _non_blocking_send_work_timer = nullptr;
-    RuntimeProfile::Counter* _serialize_batch_timer = nullptr;
-    RuntimeProfile::Counter* _total_add_batch_exec_timer = nullptr;
-    RuntimeProfile::Counter* _max_add_batch_exec_timer = nullptr;
-    RuntimeProfile::Counter* _total_wait_exec_timer = nullptr;
-    RuntimeProfile::Counter* _max_wait_exec_timer = nullptr;
-    RuntimeProfile::Counter* _add_batch_number = nullptr;
-    RuntimeProfile::Counter* _num_node_channels = nullptr;
-    RuntimeProfile::Counter* _load_back_pressure_version_time_ms = nullptr;
+    // 性能计数器（RuntimeProfile）
+    RuntimeProfile::Counter* _input_rows_counter = nullptr;                    // 输入行数计数器
+    RuntimeProfile::Counter* _output_rows_counter = nullptr;                    // 输出行数计数器
+    RuntimeProfile::Counter* _filtered_rows_counter = nullptr;                  // 过滤行数计数器
+    RuntimeProfile::Counter* _send_data_timer = nullptr;                        // 发送数据耗时
+    RuntimeProfile::Counter* _row_distribution_timer = nullptr;                 // 行分布耗时
+    RuntimeProfile::Counter* _append_node_channel_timer = nullptr;              // 追加到 NodeChannel 耗时
+    RuntimeProfile::Counter* _filter_timer = nullptr;                           // 过滤耗时
+    RuntimeProfile::Counter* _where_clause_timer = nullptr;                     // WHERE 子句过滤耗时
+    RuntimeProfile::Counter* _add_partition_request_timer = nullptr;            // 添加分区请求耗时
+    RuntimeProfile::Counter* _wait_mem_limit_timer = nullptr;                   // 等待内存限制耗时
+    RuntimeProfile::Counter* _validate_data_timer = nullptr;                    // 数据验证耗时
+    RuntimeProfile::Counter* _open_timer = nullptr;                              // 打开耗时
+    RuntimeProfile::Counter* _close_timer = nullptr;                             // 关闭耗时
+    RuntimeProfile::Counter* _non_blocking_send_timer = nullptr;                 // 非阻塞发送总耗时
+    RuntimeProfile::Counter* _non_blocking_send_work_timer = nullptr;            // 非阻塞发送实际工作耗时
+    RuntimeProfile::Counter* _serialize_batch_timer = nullptr;                  // 序列化批次耗时
+    RuntimeProfile::Counter* _total_add_batch_exec_timer = nullptr;              // 总 add_batch 执行耗时
+    RuntimeProfile::Counter* _max_add_batch_exec_timer = nullptr;                // 最大 add_batch 执行耗时
+    RuntimeProfile::Counter* _total_wait_exec_timer = nullptr;                   // 总等待执行耗时
+    RuntimeProfile::Counter* _max_wait_exec_timer = nullptr;                     // 最大等待执行耗时
+    RuntimeProfile::Counter* _add_batch_number = nullptr;                        // add_batch 调用次数
+    RuntimeProfile::Counter* _num_node_channels = nullptr;                       // NodeChannel 数量
+    RuntimeProfile::Counter* _load_back_pressure_version_time_ms = nullptr;      // 负载背压版本等待时间
 
-    // the timeout of load channels opened by this tablet sink. in second
+    // 本次 tablet sink 打开的 load channel 的超时时间（秒）
     int64_t _load_channel_timeout_s = 0;
-    // the load txn absolute expiration time.
+    // 导入事务的绝对过期时间（时间戳）
     int64_t _txn_expiration = 0;
 
+    // 发送批次的并行度（控制同时发送的批次数量）
     int32_t _send_batch_parallelism = 1;
-    // Save the status of try_close() and close() method
+    // 保存 try_close() 和 close() 方法的状态
     Status _close_status;
-    // if we called try_close(), for auto partition the periodic send thread should stop if it's still waiting for node channels first-time open.
+    // 如果调用了 try_close()，对于自动分区场景，周期性发送线程应该停止等待首次打开的 node channels
     bool _try_close = false;
-    // for non-pipeline, if close() did something, close_wait() should wait it.
+    // 对于非 pipeline 模式，如果 close() 做了某些操作，close_wait() 应该等待它完成
     bool _close_wait = false;
+    // 是否已初始化
     bool _inited = false;
+    // 是否写入文件缓存
     bool _write_file_cache = false;
 
-    // User can change this config at runtime, avoid it being modified during query or loading process.
+    // 是否通过 brpc 传输大数据（用户可以在运行时修改此配置，避免在查询或加载过程中被修改）
     bool _transfer_large_data_by_brpc = false;
 
+    // OLAP 表分区参数（包含分区信息、分区键等）
     VOlapTablePartitionParam* _vpartition = nullptr;
 
+    // 运行时状态（不拥有所有权，在 open 时设置）
     RuntimeState* _state = nullptr; // not owned, set when open
 
+    // 行分布器（根据分区键计算每行数据属于哪个分区和 tablet）
     VRowDistribution _row_distribution;
-    // reuse to avoid frequent memory allocation and release.
+    // 复用向量，避免频繁的内存分配和释放
+    // 存储每行数据对应的分区和 tablet ID 信息
     std::vector<RowPartTabletIds> _row_part_tablet_ids;
 
-    // tablet_id -> <total replicas num, load required replicas num>
+    // Tablet 副本信息映射：tablet_id -> <总副本数, 写入所需副本数>
+    // 用于判断是否达到 quorum，决定是否可以提交事务
     std::unordered_map<int64_t, std::pair<int, int>> _tablet_replica_info;
 };
 } // namespace doris::vectorized

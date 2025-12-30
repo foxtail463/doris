@@ -355,24 +355,111 @@ public class UnequalPredicateInfer {
             }
         }
 
+        /**
+         * 根据 chosen 矩阵生成新的比较谓词。
+         * 
+         * 该方法遍历 chosen 矩阵，对于每个被选中的关系（GT, GTE, EQ），
+         * 创建对应的比较谓词对象，并进行规范化处理。
+         * 
+         * ==================== 处理流程 ====================
+         * 
+         * 【步骤1：遍历关系矩阵】
+         * 遍历 chosen 矩阵的所有位置 (i, j)，其中：
+         * - i：左表达式的索引（usedExprs[i]）
+         * - j：右表达式的索引（usedExprs[j]）
+         * 
+         * 【步骤2：跳过无效情况】
+         * 以下情况会被跳过，不生成谓词：
+         * - i == j：自己和自己比较（如 id = id），这是恒真的，不需要生成
+         * - isAllLiteral(i, j)：两个字面量之间的比较（如 2 < 10），
+         *   这种比较是常量比较，在查询优化中没有意义
+         * 
+         * 【步骤3：生成比较谓词】
+         * 根据 chosen[i][j] 的关系类型，创建对应的比较谓词：
+         * - Relation.GT → new GreaterThan(left, right)
+         * - Relation.GTE → new GreaterThanEqual(left, right)
+         * - Relation.EQ → new EqualTo(left, right)
+         * 
+         * 【步骤4：规范化谓词】
+         * 调用 normalize() 方法对生成的谓词进行规范化：
+         * - normalizePredicate()：确保常量在右边（如 2 < id → id > 2）
+         * - TypeCoercionUtils.processComparisonPredicate()：进行类型转换
+         * - withInferred(true)：设置 inferred 标志，标记为推导出的谓词
+         * 
+         * 【步骤5：处理等值关系】
+         * 对于等值关系（EQ），生成谓词后需要清除 chosen 矩阵中的对应关系：
+         * - 清除 chosen[i][j] = UNDEFINED
+         * - 清除 chosen[j][i] = UNDEFINED（因为等值关系是对称的）
+         * 这样可以避免重复生成相同的等值谓词
+         * 
+         * 【步骤6：异常处理】
+         * 如果类型转换失败（AnalysisException），跳过该谓词，继续处理下一个
+         * 
+         * ==================== 示例 ====================
+         * 
+         * 输入：
+         * usedExprs = [id#0, 2, 10]
+         * chosen 矩阵：
+         *        id#0    2     10
+         * id#0    EQ     EQ    GT
+         * 2       EQ     EQ    ?
+         * 10      ?      ?     EQ
+         * 
+         * 处理过程：
+         * 1. (0, 0)：i == j，跳过
+         * 2. (0, 1)：chosen[0][1] = EQ → 生成 id#0 = 2，清除 chosen[0][1] 和 chosen[1][0]
+         * 3. (0, 2)：chosen[0][2] = GT → 生成 id#0 > 10
+         * 4. (1, 0)：chosen[1][0] = UNDEFINED（已被清除），跳过
+         * 5. (1, 1)：i == j，跳过
+         * 6. (1, 2)：isAllLiteral(1, 2) = true（2 和 10 都是字面量），跳过
+         * 7. (2, 0)：chosen[2][0] = UNDEFINED，跳过
+         * 8. (2, 1)：isAllLiteral(2, 1) = true，跳过
+         * 9. (2, 2)：i == j，跳过
+         * 
+         * 结果：
+         * newPredicates = {
+         *     id#0 = 2,      // 规范化后，inferred=true
+         *     id#0 > 10      // 规范化后，inferred=true
+         * }
+         * 
+         * ==================== 关键点 ====================
+         * 
+         * 1. 生成的谓词都会设置 inferred=true，表示这是推导出的谓词
+         * 2. 等值关系生成后会清除，避免重复
+         * 3. 常量比较会被跳过，因为它们在查询优化中没有意义
+         * 4. 类型转换失败不会中断整个流程，只是跳过该谓词
+         * 
+         * @param chosen 经过选择的关系矩阵，包含需要生成谓词的关系
+         * @return 生成的新比较谓词集合，所有谓词的 inferred 标志都设置为 true
+         */
         private Set<Expression> generatePredicates(Relation[][] chosen) {
             Set<Expression> newPredicates = new LinkedHashSet<>();
+            // 遍历关系矩阵的所有位置
             for (int i = 0; i < size; ++i) {
                 for (int j = 0; j < size; ++j) {
+                    // 跳过自己和自己比较（恒真，无意义）
+                    // 跳过两个字面量之间的比较（常量比较，在查询优化中无意义）
                     if (i == j || isAllLiteral(i, j)) {
                         continue;
                     }
                     try {
+                        // 根据关系类型生成对应的比较谓词
                         if (chosen[i][j] == Relation.GT) {
+                            // 生成大于谓词：usedExprs[i] > usedExprs[j]
+                            // normalize() 会规范化谓词并设置 inferred=true
                             newPredicates.add(normalize(new GreaterThan(usedExprs.get(i), usedExprs.get(j))));
                         } else if (chosen[i][j] == Relation.GTE) {
+                            // 生成大于等于谓词：usedExprs[i] >= usedExprs[j]
                             newPredicates.add(normalize(new GreaterThanEqual(usedExprs.get(i), usedExprs.get(j))));
                         } else if (chosen[i][j] == Relation.EQ) {
+                            // 生成等值谓词：usedExprs[i] = usedExprs[j]
                             newPredicates.add(normalize(new EqualTo(usedExprs.get(i), usedExprs.get(j))));
+                            // 等值关系是对称的，生成后清除 chosen 矩阵中的对应关系，避免重复生成
                             clear(chosen, i, j, Relation.EQ);
                         }
                     } catch (AnalysisException e) {
-                        // type error, just not generate this predicate, do nothing but continue
+                        // 类型转换失败（如无法比较的类型），跳过该谓词，继续处理下一个
+                        // 这种情况通常发生在类型不兼容的表达式之间（如字符串和数字）
                     }
                 }
             }
@@ -539,21 +626,128 @@ public class UnequalPredicateInfer {
         }
     }
 
-    /**inferUnequalPredicates*/
+    /**
+     * 推导不等值谓词：基于输入的比较谓词集合，推导出所有可能的传递关系和新谓词。
+     * 
+     * 该方法是不等值谓词推导的核心入口，通过构建推理图（InferenceGraph）并使用图算法
+     * 来推导传递关系，最终生成新的比较谓词。
+     * 
+     * ==================== 处理流程 ====================
+     * 
+     * 【步骤1：构建推理图】
+     * 创建 InferenceGraph 对象，解析输入谓词：
+     * - 提取所有比较谓词（ComparisonPredicate）
+     * - 提取谓词两边的表达式（Slot 或 Literal）
+     * - 构建表达式索引映射（usedExprs, usedExprPosition）
+     * - 构建关系矩阵（graph），记录表达式之间的比较关系（GT, GTE, EQ）
+     * 
+     * 【步骤2：推导传递关系】
+     * 使用 Floyd-Warshall 算法推导传递闭包：
+     * - 如果 a < b 且 b < c，则推导出 a < c
+     * - 如果 a = b 且 b > c，则推导出 a > c
+     * - 例如：id = 2 和 id > 10 可以推导出 2 < 10（但常量比较会被跳过）
+     * 
+     * 【步骤3：选择等值谓词】
+     * 从推导后的关系矩阵中选择等值谓词：
+     * - 优先选择包含字面量的等值谓词（如 id = 5）
+     * - 选择表内等值谓词（如 t1.a = t1.b）
+     * - 选择跨表等值谓词（如 t1.a = t2.b）
+     * - 记录与常量相等的表达式集合（equalWithConstant）
+     * 
+     * 【步骤4：选择不等值谓词】
+     * 从推导后的关系矩阵中选择不等值谓词：
+     * - 使用拓扑排序确定表达式顺序
+     * - 过滤掉可以通过中间表达式推导出的谓词（避免冗余）
+     * - 保留索引列或分区列的谓词（即使可推导也保留，用于优化）
+     * - 只选择表内过滤谓词（isTableFilter）
+     * 
+     * 【步骤5：选择输入谓词】
+     * 从原始输入谓词中选择需要保留的：
+     * - 如果输入谓词在 chosen 矩阵中被选中，则保留
+     * - 如果输入谓词无法通过 chosen 矩阵推导出，则保留（避免丢失信息）
+     * - 如果输入谓词可以通过 chosen 矩阵推导出，则移除（冗余谓词）
+     * 
+     * 【步骤6：生成新谓词】
+     * 根据 chosen 矩阵生成新的比较谓词：
+     * - 遍历 chosen 矩阵，对于每个关系（GT, GTE, EQ）
+     * - 创建对应的比较谓词对象（GreaterThan, GreaterThanEqual, EqualTo）
+     * - 规范化谓词（normalize）：确保常量在右边，进行类型转换
+     * - 设置 inferred=true 标志，标记为推导出的谓词
+     * 
+     * 【步骤7：合并结果】
+     * 合并所有谓词：
+     * - 选择的输入谓词（chooseInputPredicates）
+     * - 生成的新谓词（generatePredicates）
+     * - 其他无法处理的谓词（otherPredicates，如包含函数的谓词）
+     * 
+     * ==================== 示例 ====================
+     * 
+     * 输入：{id = 2, id > 10}
+     * 
+     * 1. 构建推理图：
+     *    usedExprs = [id#0, 2, 10]
+     *    graph[0][1] = EQ  (id = 2)
+     *    graph[0][2] = GT  (id > 10)
+     * 
+     * 2. 推导传递关系：
+     *    deduce() 推导出 graph[1][2] = LT  (2 < 10，但会被跳过，因为是常量比较)
+     * 
+     * 3. 选择等值谓词：
+     *    chosen[0][1] = EQ  (id = 2)
+     *    equalWithConstant = {0}  (id 与常量 2 相等)
+     * 
+     * 4. 选择不等值谓词：
+     *    chosen[0][2] = GT  (id > 10)
+     * 
+     * 5. 选择输入谓词：
+     *    id = 2 和 id > 10 都在 chosen 中，都保留
+     * 
+     * 6. 生成新谓词：
+     *    根据 id = 2 和 id > 10，可能推导出 id >= 2
+     *    （具体推导逻辑在 chooseUnequalPredicates 中）
+     * 
+     * 7. 返回结果：
+     *    {id = 2, id > 10, id >= 2}  (id >= 2 的 inferred=true)
+     * 
+     * ==================== 关键点 ====================
+     * 
+     * 1. 推导出的新谓词会设置 inferred=true 标志，用于后续过滤
+     * 2. 冗余谓词会被移除，只保留最小集合
+     * 3. 索引列和分区列的谓词会被特殊处理，即使可推导也保留
+     * 4. 包含函数的谓词会被放入 otherPredicates，不参与推导
+     * 
+     * @param inputs 输入的表达式集合，通常包含比较谓词（ComparisonPredicate）
+     * @return 推导后的表达式集合，包含原始谓词和推导出的新谓词
+     */
     public static Set<? extends Expression> inferUnequalPredicates(Set<Expression> inputs) {
+        // 如果输入少于2个谓词，无法进行推导，直接返回
         if (inputs.size() < 2) {
             return inputs;
         }
+        // 步骤1：构建推理图，解析输入谓词并构建关系矩阵
         InferenceGraph inferGraph = new InferenceGraph(inputs);
+        // 如果没有可用的表达式（所有谓词都无法处理），直接返回输入
         if (inferGraph.usedExprs.isEmpty()) {
             return inputs;
         }
+        // 步骤2：使用 Floyd-Warshall 算法推导传递关系
+        // 例如：a < b 且 b < c → a < c
         inferGraph.deduce(inferGraph.graph);
+        // 记录与常量相等的表达式索引集合（用于后续选择策略）
         Set<Integer> equalWithConstant = new HashSet<>();
+        // 步骤3：从推导后的关系矩阵中选择等值谓词
+        // 优先选择包含字面量的等值谓词，记录 equalWithConstant
         InferenceGraph.Relation[][] chosen = inferGraph.chooseEqualPredicates(equalWithConstant);
+        // 步骤4：从推导后的关系矩阵中选择不等值谓词
+        // 过滤掉可推导的冗余谓词，保留必要的谓词
         inferGraph.chooseUnequalPredicates(chosen, equalWithConstant);
+        // 步骤5：从原始输入谓词中选择需要保留的谓词
+        // 移除可以通过 chosen 矩阵推导出的冗余谓词
         Set<Expression> newPredicates = inferGraph.chooseInputPredicates(chosen);
+        // 步骤6：根据 chosen 矩阵生成新的比较谓词
+        // 新生成的谓词会设置 inferred=true 标志
         newPredicates.addAll(inferGraph.generatePredicates(chosen));
+        // 步骤7：添加其他无法处理的谓词（如包含函数的谓词）
         newPredicates.addAll(inferGraph.otherPredicates);
         return newPredicates;
     }

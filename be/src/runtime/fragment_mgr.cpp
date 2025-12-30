@@ -844,66 +844,130 @@ std::string FragmentMgr::dump_pipeline_tasks(TUniqueId& query_id) {
     }
 }
 
+/**
+ * 执行 Pipeline Fragment（执行计划片段）
+ * 
+ * 该函数是 BE 执行查询计划的核心入口，负责：
+ * 1. 获取或创建 QueryContext（查询上下文），管理查询的生命周期和资源
+ * 2. 创建 PipelineFragmentContext（Pipeline 片段上下文），封装执行计划片段
+ * 3. 准备（prepare）上下文：构建 pipelines、初始化运行时状态、创建 pipeline tasks
+ * 4. 将上下文注册到 _pipeline_map，避免重复执行
+ * 5. 提交（submit）pipeline tasks 到执行器，开始实际执行
+ * 
+ * @param params Pipeline Fragment 参数，包含执行计划、查询选项等
+ * @param query_source 查询来源（如 Stream Load、Routine Load、普通查询等）
+ * @param cb 完成回调函数，在 fragment 执行完成时调用
+ * @param parent 父 Fragment 参数列表（用于多阶段查询）
+ * @return Status 返回执行状态，成功返回 OK，失败返回相应的错误状态
+ */
 Status FragmentMgr::exec_plan_fragment(const TPipelineFragmentParams& params,
                                        QuerySource query_source, const FinishCallback& cb,
                                        const TPipelineFragmentParamsList& parent) {
+    // 记录执行计划参数（用于调试）
+    // 由于 TPipelineFragmentParams 的 debug string 可能很长，glog 会截断日志行
+    // 所以单独打印 query_options 以便调试
     VLOG_ROW << "Query: " << print_id(params.query_id) << " exec_plan_fragment params is "
              << apache::thrift::ThriftDebugString(params).c_str();
-    // sometimes TPipelineFragmentParams debug string is too long and glog
-    // will truncate the log line, so print query options seperately for debuggin purpose
     VLOG_ROW << "Query: " << print_id(params.query_id) << "query options is "
              << apache::thrift::ThriftDebugString(params.query_options).c_str();
 
+    // 1. 获取或创建 QueryContext（查询上下文）
+    // QueryContext 管理整个查询的生命周期，包括：
+    // - 查询 ID、查询选项、资源跟踪
+    // - 多个 Fragment 之间的协调
+    // - 查询的取消和清理
     std::shared_ptr<QueryContext> query_ctx;
     RETURN_IF_ERROR(_get_or_create_query_ctx(params, parent, query_source, query_ctx));
+    
+    // 将当前任务附加到查询的资源上下文中，用于资源跟踪和限制
     SCOPED_ATTACH_TASK(query_ctx.get()->resource_ctx());
+    
     int64_t duration_ns = 0;
+    
+    // 2. 创建 PipelineFragmentContext（Pipeline 片段上下文）
+    // PipelineFragmentContext 封装了一个执行计划片段的执行逻辑，包括：
+    // - Pipeline 的构建和管理
+    // - Pipeline Tasks 的创建和调度
+    // - 执行状态的跟踪和报告
     std::shared_ptr<pipeline::PipelineFragmentContext> context =
             std::make_shared<pipeline::PipelineFragmentContext>(
                     query_ctx->query_id(), params, query_ctx, _exec_env, cb,
+                    // 状态报告回调：当 Pipeline 需要报告状态时调用
                     [this](const ReportStatusRequest& req, auto&& ctx) {
                         return this->trigger_pipeline_context_report(req, std::move(ctx));
                     });
+    
+    // 3. 准备（prepare）Pipeline Fragment Context
+    // prepare 阶段包括：
+    // - 初始化运行时状态（RuntimeState）
+    // - 构建 Pipeline 树结构
+    // - 规划本地数据交换（Local Exchange）
+    // - 准备所有 Pipeline（初始化 Operator）
+    // - 创建 Pipeline Tasks（将 Pipeline 转换为可执行的任务）
     {
         SCOPED_RAW_TIMER(&duration_ns);
         Status prepare_st = Status::OK();
+        // 使用线程池并行准备多个 Pipeline Tasks（如果并行度足够大）
         ASSIGN_STATUS_IF_CATCH_EXCEPTION(prepare_st = context->prepare(_thread_pool.get()),
                                          prepare_st);
+        
+        // 调试钩子：用于测试 prepare 失败的情况
         DBUG_EXECUTE_IF("FragmentMgr.exec_plan_fragment.prepare_failed", {
             prepare_st = Status::Aborted("FragmentMgr.exec_plan_fragment.prepare_failed");
         });
+        
+        // 如果 prepare 失败，取消查询并返回错误
         if (!prepare_st.ok()) {
             query_ctx->cancel(prepare_st, params.fragment_id);
             return prepare_st;
         }
     }
+    
+    // 记录 prepare 阶段的耗时（微秒）
     g_fragmentmgr_prepare_latency << (duration_ns / 1000);
 
+    // 调试钩子：用于测试执行失败的情况
     DBUG_EXECUTE_IF("FragmentMgr.exec_plan_fragment.failed",
                     { return Status::Aborted("FragmentMgr.exec_plan_fragment.failed"); });
+    
+    // 4. 注册 Pipeline Fragment Context 到 _pipeline_map
+    // 确保同一个 (query_id, fragment_id) 只在一个 BE 上执行一次
     {
+        // 更新统计信息：正在执行的 fragment 数量和时间戳
         int64_t now = duration_cast<std::chrono::milliseconds>(
                               std::chrono::system_clock::now().time_since_epoch())
                               .count();
         g_fragment_executing_count << 1;
         g_fragment_last_active_time.set_value(now);
 
-        // (query_id, fragment_id) is executed only on one BE, locks _pipeline_map.
+        // 检查是否已经存在相同的 (query_id, fragment_id)
+        // 如果存在，说明有重复的 fragment 执行请求，返回错误
         auto res = _pipeline_map.find({params.query_id, params.fragment_id});
         if (res != nullptr) {
             return Status::InternalError(
                     "exec_plan_fragment query_id({}) input duplicated fragment_id({})",
                     print_id(params.query_id), params.fragment_id);
         }
+        
+        // 将 context 注册到 _pipeline_map，用于后续的查询和取消操作
         _pipeline_map.insert({params.query_id, params.fragment_id}, context);
     }
 
+    // 5. 设置查询执行状态
+    // 如果不需要等待执行触发（need_wait_execution_trigger），则标记为可以执行
+    // 这通常用于多阶段查询，某些 fragment 需要等待其他 fragment 完成后才执行
     if (!params.__isset.need_wait_execution_trigger || !params.need_wait_execution_trigger) {
         query_ctx->set_ready_to_execute_only();
     }
 
+    // 将 Pipeline Fragment Context 关联到 QueryContext
+    // 这样 QueryContext 可以管理所有相关的 Fragment Context
     query_ctx->set_pipeline_context(params.fragment_id, context);
 
+    // 6. 提交（submit）Pipeline Tasks 到执行器
+    // submit 会将所有 Pipeline Tasks 提交到 PipelineExecutorScheduler
+    // 执行器会从线程池中分配线程来执行这些任务
+    // 任务开始执行后，会从数据源读取数据，经过各个 Operator 处理，最终写入数据
     RETURN_IF_ERROR(context->submit());
     return Status::OK();
 }

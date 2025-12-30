@@ -33,7 +33,8 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Get all pattern matching subtree in query plan from a group expression.
+ * 在一个 GroupExpression 上，枚举所有与给定 Pattern 匹配的子树。
+ * 结果以迭代器形式输出，每个元素是一棵具体的 plan 树（用真实子计划替换 GroupPlan）。
  */
 public class GroupExpressionMatching implements Iterable<Plan> {
     private final Pattern<Plan> pattern;
@@ -49,9 +50,7 @@ public class GroupExpressionMatching implements Iterable<Plan> {
         return new GroupExpressionIterator(pattern, groupExpression);
     }
 
-    /**
-     * Iterator to get all subtrees.
-     */
+    /** 迭代器：产出所有匹配到的子树 plan。 */
     public static class GroupExpressionIterator implements Iterator<Plan> {
         private final List<Plan> results = Lists.newArrayList();
         private int resultIndex = 0;
@@ -64,46 +63,48 @@ public class GroupExpressionMatching implements Iterable<Plan> {
          * @param groupExpression group expression to be matched
          */
         public GroupExpressionIterator(Pattern<Plan> pattern, GroupExpression groupExpression) {
+            // 1) 根节点形状必须先匹配上（只看 operator / predicates 不展开孩子）
             if (!pattern.matchRoot(groupExpression.getPlan())) {
                 return;
             }
 
-            int childrenGroupArity = groupExpression.arity();
-            int patternArity = pattern.arity();
+            int childrenGroupArity = groupExpression.arity(); // 实际子 Group 数
+            int patternArity = pattern.arity();                // pattern 的子模式数
+
+            // 2) 非子树模式下，子数目要兼容（考虑 multi/multiGroup 作为“0 个或多个”）
             if (!(pattern instanceof SubTreePattern)) {
-                // (logicalFilter(), multi()) match (logicalFilter()),
-                // but (logicalFilter(), logicalFilter(), multi()) not match (logicalFilter())
+                // 形如 (filter, multi()) 可匹配 (filter)；但 (filter, filter, multi()) 不能匹配 (filter)
                 boolean extraMulti = patternArity == childrenGroupArity + 1
                         && (pattern.hasMultiChild() || pattern.hasMultiGroupChild());
                 if (patternArity > childrenGroupArity && !extraMulti) {
                     return;
                 }
 
-                // (multi()) match (logicalFilter(), logicalFilter()),
-                // but (logicalFilter()) not match (logicalFilter(), logicalFilter())
+                // 形如 (multi()) 可匹配 (filter, filter)；但 (filter) 不能匹配 (filter, filter)
                 if (!pattern.isAny() && patternArity < childrenGroupArity
                         && !pattern.hasMultiChild() && !pattern.hasMultiGroupChild()) {
                     return;
                 }
             }
 
-            // Pattern.GROUP / Pattern.MULTI / Pattern.MULTI_GROUP can not match GroupExpression
+            // 3) GROUP/MULTI/MULTI_GROUP 这些“占位”模式不能直接匹配 GroupExpression 自身
             if (pattern.isGroup() || pattern.isMulti() || pattern.isMultiGroup()) {
                 return;
             }
 
-            // getPlan return the plan with GroupPlan as children
+            // 4) 取出当前 root 计划（子节点还是 GroupPlan 占位）
             Plan root = groupExpression.getPlan();
+
+            // 5) 无子模式（如 ANY）且非 SubTreePattern：只要根谓词匹配即可命中
             if (patternArity == 0 && !(pattern instanceof SubTreePattern)) {
                 if (pattern.matchPredicates(root)) {
-                    // if no children pattern, we treat all children as GROUP. e.g. Pattern.ANY.
-                    // leaf plan will enter this branch too, e.g. logicalRelation().
+                    // 没有子模式时，默认把所有孩子视作 GROUP，占位即可
                     results.add(root);
                 }
+
+            // 6) 有子 Group 时，逐子匹配并做笛卡尔组合
             } else if (childrenGroupArity > 0) {
-                // matching children group, one List<Plan> per child
-                // first dimension is every child group's plan
-                // second dimension is all matched plan in one group
+                // childrenPlans[i]：第 i 个子 Group 匹配到的所有 plan
                 List<Plan>[] childrenPlans = new List[childrenGroupArity];
                 for (int i = 0; i < childrenGroupArity; ++i) {
                     Group childGroup = groupExpression.child(i);
@@ -111,19 +112,21 @@ public class GroupExpressionMatching implements Iterable<Plan> {
 
                     if (childrenPlan.isEmpty()) {
                         if (pattern instanceof SubTreePattern) {
+                            // SubTreePattern 允许直接把子 Group 占位成 GroupPlan
                             childrenPlan = ImmutableList.of(new GroupPlan(childGroup));
                         } else {
-                            // current pattern is match but children patterns not match
+                            // 根匹配但某个子匹配失败，整体失败
                             return;
                         }
                     }
                     childrenPlans[i] = childrenPlan;
                 }
+                // 将根与各子候选做笛卡尔积，拼出所有匹配的具体 plan 树
                 assembleAllCombinationPlanTree(root, pattern, groupExpression, childrenPlans);
+
+            // 7) 叶子 Group 但 pattern 允许 multi()/multiGroup（零个或多个孩子）
             } else if (patternArity == 1 && (pattern.hasMultiChild() || pattern.hasMultiGroupChild())) {
-                // leaf group with multi child pattern
-                // e.g. logicalPlan(multi()) match LogicalOlapScan, because LogicalOlapScan is LogicalPlan
-                //      and multi() pattern indicate zero or more children()
+                // 如 logicalPlan(multi()) 可匹配 LogicalOlapScan（把“零个孩子”视为匹配）
                 if (pattern.matchPredicates(root)) {
                     results.add(root);
                 }
@@ -131,6 +134,7 @@ public class GroupExpressionMatching implements Iterable<Plan> {
             this.resultsSize = results.size();
         }
 
+        // 针对第 childIndex 个子 Group，用对应子模式去匹配，返回该子 Group 的所有匹配 plan
         private List<Plan> matchingChildGroup(Pattern<? extends Plan> parentPattern,
                 Group childGroup, int childIndex) {
             Pattern<? extends Plan> childPattern;
@@ -141,7 +145,7 @@ public class GroupExpressionMatching implements Iterable<Plan> {
                 int patternChildIndex = isLastPattern ? parentPattern.arity() - 1 : childIndex;
 
                 childPattern = parentPattern.child(patternChildIndex);
-                // translate MULTI and MULTI_GROUP to ANY and GROUP
+                // 把 MULTI/MULTI_GROUP 翻译成 ANY/GROUP（多余的孩子都归入最后一个子模式）
                 if (isLastPattern) {
                     if (childPattern.isMulti()) {
                         childPattern = Pattern.ANY;
@@ -151,10 +155,12 @@ public class GroupExpressionMatching implements Iterable<Plan> {
                 }
             }
 
+            // 递归调用 GroupMatching，在子 Group 内枚举所有匹配当前子模式的 plan
             List<Plan> matchingChildren = GroupMatching.getAllMatchingPlans(childPattern, childGroup);
             return matchingChildren;
         }
 
+        // 把根 + 各子匹配结果做笛卡尔积，生成所有匹配的具体 plan 树
         private void assembleAllCombinationPlanTree(Plan root, Pattern<Plan> rootPattern,
                 GroupExpression groupExpression, List<Plan>[] childrenPlans) {
             int childrenPlansSize = childrenPlans.length;
@@ -166,6 +172,7 @@ public class GroupExpressionMatching implements Iterable<Plan> {
             Optional<GroupExpression> groupExprOption = Optional.of(groupExpression);
             Optional<LogicalProperties> logicalPropOption = Optional.of(logicalProperties);
             while (offset < childrenPlansSize) {
+                // 取当前索引组合的一组子计划
                 ImmutableList.Builder<Plan> childrenBuilder = ImmutableList.builderWithExpectedSize(childrenPlansSize);
                 for (int i = 0; i < childrenPlansSize; i++) {
                     childrenBuilder.add(childrenPlans[i].get(childrenPlanIndex[i]));
@@ -175,11 +182,15 @@ public class GroupExpressionMatching implements Iterable<Plan> {
                 // assemble children: replace GroupPlan to real plan,
                 // withChildren will erase groupExpression, so we must
                 // withGroupExpression too.
+                // 将 GroupPlan 占位替换为真实子 plan，并带上 groupExpr / logicalProp 信息
                 Plan rootWithChildren = root.withGroupExprLogicalPropChildren(groupExprOption,
                         logicalPropOption, children);
+                // 最终再用 rootPattern 的谓词校验一遍
                 if (rootPattern.matchPredicates(rootWithChildren)) {
                     results.add(rootWithChildren);
                 }
+
+                // 递增“混合基数”计数器，遍历下一组子计划组合
                 for (offset = 0; offset < childrenPlansSize; offset++) {
                     childrenPlanIndex[offset]++;
                     if (childrenPlanIndex[offset] == childrenPlans[offset].size()) {

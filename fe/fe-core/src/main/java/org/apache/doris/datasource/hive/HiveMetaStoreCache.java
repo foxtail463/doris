@@ -894,18 +894,36 @@ public class HiveMetaStoreCache {
         }
     }
 
+    /**
+     * 文件缓存值类，用于存储文件列表和相关元数据信息
+     * 主要用于自分割器（self splitter）的文件缓存
+     */
     @Data
     public static class FileCacheValue {
-        // File Cache for self splitter.
+        /** 文件列表，存储 Hive 文件状态信息 */
         private final List<HiveFileStatus> files = Lists.newArrayList();
+        /** 标识文件是否可分割 */
         private boolean isSplittable;
-        // The values of partitions.
-        // e.g for file : hdfs://path/to/table/part1=a/part2=b/datafile
-        // partitionValues would be ["part1", "part2"]
+        /**
+         * 分区值列表，存储该文件所属分区的各个分区列的值
+         * 
+         * 从 Hive 分区名称中解析得到，例如：
+         * - 分区名称：nation=cn/city=beijing
+         * - partitionValues：["cn", "beijing"]
+         * 
+         * 这个字段用于标识缓存中的文件属于哪个分区，在后续的文件分割和查询处理中
+         * 可以根据分区值进行分区裁剪和优化
+         */
         protected List<String> partitionValues;
 
+        /** ACID 事务信息，用于支持 Hive 的 ACID 事务特性 */
         private AcidInfo acidInfo;
 
+        /**
+         * 添加文件到缓存列表
+         * @param file 远程文件对象
+         * @param locationPath 位置路径
+         */
         public void addFile(RemoteFile file, LocationPath locationPath) {
             if (isFileVisible(file.getPath())) {
                 HiveFileStatus status = new HiveFileStatus();
@@ -918,18 +936,36 @@ public class HiveMetaStoreCache {
             }
         }
 
+        /**
+         * 获取分区值的数量
+         * @return 分区值列表的大小，如果为 null 则返回 0
+         */
         public int getValuesSize() {
             return partitionValues == null ? 0 : partitionValues.size();
         }
 
+        /**
+         * 获取 ACID 事务信息
+         * @return ACID 事务信息对象
+         */
         public AcidInfo getAcidInfo() {
             return acidInfo;
         }
 
+        /**
+         * 设置 ACID 事务信息
+         * @param acidInfo ACID 事务信息对象
+         */
         public void setAcidInfo(AcidInfo acidInfo) {
             this.acidInfo = acidInfo;
         }
 
+        /**
+         * 判断文件是否可见
+         * Hive 会忽略以 _ 或 . 开头的隐藏文件
+         * @param path 文件路径
+         * @return 如果文件可见返回 true，否则返回 false
+         */
         @VisibleForTesting
         public static boolean isFileVisible(Path path) {
             if (path == null) {
@@ -942,11 +978,18 @@ public class HiveMetaStoreCache {
             return true;
         }
 
+        /**
+         * 检查路径是否包含隐藏路径
+         * Hive 会忽略以 _ 或 . 开头的文件和目录
+         * @param path 路径字符串
+         * @return 如果路径包含隐藏路径返回 true，否则返回 false
+         */
         private static boolean containsHiddenPath(String path) {
-            // Hive ignores files starting with _ and .
+            // Hive 会忽略以 _ 和 . 开头的文件
             if (path.startsWith(".") || path.startsWith("_")) {
                 return true;
             }
+            // 检查路径中是否包含以 /_ 或 /. 开头的目录或文件
             for (int i = 0; i < path.length() - 1; i++) {
                 if (path.charAt(i) == '/' && (path.charAt(i + 1) == '.' || path.charAt(i + 1) == '_')) {
                     return true;

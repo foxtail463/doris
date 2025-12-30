@@ -607,11 +607,15 @@ private:
     Status _fill_row_id_columns(Block* block);
 
     bool _seek_to_read_one_line() {
+        // 如果当前是按行号精确读取（_read_by_rows=true），则需要跳到指定行
         if (_read_by_rows) {
             if (_row_ids.empty()) {
+                // 没有行号可读，直接返回 false
                 return false;
             }
+            // 将 ORC Reader 定位到下一个要读取的行号
             _row_reader->seekToRow(_row_ids.front());
+            // 弹出已经处理过的行号
             _row_ids.pop_front();
         }
         return true;

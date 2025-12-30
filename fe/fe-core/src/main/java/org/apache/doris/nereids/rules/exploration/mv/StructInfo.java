@@ -135,6 +135,26 @@ public class StructInfo {
     // this is for building LogicalCompatibilityContext later.
     private final Map<ExpressionPosition, Map<Expression, Expression>> expressionToShuttledExpressionToMap;
 
+    // planOutputShuttledExpressions: 计划输出表达式经过 shuttle 后的结果（统一到基表列空间）
+    // 
+    // 构建过程（以查询计划为例）：
+    // 1. originalPlan.getOutput(): 计划输出的 NamedExpression 列表
+    //    例如：SELECT user_id, date_trunc(create_time, 'day') as dt, sum(amount) as total
+    //    输出：[user_id#5, Alias(dt#6, date_trunc(create_time#7, 'day')), Alias(total#8, sum(amount#9))]
+    // 
+    // 2. ExpressionUtils.shuttleExpressionWithLineage(originalPlan.getOutput(), originalPlan, new BitSet())
+    //    将输出表达式 shuttle 到基表列空间，展开 Alias，统一 ExprId 到基表列
+    //    结果：[user_id#0, date_trunc(create_time#0, 'day'), sum(amount#0)]
+    //    （所有列引用都统一到基表列空间，ExprId 变为基表列的 ExprId，如 user_id#0）
+    // 
+    // 作用：
+    // - 用于物化视图匹配：将查询和 MV 的输出表达式都统一到基表列空间后，才能正确匹配
+    // - 用于表达式重写：MaterializationContext 使用它构建 shuttledExprToScanExprMapping，
+    //   将查询表达式（基表列空间）映射到 MV scan 的输出 slot
+    // 
+    // 注意：
+    // - shuttle 过程会展开 Alias，只保留底层表达式（如 date_trunc(create_time#0, 'day')），不再有别名
+    // - 必须使用 originalPlan.getOutput() 而不是 derivedPlan.getOutput()，以确保输出顺序正确
     private final List<? extends Expression> planOutputShuttledExpressions;
 
     /**
@@ -256,19 +276,85 @@ public class StructInfo {
         return true;
     }
 
-    // derive some useful predicate by predicates
+    /**
+     * 从谓词中推导出分割谓词（SplitPredicate）和等价类（EquivalenceClass）。
+     * 
+     * 该方法用于物化视图重写，将原始谓词转换为便于匹配和补偿的形式。
+     * 
+     * ==================== 处理流程 ====================
+     * 
+     * 【步骤1：收集可上提的谓词】
+     * 从 predicates.getPulledUpPredicates() 获取所有可以上提到 HyperGraph 的谓词
+     * 例如：{a = b, b = c, id = 5, score > 10, (x = 1 OR y = 2)}
+     * 
+     * 【步骤2：Shuttle 到基表列空间】
+     * 使用 ExpressionUtils.shuttleExpressionWithLineage() 将谓词中的表达式回溯到基表列空间
+     * 目的：统一表达式到基表列空间，便于后续匹配
+     * 例如：
+     *   - 如果 a#5 是别名，对应基表列 a#0，则 a#5 = b#6 → a#0 = b#0
+     *   - 如果 id#10 是中间列，对应基表列 id#0，则 id#10 = 5 → id#0 = 5
+     * 
+     * 【步骤3：合并为 AND 表达式】
+     * 使用 ExpressionUtils.and() 将所有 shuttled 表达式合并为一个 AND 表达式
+     * 例如：AND(a#0 = b#0, b#0 = c#0, id#0 = 5, score#0 > 10, OR(x#0 = 1, y#0 = 2))
+     * 
+     * 【步骤4：分割谓词】
+     * 使用 Predicates.splitPredicates() 将合并后的表达式分割为三类：
+     * - 等值谓词（Equal Predicate）：列 = 列，如 a#0 = b#0, b#0 = c#0
+     * - 范围谓词（Range Predicate）：列 op 字面量，如 id#0 = 5, score#0 > 10
+     * - 残差谓词（Residual Predicate）：其他复杂表达式，如 OR(x#0 = 1, y#0 = 2)
+     * 
+     * 【步骤5：构建等价类】
+     * 遍历等值谓词（splitPredicate.getEqualPredicateMap()），提取列之间的等值关系：
+     * - a#0 = b#0 → 调用 equivalenceClass.addEquivalenceClass(a#0, b#0)
+     * - b#0 = c#0 → 调用 equivalenceClass.addEquivalenceClass(b#0, c#0)
+     * 
+     * EquivalenceClass.addEquivalenceClass() 会自动合并等价类（传递性）：
+     * - 第一次 addEquivalenceClass(a#0, b#0)：创建等价类 [a#0, b#0]
+     * - 第二次 addEquivalenceClass(b#0, c#0)：发现 b#0 已存在，合并为 [a#0, b#0, c#0]
+     * 
+     * 最终结果：
+     * EquivalenceClass {
+     *   equivalenceSlotMap = {
+     *     a#0 -> [a#0, b#0, c#0],
+     *     b#0 -> [a#0, b#0, c#0],
+     *     c#0 -> [a#0, b#0, c#0]
+     *   }
+     * }
+     * 
+     * ==================== 返回值 ====================
+     * 
+     * @param predicates 原始谓词集合（包含可上提和不可上提的谓词）
+     * @param originalPlan 原始计划（用于 shuttle 表达式到基表列空间）
+     * @return Pair<SplitPredicate, EquivalenceClass>
+     *         - SplitPredicate: 分割后的谓词（等值/范围/残差）
+     *         - EquivalenceClass: 等价类（列之间的等值关系）
+     * 
+     * ==================== 使用场景 ====================
+     * 
+     * 在 StructInfo.getEquivalenceClass() 和 StructInfo.getSplitPredicate() 中调用，
+     * 用于物化视图重写时的谓词匹配和补偿：
+     * - SplitPredicate 用于比较查询和MV的谓词差异
+     * - EquivalenceClass 用于等值谓词补偿（compensateEquivalence）
+     */
     private static Pair<SplitPredicate, EquivalenceClass> predicatesDerive(Predicates predicates, Plan originalPlan) {
-        // construct equivalenceClass according to equals predicates
+        // 步骤1-2：收集可上提的谓词并 shuttle 到基表列空间
         List<Expression> shuttledExpression = ExpressionUtils.shuttleExpressionWithLineage(
                         new ArrayList<>(predicates.getPulledUpPredicates()), originalPlan, new BitSet()).stream()
                 .map(Expression.class::cast)
                 .collect(Collectors.toList());
+        
+        // 步骤3-4：合并为 AND 表达式并分割为等值/范围/残差三类
         SplitPredicate splitPredicate = Predicates.splitPredicates(ExpressionUtils.and(shuttledExpression));
+        
+        // 步骤5：构建等价类（从等值谓词中提取列之间的等值关系）
         EquivalenceClass equivalenceClass = new EquivalenceClass();
         for (Expression expression : splitPredicate.getEqualPredicateMap().keySet()) {
+            // 跳过字面量（等值谓词应该是列 = 列的形式）
             if (expression instanceof Literal) {
                 continue;
             }
+            // 提取等值关系：列 = 列 → 添加到等价类
             if (expression instanceof EqualTo) {
                 EqualTo equalTo = (EqualTo) expression;
                 equivalenceClass.addEquivalenceClass(
@@ -288,25 +374,41 @@ public class StructInfo {
     }
 
     /**
-     * Build Struct info from plan.
-     * Maybe return multi structInfo when original plan already be rewritten by mv
+     * 从计划中构建 StructInfo。
+     * 这是 StructInfo 的静态工厂方法，用于分析计划结构并提取物化视图重写所需的信息。
+     * 
+     * @param derivedPlan 派生计划（可能已经经过优化，移除了不必要的节点）
+     * @param originalPlan 原始计划（逻辑输出是正确的），如果为 null 则使用 derivedPlan
+     * @param cascadesContext 优化器上下文
+     * @return 构建的 StructInfo 对象
      */
     public static StructInfo of(Plan derivedPlan, Plan originalPlan, CascadesContext cascadesContext) {
+        // 如果 originalPlan 为 null，使用 derivedPlan 作为 originalPlan
         if (originalPlan == null) {
             originalPlan = derivedPlan;
         }
-        // Split plan by the boundary which contains multi child
+        
+        // 步骤1：分割计划树
+        // 将计划按照包含多子节点的边界（如 Join）分割成 topPlan 和 bottomPlan
+        // bottomPlan 是包含表扫描和 Join 的部分（用于构建 HyperGraph）
+        // topPlan 是包含聚合、排序等操作的部分（用于收集谓词）
         LinkedHashSet<Class<? extends Plan>> set = Sets.newLinkedHashSet();
-        set.add(LogicalJoin.class);
+        set.add(LogicalJoin.class);  // 以 Join 作为分割边界
         PlanSplitContext planSplitContext = new PlanSplitContext(set);
-        // if single table without join, the bottom is
         derivedPlan.accept(PLAN_SPLITTER, planSplitContext);
         Plan topPlan = planSplitContext.getTopPlan();
         Plan bottomPlan = planSplitContext.getBottomPlan();
+        
+        // 步骤2：构建 HyperGraph
+        // HyperGraph 表示计划中的表连接关系，用于后续的表匹配和连接顺序优化
         HyperGraph hyperGraph = HyperGraph.builderForMv(planSplitContext.getBottomPlan()).build();
+        
+        // 步骤3：获取原始计划的 ObjectId（用于标识计划）
         ObjectId originalPlanId = originalPlan.getGroupExpression()
                 .map(GroupExpression::getId).orElseGet(() -> new ObjectId(-1));
-        // collect struct info fromGraph
+        
+        // 步骤4：从 HyperGraph 中收集结构信息
+        // 收集表关系、表达式映射、谓词映射等信息
         List<CatalogRelation> relationList = new ArrayList<>();
         Map<RelationId, StructInfoNode> relationIdStructInfoNodeMap = new LinkedHashMap<>();
         Map<ExpressionPosition, Multimap<Expression, Pair<Expression, HyperElement>>>
@@ -319,21 +421,33 @@ public class StructInfo {
                 relationIdStructInfoNodeMap,
                 tableBitSet,
                 cascadesContext);
+        
+        // 步骤5：验证有效性
+        // 检查 HyperGraph 中所有节点都有有效的表达式
         valid = valid
                 && hyperGraph.getNodes().stream().allMatch(n -> ((StructInfoNode) n).getExpressions() != null);
-        // if relationList has any relation which contains table operator,
-        // such as query with sample, index, table, is invalid
+        
+        // 步骤6：检查是否包含不支持的表操作符
+        // 如果关系列表中包含表操作符（如 sample、index、table 等），则标记为无效
+        // 例如：查询中包含采样（sample）操作，不支持物化视图重写
         boolean invalid = relationList.stream().anyMatch(relation ->
                 ((AbstractPlan) relation).accept(TableQueryOperatorChecker.INSTANCE, null));
         valid = valid && !invalid;
-        // collect predicate from top plan which not in hyper graph
+        
+        // 步骤7：收集 topPlan 中的谓词（不在 HyperGraph 中的谓词）
+        // 这些谓词是从 topPlan 中提取的，用于后续的谓词匹配和补偿
         PredicateCollectorContext predicateCollectorContext = new PredicateCollectorContext();
         topPlan.accept(PREDICATE_COLLECTOR, predicateCollectorContext);
         Predicates predicates = Predicates.of(predicateCollectorContext.getCouldPullUpPredicates(),
                 predicateCollectorContext.getCouldNotPullUpPredicates());
-        // this should use the output of originalPlan to make sure the output right order
+        
+        // 步骤8：Shuttle 原始计划的输出表达式
+        // 将原始计划的输出表达式 shuttle 到基表列空间，用于后续的表达式匹配和重写
+        // 注意：必须使用 originalPlan.getOutput() 而不是 derivedPlan.getOutput()，以确保输出顺序正确
         List<? extends Expression> planOutputShuttledExpressions =
                 ExpressionUtils.shuttleExpressionWithLineage(originalPlan.getOutput(), originalPlan, new BitSet());
+        
+        // 步骤9：构建并返回 StructInfo 对象
         return new StructInfo(originalPlan, originalPlanId, hyperGraph, valid, topPlan, bottomPlan,
                 relationList, relationIdStructInfoNodeMap, predicates, planSplitContext.getGroupingId(),
                 shuttledHashConjunctsToConjunctsMap, expressionToShuttledExpressionToMap,
@@ -374,6 +488,32 @@ public class StructInfo {
 
     /**
      * lazy init for performance
+     * 
+     * ==================== 调用链 ====================
+     * 
+     * 【入口：物化视图重写流程】
+     * AbstractMaterializedViewRule.predicatesCompensate()
+     *   └─> Predicates.compensateEquivalence()
+     *       ├─> queryStructInfo.getEquivalenceClass()  ← 这里（查询等价类）
+     *       └─> viewStructInfo.getEquivalenceClass()  ← 这里（MV等价类）
+     * 
+     * 【等价类生成流程】
+     * StructInfo.getEquivalenceClass()
+     *   └─> StructInfo.predicatesDerive(predicates, topPlan)
+     *       ├─> predicates.getPulledUpPredicates()           // 获取可上提的谓词
+     *       ├─> ExpressionUtils.shuttleExpressionWithLineage()  // Shuttle到基表列空间
+     *       ├─> ExpressionUtils.and(shuttledExpression)       // 合并为AND表达式
+     *       ├─> Predicates.splitPredicates()                  // 分割为等值/范围/残差
+     *       │   └─> PredicatesSplitter.getSplitPredicate()
+     *       ├─> new EquivalenceClass()                       // 创建空等价类
+     *       └─> EquivalenceClass.addEquivalenceClass()       // 添加等值关系（循环）
+     *           └─> 自动合并等价类（传递性）
+     * 
+     * 【使用场景】
+     * - 物化视图重写时，比较查询和MV的等价类差异
+     * - 如果查询有 a=b，MV有 b=c，通过等价类可以推导出需要补偿 a=c
+     * 
+     * @return 等价类对象，如果 predicates 为 null 则返回 null
      */
     public EquivalenceClass getEquivalenceClass() {
         if (this.equivalenceClass == null && this.predicates != null) {

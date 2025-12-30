@@ -87,21 +87,30 @@ public class DFSFileSystem extends RemoteFileSystem {
     @Override
     public Status listFiles(String remotePath, boolean recursive, List<RemoteFile> result) {
         try {
+            // 将远程路径字符串转换为Hadoop Path对象
             Path locatedPath = new Path(remotePath);
+            // 获取原生文件系统实例
             org.apache.hadoop.fs.FileSystem fileSystem = nativeFileSystem(locatedPath);
+            // 获取文件列表迭代器，支持递归和非递归两种模式
             RemoteIterator<LocatedFileStatus> locatedFiles = getLocatedFiles(recursive, fileSystem, locatedPath);
+            // 遍历所有文件
             while (locatedFiles.hasNext()) {
                 LocatedFileStatus fileStatus = locatedFiles.next();
+                // 将Hadoop文件状态转换为Doris远程文件对象
                 RemoteFile location = new RemoteFile(
                         fileStatus.getPath(), fileStatus.isDirectory(), fileStatus.getLen(),
                         fileStatus.getBlockSize(), fileStatus.getModificationTime(), fileStatus.getBlockLocations());
+                // 将文件信息添加到结果列表中
                 result.add(location);
             }
         } catch (FileNotFoundException e) {
+            // 文件或路径不存在异常
             return new Status(Status.ErrCode.NOT_FOUND, e.getMessage());
         } catch (Exception e) {
+            // 其他通用异常
             return new Status(Status.ErrCode.COMMON_ERROR, e.getMessage());
         }
+        // 操作成功
         return Status.OK;
     }
 
