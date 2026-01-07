@@ -16,7 +16,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-export DORIS_TOOLCHAIN=gcc
-export BUILD_TYPE=release
+export DORIS_TOOLCHAIN=clang
+export BUILD_TYPE=debug
 export DISABLE_BUILD_UI=ON
 export DISABLE_BUILD_AZURE=ON
+export DORIS_CLANG_HOME=/home/yangtao555/local/ldb-toolchain-0.27
+export CLANG_FORMAT_BINARY=/home/yangtao555/local/ldb-toolchain-0.18/bin/clang-format-16

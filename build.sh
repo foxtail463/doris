@@ -849,6 +849,11 @@ if [[ "${OUTPUT_BE_BINARY}" -eq 1 ]]; then
     cp -r -p "${DORIS_HOME}/be/output/bin"/* "${DORIS_OUTPUT}/be/bin"/
     cp -r -p "${DORIS_HOME}/be/output/conf"/* "${DORIS_OUTPUT}/be/conf"/
     cp -r -p "${DORIS_HOME}/be/output/dict" "${DORIS_OUTPUT}/be/"
+    
+    # Copy hdfs-site.xml if exists
+    if [[ -f "${DORIS_HOME}/conf/hdfs-site.xml" ]]; then
+        cp -r -p "${DORIS_HOME}/conf/hdfs-site.xml" "${DORIS_OUTPUT}/be/conf/"
+    fi
 
     if [[ -f "${DORIS_THIRDPARTY}/installed/lib/libz.so" ]]; then
         cp -r -p "${DORIS_THIRDPARTY}/installed/lib/libz.so"* "${DORIS_OUTPUT}/be/lib/"

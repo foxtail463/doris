@@ -157,6 +157,42 @@ eval "${TP_DIR}/download-thirdparty.sh ${packages[*]}"
 
 export LD_LIBRARY_PATH="${TP_DIR}/installed/lib:${LD_LIBRARY_PATH}"
 
+# Unified toolchain linker flags configuration
+# For ldb-toolchain and similar custom toolchains, explicit pthread linking is required
+if [[ "${KERNEL}" != 'Darwin' ]]; then
+    # Add pthread library for all non-Darwin builds (required for ldb-toolchain)
+    TOOLCHAIN_LDFLAGS="-lpthread"
+else
+    TOOLCHAIN_LDFLAGS=""
+fi
+export TOOLCHAIN_LDFLAGS
+
+# Helper function to add CMake linker flags for ldb-toolchain compatibility
+# Usage: add_cmake_linker_flags [additional_flags...]
+# This function adds CMAKE_EXE_LINKER_FLAGS and CMAKE_SHARED_LINKER_FLAGS
+# to ensure pthread is linked for ldb-toolchain
+# Returns CMake arguments that can be directly used in cmake command
+add_cmake_linker_flags() {
+    local additional_flags="$*"
+    local flags="${TOOLCHAIN_LDFLAGS}"
+    if [[ -n "${additional_flags}" ]]; then
+        flags="${flags} ${additional_flags}"
+    fi
+    # Use printf to avoid quote nesting issues
+    printf -- '-DCMAKE_EXE_LINKER_FLAGS=%s -DCMAKE_SHARED_LINKER_FLAGS=%s' "${flags}" "${flags}"
+}
+
+# Helper function to build standard LDFLAGS for autotools
+# Usage: build_ldflags [additional_flags...]
+build_ldflags() {
+    local additional_flags="$*"
+    local flags="-L${TP_LIB_DIR} ${TOOLCHAIN_LDFLAGS}"
+    if [[ -n "${additional_flags}" ]]; then
+        flags="${flags} ${additional_flags}"
+    fi
+    echo "${flags}"
+}
+
 # toolchain specific warning options and settings
 if [[ "${CC}" == *gcc ]]; then
     warning_uninitialized='-Wno-maybe-uninitialized'
@@ -331,7 +367,7 @@ build_libbacktrace() {
 
     CPPFLAGS="-I${TP_INCLUDE_DIR}" \
         CXXFLAGS="-I${TP_INCLUDE_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR}" \
+        LDFLAGS="$(build_ldflags)" \
         ./configure --prefix="${TP_INSTALL_DIR}"
 
     make -j "${PARALLEL}"
@@ -348,7 +384,7 @@ build_libevent() {
 
     CFLAGS="-std=c99 -D_BSD_SOURCE -fno-omit-frame-pointer -g -ggdb -O2 -I${TP_INCLUDE_DIR}" \
         CPPLAGS="-I${TP_INCLUDE_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR}" \
+        LDFLAGS="$(build_ldflags)" \
         "${CMAKE_CMD}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -G "${GENERATOR}" -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" -DEVENT__DISABLE_TESTS=ON \
         -DEVENT__DISABLE_SAMPLES=ON -DEVENT__DISABLE_REGRESS=ON ..
@@ -374,7 +410,7 @@ build_openssl() {
 
     CPPFLAGS="-I${TP_INCLUDE_DIR}" \
         CXXFLAGS="-I${TP_INCLUDE_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR}" \
+        LDFLAGS="$(build_ldflags)" \
         LIBDIR="lib" \
         ./Configure --prefix="${TP_INSTALL_DIR}" --with-rand-seed=devrandom -shared "${OPENSSL_PLATFORM}"
     # NOTE(amos): Never use '&&' to concat commands as it will eat error code
@@ -400,7 +436,7 @@ build_thrift() {
     if [[ "${KERNEL}" != 'Darwin' ]]; then
         cflags="-I${TP_INCLUDE_DIR}"
         cxxflags="-I${TP_INCLUDE_DIR} ${warning_unused_but_set_variable} -Wno-inconsistent-missing-override"
-        ldflags="-L${TP_LIB_DIR} --static"
+        ldflags="$(build_ldflags --static)"
     else
         cflags="-I${TP_INCLUDE_DIR} -Wno-implicit-function-declaration -Wno-inconsistent-missing-override"
         cxxflags="-I${TP_INCLUDE_DIR} ${warning_unused_but_set_variable} -Wno-inconsistent-missing-override"
@@ -433,7 +469,7 @@ build_protobuf() {
     if [[ "${KERNEL}" == 'Darwin' ]]; then
         ldflags="-L${TP_LIB_DIR}"
     else
-        ldflags="-L${TP_LIB_DIR} -static-libstdc++ -static-libgcc -Wl,--undefined=pthread_create"
+        ldflags="-L${TP_LIB_DIR} ${TOOLCHAIN_LDFLAGS} -static-libstdc++ -static-libgcc -Wl,--undefined=pthread_create"
     fi
 
     mkdir -p cmake/build
@@ -471,7 +507,8 @@ build_gflags() {
 
     "${CMAKE_CMD}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -G "${GENERATOR}" -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
-        -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=On ../
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=On \
+        $(add_cmake_linker_flags) ../
 
     "${BUILD_SYSTEM}" -j "${PARALLEL}"
     "${BUILD_SYSTEM}" install
@@ -488,20 +525,21 @@ build_glog() {
         autoreconf -i
 
         CPPFLAGS="-I${TP_INCLUDE_DIR} -fpermissive -fPIC" \
-            LDFLAGS="-L${TP_LIB_DIR}" \
+            LDFLAGS="$(build_ldflags)" \
             ./configure --prefix="${TP_INSTALL_DIR}" --enable-frame-pointers --disable-shared --enable-static
 
         make -j "${PARALLEL}"
         make install
     elif [[ "${GLOG_SOURCE}" == "glog-0.6.0" ]]; then
-        LDFLAGS="-L${TP_LIB_DIR}" \
+        LDFLAGS="$(build_ldflags)" \
             "${CMAKE_CMD}" -S . -B build -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DWITH_UNWIND=OFF \
             -DBUILD_SHARED_LIBS=OFF \
-            -DWITH_TLS=OFF
+            -DWITH_TLS=OFF \
+            $(add_cmake_linker_flags)
 
         "${CMAKE_CMD}" --build build --target install
     fi
@@ -580,15 +618,15 @@ build_gperftools() {
         ./autogen.sh
     fi
 
+    local ldflags="$(build_ldflags)"
     CPPFLAGS="-I${TP_INCLUDE_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR}" \
-        LD_LIBRARY_PATH="${TP_LIB_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR}" \
+        LDFLAGS="${ldflags}" \
         LD_LIBRARY_PATH="${TP_LIB_DIR}" \
         ./configure --prefix="${TP_INSTALL_DIR}/gperftools" --disable-shared --enable-static --disable-libunwind --with-pic --enable-frame-pointers
 
-    make -j "${PARALLEL}"
-    make install
+    # Pass LDFLAGS to make to ensure test programs link correctly
+    make -j "${PARALLEL}" LDFLAGS="${ldflags}"
+    make install LDFLAGS="${ldflags}"
 }
 
 # zlib
@@ -598,7 +636,7 @@ build_zlib() {
 
     CFLAGS="-O3 -fPIC" \
         CPPFLAGS="-I${TP_INCLUDE_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR}" \
+        LDFLAGS="$(build_ldflags)" \
         ./configure --prefix="${TP_INSTALL_DIR}"
 
     make -j "${PARALLEL}"
@@ -671,7 +709,7 @@ build_lzo2() {
     cd "${TP_SOURCE_DIR}/${LZO2_SOURCE}"
 
     CPPFLAGS="-I${TP_INCLUDE_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR}" \
+        LDFLAGS="$(build_ldflags)" \
         ./configure --prefix="${TP_INSTALL_DIR}" --disable-shared --enable-static
 
     make -j "${PARALLEL}"
@@ -698,7 +736,7 @@ build_curl() {
     fi
 
     CPPFLAGS="-I${TP_INCLUDE_DIR} " \
-        LDFLAGS="-L${TP_LIB_DIR}" LIBS="${libs}" \
+        LDFLAGS="$(build_ldflags)" LIBS="${libs}" \
         PKG_CONFIG="pkg-config --static" \
         ./configure --prefix="${TP_INSTALL_DIR}" --disable-shared --enable-static \
         --without-librtmp --with-ssl="${TP_INSTALL_DIR}" --without-libidn2 --disable-ldap --enable-ipv6 \
@@ -716,7 +754,8 @@ build_re2() {
 
     "${CMAKE_CMD}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DCMAKE_BUILD_TYPE=Release -G "${GENERATOR}" -DBUILD_SHARED_LIBS=0 -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-        -DCMAKE_PREFIX_PATH="${TP_INSTALL_DIR}" -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}"
+        -DCMAKE_PREFIX_PATH="${TP_INSTALL_DIR}" -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
+        $(add_cmake_linker_flags)
     "${BUILD_SYSTEM}" -j "${PARALLEL}" install
     strip_lib libre2.a
 }
@@ -746,9 +785,12 @@ build_hyperscan() {
     cd "${BUILD_DIR}"
 
     CXXFLAGS="-D_HAS_AUTO_PTR_ETC=0" \
+        LDFLAGS="${TOOLCHAIN_LDFLAGS}" \
         "${CMAKE_CMD}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -G "${GENERATOR}" -DBUILD_SHARED_LIBS=0 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-        -DBOOST_ROOT="${TP_INSTALL_DIR}" -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" -DBUILD_EXAMPLES=OFF ..
+        -DBOOST_ROOT="${TP_INSTALL_DIR}" -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
+        $(add_cmake_linker_flags) \
+        -DBUILD_EXAMPLES=OFF ..
     "${BUILD_SYSTEM}" -j "${PARALLEL}" install
     strip_lib libhs.a
 }
@@ -760,16 +802,32 @@ build_boost() {
 
     if [[ "${KERNEL}" != 'Darwin' ]]; then
         cxxflags='-static'
+        # Fix build.sh to add pthread library for C++11 detection and B2 engine build
+        # Required for ldb-toolchain
+        if [[ -f tools/build/src/engine/build.sh ]]; then
+            # Backup original build.sh
+            [[ ! -f tools/build/src/engine/build.sh.bak ]] && cp tools/build/src/engine/build.sh tools/build/src/engine/build.sh.bak
+            # Modify the C++11 check to include pthread
+            if ! grep -q "check_cxx11.cpp ${TOOLCHAIN_LDFLAGS}" tools/build/src/engine/build.sh; then
+                sed -i "s|\${CMD} check_clib.cpp check_cxx11.cpp|\${CMD} check_clib.cpp check_cxx11.cpp ${TOOLCHAIN_LDFLAGS}|g" tools/build/src/engine/build.sh
+            fi
+            # Modify the B2 engine build to include pthread
+            if ! grep -q "B2_SOURCES} ${TOOLCHAIN_LDFLAGS} -o b2" tools/build/src/engine/build.sh; then
+                sed -i "s|\${B2_SOURCES} -o b2|\${B2_SOURCES} ${TOOLCHAIN_LDFLAGS} -o b2|g" tools/build/src/engine/build.sh
+            fi
+        fi
     else
         cxxflags=''
     fi
 
     CXXFLAGS="${cxxflags}" \
+        LDFLAGS="${TOOLCHAIN_LDFLAGS}" \
         ./bootstrap.sh --prefix="${TP_INSTALL_DIR}" --with-toolset="${boost_toolset}"
     # -q: Fail at first error
     ./b2 -q link=static runtime-link=static -j "${PARALLEL}" \
         --without-mpi --without-graph --without-graph_parallel --without-python \
-        cxxflags="-std=c++17 -g -I${TP_INCLUDE_DIR} -L${TP_LIB_DIR}" install
+        cxxflags="-std=c++17 -g -I${TP_INCLUDE_DIR} -L${TP_LIB_DIR}" \
+        linkflags="${TOOLCHAIN_LDFLAGS}" install
 }
 
 # mysql
@@ -831,7 +889,8 @@ build_leveldb() {
 
     CXXFLAGS="-fPIC" "${CMAKE_CMD}" -G "${GENERATOR}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" -DLEVELDB_BUILD_BENCHMARKS=OFF \
-        -DLEVELDB_BUILD_TESTS=OFF ..
+        -DLEVELDB_BUILD_TESTS=OFF \
+        $(add_cmake_linker_flags) ..
     "${BUILD_SYSTEM}" -j "${PARALLEL}" install
     strip_lib libleveldb.a
 }
@@ -848,9 +907,9 @@ build_brpc() {
     rm -rf CMakeCache.txt CMakeFiles/
 
     if [[ "${KERNEL}" != 'Darwin' ]]; then
-        ldflags="-L${TP_LIB_DIR} -static-libstdc++ -static-libgcc"
+        ldflags="-static-libstdc++ -static-libgcc"
     else
-        ldflags="-L${TP_LIB_DIR}"
+        ldflags=""
 
         # Don't set OPENSSL_ROOT_DIR
         sed '/set(OPENSSL_ROOT_DIR/,/)/ d' ../CMakeLists.txt >../CMakeLists.txt.bak
@@ -863,12 +922,13 @@ build_brpc() {
     # If glog is compiled before gflags, the above error will not exist, this works in glog 0.4,
     # but glog 0.6 enforces dependency on gflags.
     # glog must be enabled, otherwise error: `flag 'v' was defined more than once` (in files 'glog-0.6.0/src/vlog_is_on.cc' and 'brpc-1.6.0/src/butil/logging.cc')
-    LDFLAGS="${ldflags}" \
+    LDFLAGS="$(build_ldflags ${ldflags})" \
         "${CMAKE_CMD}" -G "${GENERATOR}" -DBUILD_SHARED_LIBS=ON -DWITH_GLOG=ON -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DCMAKE_LIBRARY_PATH="${TP_INSTALL_DIR}/lib64" -DCMAKE_INCLUDE_PATH="${TP_INSTALL_DIR}/include" \
         -DBUILD_BRPC_TOOLS=OFF \
-        -DPROTOBUF_PROTOC_EXECUTABLE="${TP_INSTALL_DIR}/bin/protoc" ..
+        -DPROTOBUF_PROTOC_EXECUTABLE="${TP_INSTALL_DIR}/bin/protoc" \
+        $(add_cmake_linker_flags ${ldflags}) ..
 
     "${BUILD_SYSTEM}" -j "${PARALLEL}"
     "${BUILD_SYSTEM}" install
@@ -894,10 +954,11 @@ build_rocksdb() {
     fi
 
     # -Wno-range-loop-construct gcc-11
+    # Note: rocksdb uses Makefile, not CMake, so we only need LDFLAGS
     CFLAGS="-I ${TP_INCLUDE_DIR} -I ${TP_INCLUDE_DIR}/snappy -I ${TP_INCLUDE_DIR}/lz4" \
         CXXFLAGS="-include cstdint -Wno-deprecated-copy ${warning_stringop_truncation} ${warning_shadow} ${warning_dangling_gsl} \
     ${warning_defaulted_function_deleted} ${warning_unused_but_set_variable} -Wno-pessimizing-move -Wno-range-loop-construct" \
-        LDFLAGS="${ldflags}" \
+        LDFLAGS="$(build_ldflags ${ldflags})" \
         PORTABLE=1 make USE_RTTI=1 -j "${PARALLEL}" static_lib
     cp librocksdb.a ../../installed/lib/librocksdb.a
     cp -r include/rocksdb ../../installed/include/
@@ -911,7 +972,7 @@ build_cyrus_sasl() {
 
     CFLAGS="-fPIC -std=gnu89 -Wno-implicit-function-declaration" \
         CPPFLAGS="-I${TP_INCLUDE_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR}" \
+        LDFLAGS="$(build_ldflags)" \
         LIBS="-lcrypto" \
         ./configure --prefix="${TP_INSTALL_DIR}" --enable-static --enable-shared=no --with-openssl="${TP_INSTALL_DIR}" --with-pic --enable-gssapi="${TP_INSTALL_DIR}" --with-gss_impl=mit --with-dblib=none
 
@@ -935,7 +996,7 @@ build_librdkafka() {
     # PKG_CONFIG="pkg-config --static"
 
     CPPFLAGS="-I${TP_INCLUDE_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR} -lssl -lcrypto -lzstd -lz -lsasl2 \
+        LDFLAGS="$(build_ldflags) -lssl -lcrypto -lzstd -lz -lsasl2 \
         -lgssapi_krb5 -lkrb5 -lkrb5support -lk5crypto -lcom_err -lresolv" \
         ./configure --prefix="${TP_INSTALL_DIR}" --enable-static --enable-sasl --disable-c11threads
 
@@ -954,7 +1015,7 @@ build_odbc() {
     cd "${TP_SOURCE_DIR}/${ODBC_SOURCE}"
 
     CFLAGS="-I${TP_INCLUDE_DIR} -Wno-int-conversion -std=gnu89 -Wno-implicit-function-declaration" \
-        LDFLAGS="-L${TP_LIB_DIR}" \
+        LDFLAGS="$(build_ldflags)" \
         ./configure --prefix="${TP_INSTALL_DIR}" --with-included-ltdl --enable-static=yes --enable-shared=no
 
     make -j "${PARALLEL}"
@@ -972,14 +1033,15 @@ build_flatbuffers() {
     rm -rf CMakeCache.txt CMakeFiles/
 
     if [[ "${KERNEL}" != 'Darwin' ]]; then
-        ldflags='-static-libstdc++ -static-libgcc'
+        ldflags="-static-libstdc++ -static-libgcc"
     else
-        ldflags=''
+        ldflags=""
     fi
 
-    LDFLAGS="${ldflags}" \
+    LDFLAGS="$(build_ldflags ${ldflags})" \
         "${CMAKE_CMD}" -G "${GENERATOR}" \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        $(add_cmake_linker_flags ${ldflags}) \
         -DFLATBUFFERS_CXX_FLAGS="${warning_class_memaccess} ${warning_unused_but_set_variable}" \
         -DFLATBUFFERS_BUILD_TESTS=OFF \
         ..
@@ -1003,7 +1065,9 @@ build_cares() {
         -DCARES_STATIC=ON \
         -DCARES_SHARED=OFF \
         -DCARES_STATIC_PIC=ON \
-        -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" ..
+        -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
+        $(add_cmake_linker_flags) \
+        ..
     make
     make install
 }
@@ -1040,7 +1104,7 @@ build_grpc() {
         -DgRPC_ZLIB_PROVIDER=package \
         -DZLIB_ROOT="${TP_INSTALL_DIR}" \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-        ../..
+        $(add_cmake_linker_flags) ../..
 
     make -j "${PARALLEL}"
     make install
@@ -1071,12 +1135,12 @@ build_arrow() {
     export ARROW_PROTOBUF_URL="${TP_SOURCE_DIR}/${PROTOBUF_NAME}"
 
     if [[ "${KERNEL}" != 'Darwin' ]]; then
-        ldflags="-L${TP_LIB_DIR} -static-libstdc++ -static-libgcc"
+        ldflags="-static-libstdc++ -static-libgcc"
     else
-        ldflags="-L${TP_LIB_DIR}"
+        ldflags=""
     fi
 
-    LDFLAGS="${ldflags}" \
+    LDFLAGS="$(build_ldflags ${ldflags})" \
         "${CMAKE_CMD}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -G "${GENERATOR}" -DARROW_PARQUET=ON -DARROW_IPC=ON -DARROW_BUILD_SHARED=OFF \
         -DARROW_BUILD_STATIC=ON -DARROW_WITH_BROTLI=ON -DARROW_WITH_LZ4=ON -DARROW_USE_GLOG=ON \
@@ -1118,7 +1182,8 @@ build_arrow() {
         -DJEMALLOC_HOME="${TP_INSTALL_DIR}" \
         -DARROW_THRIFT_USE_SHARED=OFF \
         -DThrift_SOURCE=SYSTEM \
-        -DThrift_ROOT="${TP_INSTALL_DIR}" ..
+        -DThrift_ROOT="${TP_INSTALL_DIR}" \
+        $(add_cmake_linker_flags ${ldflags}) ..
 
     "${BUILD_SYSTEM}" -j "${PARALLEL}"
     "${BUILD_SYSTEM}" install
@@ -1136,7 +1201,7 @@ build_abseil() {
     check_if_source_exist "${ABSEIL_SOURCE}"
     cd "${TP_SOURCE_DIR}/${ABSEIL_SOURCE}"
 
-    LDFLAGS="-L${TP_LIB_DIR}" \
+    LDFLAGS="$(build_ldflags)" \
         "${CMAKE_CMD}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -B "${BUILD_DIR}" -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
         -DABSL_ENABLE_INSTALL=ON \
@@ -1144,7 +1209,8 @@ build_abseil() {
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DABSL_PROPAGATE_CXX_STD=ON \
-        -DBUILD_SHARED_LIBS=OFF
+        -DBUILD_SHARED_LIBS=OFF \
+        $(add_cmake_linker_flags)
 
     "${CMAKE_CMD}" --build "${BUILD_DIR}" -j "${PARALLEL}"
     "${CMAKE_CMD}" --install "${BUILD_DIR}" --prefix "${TP_INSTALL_DIR}"
@@ -1160,14 +1226,15 @@ build_s2() {
 
     rm -rf CMakeCache.txt CMakeFiles/
 
-    LDFLAGS="-L${TP_LIB_DIR}" \
+    LDFLAGS="$(build_ldflags)" \
         ${CMAKE_CMD} -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -G "${GENERATOR}" -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
         -DCMAKE_PREFIX_PATH="${TP_INSTALL_DIR}" \
         -DBUILD_SHARED_LIBS=OFF \
         -DWITH_GFLAGS=ON \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_LIBRARY_PATH="${TP_INSTALL_DIR}" ..
+        -DCMAKE_LIBRARY_PATH="${TP_INSTALL_DIR}" \
+        $(add_cmake_linker_flags) ..
 
     "${BUILD_SYSTEM}" -j "${PARALLEL}"
     "${BUILD_SYSTEM}" install
@@ -1267,16 +1334,17 @@ build_croaringbitmap() {
     rm -rf CMakeCache.txt CMakeFiles/
 
     if [[ "${KERNEL}" != 'Darwin' ]]; then
-        ldflags="-L${TP_LIB_DIR} -static-libstdc++ -static-libgcc"
+        ldflags="-static-libstdc++ -static-libgcc"
     else
-        ldflags="-L${TP_LIB_DIR}"
+        ldflags=""
     fi
 
     CXXFLAGS="-O3" \
-        LDFLAGS="${ldflags}" \
+        LDFLAGS="$(build_ldflags ${ldflags})" \
         "${CMAKE_CMD}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -G "${GENERATOR}" ${avx_flag:+${avx_flag}} -DROARING_BUILD_STATIC=ON -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
-        -DENABLE_ROARING_TESTS=OFF ..
+        -DENABLE_ROARING_TESTS=OFF -DROARING_USE_CPM=OFF \
+        $(add_cmake_linker_flags ${ldflags}) ..
 
     "${BUILD_SYSTEM}" -j "${PARALLEL}"
     "${BUILD_SYSTEM}" install
@@ -1370,7 +1438,8 @@ build_cctz() {
     # -Wno-elaborated-enum-base to make C++20 on MacOS happy
     "${CMAKE_CMD}" -G "${GENERATOR}" \
     -DCMAKE_CXX_FLAGS="$CMAKE_CXX_FLAGS -Wno-elaborated-enum-base" \
-    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" -DBUILD_TESTING=OFF ..
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" -DBUILD_TESTING=OFF \
+    $(add_cmake_linker_flags) ..
     "${BUILD_SYSTEM}" -j "${PARALLEL}" install
 }
 
@@ -1482,7 +1551,7 @@ build_xml2() {
     cd "${BUILD_DIR}"
 
     CPPLAGS="-I${TP_INCLUDE_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR}" \
+        LDFLAGS="$(build_ldflags)" \
         ../configure --prefix="${TP_INSTALL_DIR}" --enable-shared=no --with-pic --with-python=no --with-lzma="${TP_INSTALL_DIR}"
 
     make -j "${PARALLEL}"
@@ -1532,12 +1601,15 @@ build_krb5() {
         with_crypto_impl='--with-crypto-impl=openssl'
     fi
 
-    CFLAGS="-fcommon -fPIC -I${TP_INSTALL_DIR}/include -std=gnu89" LDFLAGS="-L${TP_INSTALL_DIR}/lib" \
+    local ldflags="-L${TP_INSTALL_DIR}/lib ${TOOLCHAIN_LDFLAGS}"
+    CFLAGS="-fcommon -fPIC -I${TP_INSTALL_DIR}/include -std=gnu89" \
+        LDFLAGS="${ldflags}" \
         ../configure --prefix="${TP_INSTALL_DIR}" --disable-shared --enable-static \
         --without-keyutils ${with_crypto_impl:+${with_crypto_impl}}
 
-    make -j "${PARALLEL}"
-    make install
+    # Pass LDFLAGS to make to ensure all programs link correctly
+    make -j "${PARALLEL}" LDFLAGS="${ldflags}"
+    make install LDFLAGS="${ldflags}"
 }
 
 # hdfs3
@@ -1623,7 +1695,7 @@ build_libunwind() {
         # LIBUNWIND_IS_NATIVE_ONLY: https://lists.llvm.org/pipermail/cfe-commits/Week-of-Mon-20160523/159802.html
         # -nostdinc++ only required for gcc compilation
         cflags="-I${TP_INCLUDE_DIR} -std=c99 -D_LIBUNWIND_NO_HEAP=1 -D_DEBUG -D_LIBUNWIND_IS_NATIVE_ONLY -O3 -fno-exceptions -funwind-tables -fno-sanitize=all -nostdinc++ -fno-rtti -Wno-error=incompatible-pointer-types"
-        CFLAGS="${cflags}" LDFLAGS="-L${TP_LIB_DIR} -llzma" ../configure --prefix="${TP_INSTALL_DIR}" --disable-shared --enable-static
+        CFLAGS="${cflags}" LDFLAGS="$(build_ldflags -llzma)" ../configure --prefix="${TP_INSTALL_DIR}" --disable-shared --enable-static
 
         make -j "${PARALLEL}"
         make install
@@ -1858,10 +1930,11 @@ build_ali_sdk() {
 
     CPPFLAGS="-I${TP_INCLUDE_DIR}" \
         CXXFLAGS="-I${TP_INCLUDE_DIR}" \
-        LDFLAGS="-L${TP_LIB_DIR}" \
+        LDFLAGS="$(build_ldflags)" \
         "${CMAKE_CMD}" -G "${GENERATOR}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DBUILD_PRODUCT=core -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
-        -DTP_INSTALL_DIR="${TP_INSTALL_DIR}" ..
+        -DTP_INSTALL_DIR="${TP_INSTALL_DIR}" \
+        $(add_cmake_linker_flags) ..
     "${BUILD_SYSTEM}" -j "${PARALLEL}"
     "${BUILD_SYSTEM}" install
 }

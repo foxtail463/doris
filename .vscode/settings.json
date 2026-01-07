@@ -1,0 +1,26 @@
+{
+    // fe
+    "java.jdt.ls.vmargs": "-Xms8G -Xmx12G -XX:+UseG1GC -XX:+UseStringDeduplication -XX:MaxGCPauseMillis=200 -XX:+ParallelRefProcEnabled",
+
+    // be
+    "cmake.sourceDirectory": "${workspaceFolder}/be",
+    "cmake.cmakePath": "/home/yangtao555/local/ldb-toolchain-0.27/bin/cmake",
+    "cmake.configureSettings": {
+        "CMAKE_C_COMPILER": "/home/yangtao555/local/ldb-toolchain-0.27/bin/clang",
+        "CMAKE_CXX_COMPILER": "/home/yangtao555/local/ldb-toolchain-0.27/bin/clang++"
+    },
+    "clangd.path": "/home/yangtao555/local/ldb-toolchain-0.27/bin/clangd",
+    "clangd.arguments": [
+        "--background-index",
+        "--clang-tidy", //开启clang-tidy
+        "--compile-commands-dir=/data7/yangtao555/code/doris/be/build_Debug/",
+        "--completion-style=detailed",
+        "-j=5", //clangd分析文件的并行数
+        "--all-scopes-completion",
+        "--pch-storage=memory",
+        "--pretty",
+        "--query-driver=/home/yangtao555/local/ldb-toolchain-0.27/bin/*" //编译器路径
+    ],
+    "clangd.trace": "output/clangd-server.log",
+    "java.compile.nullAnalysis.mode": "automatic"
+}

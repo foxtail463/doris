@@ -1,0 +1,53 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Doris FE (Start + Attach)",
+            "type": "java",
+            "request": "attach",
+            "hostName": "localhost",
+            "port": 5005,
+            "preLaunchTask": "start-doris-fe",
+            "postDebugTask": "stop-doris-fe"
+        },
+        {
+            "name": "Debug Doris BE (Start + Attach + No Exceptions)",
+            "type": "lldb",
+            "request": "attach",
+            "program": "${workspaceFolder}/output/be/lib/doris_be",
+            "preLaunchTask": "start-doris-be",
+            "postDebugTask": "stop-doris-be",
+            "stopOnEntry": false,
+            "initCommands": [
+                "settings set target.inline-breakpoint-strategy always",
+                "breakpoint set -E c++ --auto-continue true",
+                "process handle -p true -s false -n false SIGABRT"
+            ]
+        },
+        {
+            "name": "Debug Test (Direct Launch)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/be/ut_build_ASAN/test/doris_be_test",
+            "args": [
+                "--gtest_filter=FileCacheActionTest.*",
+                "--gtest_output=xml:${workspaceFolder}/be/ut_build_ASAN/gtest_output/doris_be_test.xml",
+                "--gtest_print_time=true"
+            ],
+            "cwd": "${workspaceFolder}/be",
+            "env": {
+                "DORIS_HOME": "${workspaceFolder}/be/ut_build_ASAN/test",
+                "DORIS_TEST_BINARY_DIR": "${workspaceFolder}/be/ut_build_ASAN/test",
+                "LOG_DIR": "${workspaceFolder}/be/ut_build_ASAN/test/log",
+                "UDF_RUNTIME_DIR": "${workspaceFolder}/be/ut_build_ASAN/test/lib/udf-runtime"
+            },
+            "stopOnEntry": false,
+            "initCommands": [
+                "settings set target.inline-breakpoint-strategy always",
+                "breakpoint set -E c++ --auto-continue true",
+                "process handle -p true -s false -n false SIGABRT"
+            ]
+        }
+    ]
+}
+

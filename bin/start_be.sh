@@ -300,6 +300,7 @@ fi
 
 export PPROF_TMPDIR="${LOG_DIR}"
 
+# export JAVA_HOME="/usr/lib/jvm/java-8-openjdk-amd64"
 if [[ -z "${JAVA_HOME}" ]]; then
     echo "The JAVA_HOME environment variable is not set correctly"
     echo "This environment variable is required to run this program"
