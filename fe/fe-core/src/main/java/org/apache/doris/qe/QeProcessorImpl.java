@@ -224,6 +224,7 @@ public final class QeProcessorImpl implements QeProcessor {
                     .connId(String.valueOf(context.getConnectionId())).db(context.getDatabase())
                     .catalog(context.getDefaultCatalog())
                     .fragmentInstanceInfos(info.getCoord().getFragmentInstanceInfos())
+                    .fragmentInstanceStatistics(info.getCoord().getFragmentInstanceStatistics())
                     .profile(info.getCoord().getExecutionProfile().getRoot())
                     .isReportSucc(context.getSessionVariable().enableProfile()).build();
             querySet.put(queryIdStr, item);
@@ -242,9 +243,12 @@ public final class QeProcessorImpl implements QeProcessor {
             // with profile in a single rpc, this will make FE ignore the exec status and may lead to bug in query
             // like insert into select.
             if (params.isSetBackendId() && params.isSetDone()) {
+                int fragmentNum = params.getQueryProfile().isSetFragmentIdToProfileNodeReports()
+                        ? params.getQueryProfile().getFragmentIdToProfileNodeReports().size()
+                        : 0;
                 LOG.info("Receive profile {} report from {}, isDone {}, fragments {}",
                         DebugUtil.printId(params.getQueryProfile().getQueryId()), beAddr.toString(),
-                        params.isDone(), params.getQueryProfile().fragment_id_to_profile.size());
+                        params.isDone(), fragmentNum);
 
                 Backend backend = Env.getCurrentSystemInfo().getBackend(params.getBackendId());
                 if (backend == null) {
@@ -252,6 +256,11 @@ public final class QeProcessorImpl implements QeProcessor {
                             params.getBackendId(), DebugUtil.printId(params.getQueryProfile().getQueryId()));
                 } else {
                     boolean isDone = params.isDone();
+                    Coordinator coordinator = getCoordinator(params.getQueryProfile().getQueryId());
+                    if (coordinator != null && params.getQueryProfile().isSetFragmentIdToInstanceStatistics()) {
+                        coordinator.updateFragmentInstanceStatistics(
+                                params.getQueryProfile().getFragmentIdToInstanceStatistics());
+                    }
                     // the process status is ignored by design.
                     // actually be does not care the process status of profile on fe.
                     processQueryProfile(params.getQueryProfile(), backend.getHeartbeatAddress(), isDone);
@@ -270,6 +279,11 @@ public final class QeProcessorImpl implements QeProcessor {
                 result.setStatus(new TStatus(TStatusCode.OK));
                 return result;
             }
+        }
+
+        if (params.isSetQueryProfile() && !params.isSetStatus()) {
+            result.setStatus(new TStatus(TStatusCode.OK));
+            return result;
         }
 
         final QueryInfo info = coordinatorMap.get(params.query_id);

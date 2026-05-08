@@ -151,3 +151,5 @@ compile_commands.json
 .github
 
 .worktrees/
+
+my-doris.code-workspace

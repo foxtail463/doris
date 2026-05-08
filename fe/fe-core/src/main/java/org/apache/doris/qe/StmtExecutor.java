@@ -342,10 +342,14 @@ public class StmtExecutor {
         builder.sqlStatement(originStmt == null ? "" : originStmt.originStmt);
         builder.isCached(isCached ? "Yes" : "No");
 
-        Map<String, Integer> beToInstancesNum = coord == null ? Maps.newTreeMap() : coord.getBeToInstancesNum();
-        builder.totalInstancesNum(String.valueOf(beToInstancesNum.values().stream().reduce(0, Integer::sum)));
+        Map<String, Integer> brpcHostPortToInstanceCount = coord == null
+                ? Maps.newTreeMap()
+                : coord.getBrpcHostPortToInstanceCount();
+        builder.totalInstancesNum(String.valueOf(
+                brpcHostPortToInstanceCount.values().stream().reduce(0, Integer::sum)));
         builder.instancesNumPerBe(
-                beToInstancesNum.entrySet().stream().map(entry -> entry.getKey() + ":" + entry.getValue())
+                brpcHostPortToInstanceCount.entrySet().stream()
+                        .map(entry -> entry.getKey() + ":" + entry.getValue())
                         .collect(Collectors.joining(",")));
         String clusterName = context.sessionVariable.resolveCloudClusterName(context);
         builder.parallelFragmentExecInstance(

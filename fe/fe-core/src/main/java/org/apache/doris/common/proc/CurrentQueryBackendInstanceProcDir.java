@@ -61,18 +61,17 @@ public class CurrentQueryBackendInstanceProcDir implements ProcDirInterface {
         for (QueryStatisticsItem item : currentQueryMap.values()) {
             for (QueryStatisticsItem.FragmentInstanceInfo info : item.getFragmentInstanceInfos()) {
                 final RowData content = new RowData();
-                final String address = new StringBuilder(info.getAddress().getHostname())
+                final String beHostPortString = new StringBuilder(info.getBeHostPort().getHostname())
                         .append(":")
-                        .append(info.getAddress().getPort())
+                        .append(info.getBeHostPort().getPort())
                         .toString();
-                content.setHost(address);
+                content.setHost(beHostPortString);
                 content.setInstanceId(DebugUtil.printId(info.getInstanceId()));
                 content.setExecTime(item.getQueryExecTime());
-                final String hostWithPort = info.getAddress().toString();
-                List<RowData> list = hostInstances.get(hostWithPort);
+                List<RowData> list = hostInstances.get(beHostPortString);
                 if (list == null) {
                     list = Lists.newArrayList();
-                    hostInstances.put(hostWithPort, list);
+                    hostInstances.put(beHostPortString, list);
                 }
                 list.add(content);
             }
@@ -106,7 +105,6 @@ public class CurrentQueryBackendInstanceProcDir implements ProcDirInterface {
 
     private static class RowData {
         private String host;
-        private String backendId;
         private String instanceId;
         private String execTime;
 
@@ -116,14 +114,6 @@ public class CurrentQueryBackendInstanceProcDir implements ProcDirInterface {
 
         public void setHost(String host) {
             this.host = host;
-        }
-
-        public String getBackendId() {
-            return backendId;
-        }
-
-        public void setBackendId(String backendId) {
-            this.backendId = backendId;
         }
 
         public String getInstanceId() {

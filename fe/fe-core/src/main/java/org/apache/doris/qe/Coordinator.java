@@ -82,6 +82,7 @@ import org.apache.doris.proto.Types;
 import org.apache.doris.proto.Types.PUniqueId;
 import org.apache.doris.qe.ConnectContext.ConnectType;
 import org.apache.doris.qe.QueryStatisticsItem.FragmentInstanceInfo;
+import org.apache.doris.qe.QueryStatisticsItem.FragmentInstanceStatistics;
 import org.apache.doris.resource.workloadgroup.QueryQueue;
 import org.apache.doris.resource.workloadgroup.QueueToken;
 import org.apache.doris.resource.workloadgroup.WorkloadGroup;
@@ -104,6 +105,7 @@ import org.apache.doris.thrift.TExternalScanRange;
 import org.apache.doris.thrift.TFileScanRange;
 import org.apache.doris.thrift.TFileScanRangeParams;
 import org.apache.doris.thrift.TFragmentInstanceReport;
+import org.apache.doris.thrift.TFragmentInstanceStatistics;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TPaloScanRange;
 import org.apache.doris.thrift.TPipelineFragmentParams;
@@ -232,6 +234,8 @@ public class Coordinator implements CoordInterface {
 
     private final Map<Pair<Integer, Long>, PipelineExecContext> pipelineExecContexts = new HashMap<>();
     private final List<PipelineExecContext> needCheckPipelineExecContexts = Lists.newArrayList();
+    private final Map<String, FragmentInstanceStatistics> fragmentInstanceStatistics =
+            Maps.newConcurrentMap();
     private List<ResultReceiver> receivers = Lists.newArrayList();
     private ResultReceiverConsumer receiverConsumer;
     private final List<ScanNode> scanNodes;
@@ -525,6 +529,33 @@ public class Coordinator implements CoordInterface {
                     ctxs.getInstanceNumber());
         }
         return result;
+    }
+
+    public Map<String, Integer> getBrpcHostPortToInstanceCount() {
+        Map<String, Integer> result = Maps.newTreeMap();
+        for (FragmentInstanceInfo info : getFragmentInstanceInfos()) {
+            TNetworkAddress brpcHostPort = info.getBrpcHostPort();
+            String brpcHostPortString = brpcHostPort.getHostname() + ":" + brpcHostPort.getPort();
+            result.merge(brpcHostPortString, 1, Integer::sum);
+        }
+        return result;
+    }
+
+    public void updateFragmentInstanceStatistics(
+            Map<Integer, List<TFragmentInstanceStatistics>> fragmentIdToInstanceStatistics) {
+        for (List<TFragmentInstanceStatistics> statisticsList : fragmentIdToInstanceStatistics.values()) {
+            for (TFragmentInstanceStatistics statistics : statisticsList) {
+                Preconditions.checkState(statistics.isSetFragmentInstanceId(),
+                        "Fragment instance statistics must set fragment instance id");
+                fragmentInstanceStatistics.put(
+                        QueryStatisticsItem.fragmentInstanceStatisticsKey(statistics.getFragmentInstanceId()),
+                        FragmentInstanceStatistics.fromThrift(statistics));
+            }
+        }
+    }
+
+    public Map<String, FragmentInstanceStatistics> getFragmentInstanceStatistics() {
+        return Maps.newHashMap(fragmentInstanceStatistics);
     }
 
     // Initialize
@@ -874,7 +905,7 @@ public class Coordinator implements CoordInterface {
                     PipelineExecContexts ctxs = beToPipelineExecCtxs.get(pipelineExecContext.backend.getId());
                     if (ctxs == null) {
                         ctxs = new PipelineExecContexts(queryId, pipelineExecContext.backend,
-                                pipelineExecContext.brpcAddress, twoPhaseExecution,
+                                pipelineExecContext.brpcHostPort, twoPhaseExecution,
                                 entry.getValue().getFragmentNumOnHost());
                         beToPipelineExecCtxs.putIfAbsent(pipelineExecContext.backend.getId(), ctxs);
                     }
@@ -2955,8 +2986,8 @@ public class Coordinator implements CoordInterface {
         boolean initiated;
         boolean done;
 
-        TNetworkAddress brpcAddress;
-        TNetworkAddress address;
+        TNetworkAddress beHostPort;
+        TNetworkAddress brpcHostPort;
         Backend backend;
         long lastMissingHeartbeatTime = -1;
         long beProcessEpoch = 0;
@@ -2972,8 +3003,8 @@ public class Coordinator implements CoordInterface {
             this.done = false;
 
             this.backend = backend;
-            this.address = new TNetworkAddress(backend.getHost(), backend.getBePort());
-            this.brpcAddress = new TNetworkAddress(backend.getHost(), backend.getBrpcPort());
+            this.beHostPort = new TNetworkAddress(backend.getHost(), backend.getBePort());
+            this.brpcHostPort = new TNetworkAddress(backend.getHost(), backend.getBrpcPort());
             this.beProcessEpoch = backend.getProcessEpoch();
             this.jobId = jobId;
 
@@ -3023,10 +3054,11 @@ public class Coordinator implements CoordInterface {
             return true;
         }
 
-        public List<QueryStatisticsItem.FragmentInstanceInfo> buildFragmentInstanceInfo() {
+        public List<FragmentInstanceInfo> buildFragmentInstanceInfo() {
             return this.rpcParams.local_params.stream().map(it -> new FragmentInstanceInfo.Builder()
                     .instanceId(it.fragment_instance_id).fragmentId(String.valueOf(fragmentId))
-                    .address(this.address).build()).collect(Collectors.toList());
+                    .beHostPort(this.beHostPort).brpcHostPort(this.brpcHostPort).build())
+                    .collect(Collectors.toList());
         }
     }
 
@@ -3475,8 +3507,8 @@ public class Coordinator implements CoordInterface {
     }
 
     // consistent with EXPLAIN's fragment index
-    public List<QueryStatisticsItem.FragmentInstanceInfo> getFragmentInstanceInfos() {
-        final List<QueryStatisticsItem.FragmentInstanceInfo> result =
+    public List<FragmentInstanceInfo> getFragmentInstanceInfos() {
+        final List<FragmentInstanceInfo> result =
                 Lists.newArrayList();
         lock();
         try {
@@ -3485,7 +3517,7 @@ public class Coordinator implements CoordInterface {
                     if (fragments.get(index).getFragmentId() != ctx.fragmentId) {
                         continue;
                     }
-                    final List<QueryStatisticsItem.FragmentInstanceInfo> info = ctx.buildFragmentInstanceInfo();
+                    final List<FragmentInstanceInfo> info = ctx.buildFragmentInstanceInfo();
                     result.addAll(info);
                 }
             }

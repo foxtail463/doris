@@ -20,16 +20,14 @@ package org.apache.doris.common.proc;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.profile.Counter;
 import org.apache.doris.common.profile.RuntimeProfile;
-import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.qe.QueryStatisticsItem;
+import org.apache.doris.qe.QueryStatisticsItem.FragmentInstanceInfo;
+import org.apache.doris.qe.QueryStatisticsItem.FragmentInstanceStatistics;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TUniqueId;
 
-import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.util.Collection;
 import java.util.List;
@@ -39,8 +37,6 @@ import java.util.Map;
  * Provide running query's statistics.
  */
 public class CurrentQueryInfoProvider {
-    private static final Logger LOG = LogManager.getLogger(CurrentQueryInfoProvider.class);
-
     public CurrentQueryInfoProvider() {
     }
 
@@ -77,52 +73,22 @@ public class CurrentQueryInfoProvider {
      * @throws AnalysisException
      */
     public Collection<InstanceStatistics> getInstanceStatistics(QueryStatisticsItem item) throws AnalysisException {
-        final Map<String, RuntimeProfile> instanceProfiles = collectInstanceProfile(item.getQueryProfile());
         final List<InstanceStatistics> instanceStatisticsList = Lists.newArrayList();
-        for (QueryStatisticsItem.FragmentInstanceInfo instanceInfo : item.getFragmentInstanceInfos()) {
-            final RuntimeProfile instanceProfile
-                    = instanceProfiles.get(DebugUtil.printId(instanceInfo.getInstanceId()));
-            Preconditions.checkNotNull(instanceProfile);
-            final InstanceStatistics Statistics =
+        for (FragmentInstanceInfo instanceInfo : item.getFragmentInstanceInfos()) {
+            FragmentInstanceStatistics fragmentInstanceStatistics =
+                    item.getIsReportSucc()
+                            ? item.getFragmentInstanceStatistics().get(
+                                    QueryStatisticsItem.fragmentInstanceStatisticsKey(instanceInfo.getInstanceId()))
+                            : null;
+            final InstanceStatistics statistics =
                     new InstanceStatistics(
                             instanceInfo.getFragmentId(),
                             instanceInfo.getInstanceId(),
-                            instanceInfo.getAddress(),
-                            instanceProfile);
-            instanceStatisticsList.add(Statistics);
+                            instanceInfo.getBeHostPort(),
+                            fragmentInstanceStatistics);
+            instanceStatisticsList.add(statistics);
         }
         return instanceStatisticsList;
-    }
-
-    /**
-     * Profile trees is query profile -> fragment profile -> instance profile ....
-     * @param queryProfile
-     * @return instanceProfiles
-     */
-    private Map<String, RuntimeProfile> collectInstanceProfile(RuntimeProfile queryProfile) {
-        final Map<String, RuntimeProfile> instanceProfiles = Maps.newHashMap();
-        for (RuntimeProfile fragmentProfile : queryProfile.getChildMap().values()) {
-            for (Map.Entry<String, RuntimeProfile> entry : fragmentProfile.getChildMap().entrySet()) {
-                Preconditions.checkState(instanceProfiles.put(
-                        parseInstanceId(entry.getKey()), entry.getValue()) == null);
-            }
-        }
-        return instanceProfiles;
-    }
-
-    /**
-     * Instance profile key is "Instance ${instance_id} (host=$host $port)"
-     * @param str
-     * @return
-     */
-    private String parseInstanceId(String str) {
-        final String[] elements = str.split(" ");
-        if (elements.length == 4) {
-            return elements[1];
-        } else {
-            Preconditions.checkState(false);
-            return "";
-        }
     }
 
     public static class QueryStatistics {
@@ -163,18 +129,18 @@ public class CurrentQueryInfoProvider {
     public static class InstanceStatistics {
         private final String fragmentId;
         private final TUniqueId instanceId;
-        private final TNetworkAddress address;
-        private final QueryStatistics statistics;
+        private final TNetworkAddress beHostPort;
+        private final FragmentInstanceStatistics statistics;
 
         public InstanceStatistics(
                 String fragmentId,
                 TUniqueId instanceId,
-                TNetworkAddress address,
-                RuntimeProfile profile) {
+                TNetworkAddress beHostPort,
+                FragmentInstanceStatistics statistics) {
             this.fragmentId = fragmentId;
             this.instanceId = instanceId;
-            this.address = address;
-            this.statistics = new QueryStatistics(profile);
+            this.beHostPort = beHostPort;
+            this.statistics = statistics;
         }
 
         public String getFragmentId() {
@@ -185,16 +151,12 @@ public class CurrentQueryInfoProvider {
             return instanceId;
         }
 
-        public TNetworkAddress getAddress() {
-            return address;
+        public TNetworkAddress getBeHostPort() {
+            return beHostPort;
         }
 
-        public long getRowsReturned() {
-            return statistics.getRowsReturned();
-        }
-
-        public long getScanBytes() {
-            return statistics.getScanBytes();
+        public FragmentInstanceStatistics getStatistics() {
+            return statistics;
         }
     }
 }

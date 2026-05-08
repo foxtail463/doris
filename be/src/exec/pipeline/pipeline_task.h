@@ -163,6 +163,8 @@ public:
 
     virtual RuntimeState* runtime_state() const { return _state; }
 
+    RuntimeProfile* task_profile() const { return _task_profile.get(); }
+
     virtual std::string task_name() const {
         return fmt::format("task{}({})", _index, _pipeline->_name);
     }

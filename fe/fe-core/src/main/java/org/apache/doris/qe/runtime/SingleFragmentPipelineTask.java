@@ -87,12 +87,14 @@ public class SingleFragmentPipelineTask extends LeafRuntimeTask {
     }
 
     public List<FragmentInstanceInfo> buildFragmentInstanceInfo() {
-        TNetworkAddress address = new TNetworkAddress(backend.getHost(), backend.getBePort());
+        TNetworkAddress beHostPort = new TNetworkAddress(backend.getHost(), backend.getBePort());
+        TNetworkAddress brpcHostPort = backend.getBrpcAddress();
         List<FragmentInstanceInfo> infos = Lists.newArrayListWithCapacity(instanceIds.size());
         for (TUniqueId instanceId : instanceIds) {
             infos.add(
                 new FragmentInstanceInfo.Builder()
-                        .address(address)
+                        .beHostPort(beHostPort)
+                        .brpcHostPort(brpcHostPort)
                         .fragmentId(String.valueOf(fragmentId))
                         .instanceId(instanceId)
                         .build()

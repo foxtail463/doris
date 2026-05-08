@@ -403,9 +403,10 @@ Status QueryContext::set_workload_group(WorkloadGroupPtr& wg) {
 }
 
 void QueryContext::add_fragment_profile(
-        int fragment_id, const std::vector<std::shared_ptr<TRuntimeProfileTree>>& pipeline_profiles,
+        int fragment_id, std::vector<TProfileNodeReport> profile_node_reports,
+        std::vector<TFragmentInstanceStatistics> fragment_instance_statistics,
         std::shared_ptr<TRuntimeProfileTree> load_channel_profile) {
-    if (pipeline_profiles.empty()) {
+    if (profile_node_reports.empty()) {
         std::string msg = fmt::format("Add pipeline profile failed, query {}, fragment {}",
                                       print_id(this->_query_id), fragment_id);
         LOG_ERROR(msg);
@@ -414,18 +415,21 @@ void QueryContext::add_fragment_profile(
     }
 
 #ifndef NDEBUG
-    for (const auto& p : pipeline_profiles) {
-        DCHECK(p != nullptr) << fmt::format("Add pipeline profile failed, query {}, fragment {}",
-                                            print_id(this->_query_id), fragment_id);
+    for (const auto& report : profile_node_reports) {
+        DCHECK(report.__isset.profile)
+                << fmt::format("Add pipeline profile failed, query {}, fragment {}",
+                               print_id(this->_query_id), fragment_id);
     }
 #endif
 
     std::lock_guard<std::mutex> l(_profile_mutex);
     VLOG_ROW << fmt::format(
             "Query add fragment profile, query {}, fragment {}, pipeline profile count {} ",
-            print_id(this->_query_id), fragment_id, pipeline_profiles.size());
+            print_id(this->_query_id), fragment_id, profile_node_reports.size());
 
-    _profile_map.insert(std::make_pair(fragment_id, pipeline_profiles));
+    _profile_map.insert(std::make_pair(fragment_id, std::move(profile_node_reports)));
+    _fragment_instance_statistics_map.insert(
+            std::make_pair(fragment_id, std::move(fragment_instance_statistics)));
 
     if (load_channel_profile != nullptr) {
         _load_channel_profile_map.insert(std::make_pair(fragment_id, load_channel_profile));
@@ -437,21 +441,28 @@ void QueryContext::_report_query_profile() {
 
     for (auto& [fragment_id, fragment_profile] : _profile_map) {
         std::shared_ptr<TRuntimeProfileTree> load_channel_profile = nullptr;
+        std::vector<TFragmentInstanceStatistics> fragment_instance_statistics;
 
         if (_load_channel_profile_map.contains(fragment_id)) {
             load_channel_profile = _load_channel_profile_map[fragment_id];
         }
+        if (auto statistics_iter = _fragment_instance_statistics_map.find(fragment_id);
+            statistics_iter != _fragment_instance_statistics_map.end()) {
+            fragment_instance_statistics = std::move(statistics_iter->second);
+        }
 
         ExecEnv::GetInstance()->runtime_query_statistics_mgr()->register_fragment_profile(
-                _query_id, this->coord_addr, fragment_id, fragment_profile, load_channel_profile);
+                _query_id, this->coord_addr, fragment_id, std::move(fragment_profile),
+                std::move(fragment_instance_statistics), load_channel_profile);
     }
 
     ExecEnv::GetInstance()->runtime_query_statistics_mgr()->trigger_profile_reporting();
 }
 
-std::unordered_map<int, std::vector<std::shared_ptr<TRuntimeProfileTree>>>
-QueryContext::_collect_realtime_query_profile() {
-    std::unordered_map<int, std::vector<std::shared_ptr<TRuntimeProfileTree>>> res;
+void QueryContext::_collect_realtime_query_profile(
+        std::unordered_map<int, std::vector<TProfileNodeReport>>& profile_node_reports,
+        std::unordered_map<int, std::vector<TFragmentInstanceStatistics>>&
+                fragment_id_to_instance_statistics) {
     std::lock_guard<std::mutex> lock(_pipeline_map_write_lock);
     for (const auto& [fragment_id, fragment_ctx_wptr] : _fragment_id_to_pipeline_ctx) {
         if (auto fragment_ctx = fragment_ctx_wptr.lock()) {
@@ -475,17 +486,20 @@ QueryContext::_collect_realtime_query_profile() {
                 continue;
             }
 
-            res.insert(std::make_pair(fragment_id, profile));
+            profile_node_reports.insert(std::make_pair(fragment_id, std::move(profile)));
+            fragment_id_to_instance_statistics.insert(
+                    std::make_pair(fragment_id, fragment_ctx->collect_fragment_instance_statistics()));
         }
     }
-
-    return res;
 }
 
 TReportExecStatusParams QueryContext::get_realtime_exec_status() {
     TReportExecStatusParams exec_status;
 
-    auto realtime_query_profile = _collect_realtime_query_profile();
+    std::unordered_map<int, std::vector<TProfileNodeReport>> realtime_query_profile;
+    std::unordered_map<int, std::vector<TFragmentInstanceStatistics>>
+            fragment_id_to_instance_statistics;
+    _collect_realtime_query_profile(realtime_query_profile, fragment_id_to_instance_statistics);
     std::vector<std::shared_ptr<TRuntimeProfileTree>> load_channel_profiles;
 
     for (auto load_channel_profile : _load_channel_profile_map) {
@@ -495,7 +509,8 @@ TReportExecStatusParams QueryContext::get_realtime_exec_status() {
     }
 
     exec_status = RuntimeQueryStatisticsMgr::create_report_exec_status_params(
-            this->_query_id, std::move(realtime_query_profile), std::move(load_channel_profiles),
+            this->_query_id, std::move(realtime_query_profile),
+            std::move(fragment_id_to_instance_statistics), std::move(load_channel_profiles),
             /*is_done=*/false);
 
     return exec_status;

@@ -20,11 +20,10 @@ package org.apache.doris.common.proc;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.util.QueryStatisticsFormatter;
 import org.apache.doris.qe.QueryStatisticsItem;
+import org.apache.doris.qe.QueryStatisticsItem.FragmentInstanceStatistics;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.util.Collection;
 import java.util.Comparator;
@@ -35,7 +34,6 @@ import java.util.List;
  * set variable "set is_report_success = true" to enable "ScanBytes" and "ProcessRows".
  */
 public class CurrentQueryFragmentProcNode implements ProcNodeInterface {
-    private static final Logger LOG = LogManager.getLogger(CurrentQueryFragmentProcNode.class);
     public static final ImmutableList<String> TITLE_NAMES = new ImmutableList.Builder<String>()
             .add("FragmentId").add("InstanceId").add("Host")
             .add("ScanBytes").add("ProcessRows").build();
@@ -60,12 +58,13 @@ public class CurrentQueryFragmentProcNode implements ProcNodeInterface {
             final List<String> rowData = Lists.newArrayList();
             rowData.add(instanceStatistics.getFragmentId());
             rowData.add(instanceStatistics.getInstanceId().toString());
-            rowData.add(instanceStatistics.getAddress().toString());
-            if (item.getIsReportSucc()) {
+            rowData.add(instanceStatistics.getBeHostPort().toString());
+            FragmentInstanceStatistics statistics = instanceStatistics.getStatistics();
+            if (statistics != null) {
                 rowData.add(QueryStatisticsFormatter.getScanBytes(
-                        instanceStatistics.getScanBytes()));
+                        statistics.getScanBytes()));
                 rowData.add(QueryStatisticsFormatter.getRowsReturned(
-                        instanceStatistics.getRowsReturned()));
+                        statistics.getRowsReturned()));
             } else {
                 rowData.add("N/A");
                 rowData.add("N/A");

@@ -18,12 +18,16 @@
 package org.apache.doris.qe;
 
 import org.apache.doris.common.profile.RuntimeProfile;
+import org.apache.doris.common.util.DebugUtil;
+import org.apache.doris.thrift.TFragmentInstanceStatistics;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 
 import java.util.List;
+import java.util.Map;
 
 public final class QueryStatisticsItem {
 
@@ -35,6 +39,7 @@ public final class QueryStatisticsItem {
     private final String connId;
     private final long queryStartTime;
     private final List<FragmentInstanceInfo> fragmentInstanceInfos;
+    private final Map<String, FragmentInstanceStatistics> fragmentInstanceStatistics;
     // root query profile
     private final RuntimeProfile queryProfile;
     private final boolean isReportSucc;
@@ -48,6 +53,7 @@ public final class QueryStatisticsItem {
         this.connId = builder.connId;
         this.queryStartTime = builder.queryStartTime;
         this.fragmentInstanceInfos = builder.fragmentInstanceInfos;
+        this.fragmentInstanceStatistics = builder.fragmentInstanceStatistics;
         this.queryProfile = builder.queryProfile;
         this.isReportSucc = builder.isReportSucc;
     }
@@ -89,6 +95,10 @@ public final class QueryStatisticsItem {
         return fragmentInstanceInfos;
     }
 
+    public Map<String, FragmentInstanceStatistics> getFragmentInstanceStatistics() {
+        return fragmentInstanceStatistics;
+    }
+
     public RuntimeProfile getQueryProfile() {
         return queryProfile;
     }
@@ -106,11 +116,13 @@ public final class QueryStatisticsItem {
         private String connId;
         private long queryStartTime;
         private List<FragmentInstanceInfo> fragmentInstanceInfos;
+        private Map<String, FragmentInstanceStatistics> fragmentInstanceStatistics;
         private RuntimeProfile queryProfile;
         private boolean isReportSucc;
 
         public Builder() {
             fragmentInstanceInfos = Lists.newArrayList();
+            fragmentInstanceStatistics = Maps.newHashMap();
         }
 
         public Builder queryId(String queryId) {
@@ -150,6 +162,11 @@ public final class QueryStatisticsItem {
 
         public Builder fragmentInstanceInfos(List<FragmentInstanceInfo> infos) {
             fragmentInstanceInfos.addAll(infos);
+            return this;
+        }
+
+        public Builder fragmentInstanceStatistics(Map<String, FragmentInstanceStatistics> statistics) {
+            fragmentInstanceStatistics.putAll(statistics);
             return this;
         }
 
@@ -197,12 +214,14 @@ public final class QueryStatisticsItem {
 
     public static final class FragmentInstanceInfo {
         private final TUniqueId instanceId;
-        private final TNetworkAddress address;
+        private final TNetworkAddress beHostPort;
+        private final TNetworkAddress brpcHostPort;
         private final String fragmentId;
 
         public FragmentInstanceInfo(Builder builder) {
             this.instanceId = builder.instanceId;
-            this.address = builder.address;
+            this.beHostPort = builder.beHostPort;
+            this.brpcHostPort = builder.brpcHostPort;
             this.fragmentId = builder.fragmentId;
         }
 
@@ -210,8 +229,12 @@ public final class QueryStatisticsItem {
             return instanceId;
         }
 
-        public TNetworkAddress getAddress() {
-            return address;
+        public TNetworkAddress getBeHostPort() {
+            return beHostPort;
+        }
+
+        public TNetworkAddress getBrpcHostPort() {
+            return brpcHostPort;
         }
 
         public String getFragmentId() {
@@ -220,7 +243,8 @@ public final class QueryStatisticsItem {
 
         public static final class Builder {
             private TUniqueId instanceId;
-            private TNetworkAddress address;
+            private TNetworkAddress beHostPort;
+            private TNetworkAddress brpcHostPort;
             private String fragmentId;
 
             public Builder instanceId(TUniqueId instanceId) {
@@ -228,8 +252,13 @@ public final class QueryStatisticsItem {
                 return this;
             }
 
-            public Builder address(TNetworkAddress address) {
-                this.address = address;
+            public Builder beHostPort(TNetworkAddress beHostPort) {
+                this.beHostPort = beHostPort;
+                return this;
+            }
+
+            public Builder brpcHostPort(TNetworkAddress brpcHostPort) {
+                this.brpcHostPort = brpcHostPort;
                 return this;
             }
 
@@ -248,8 +277,12 @@ public final class QueryStatisticsItem {
                     builder.instanceId = new TUniqueId(-1, -1);
                 }
 
-                if (builder.address == null) {
-                    builder.address = new TNetworkAddress("null", -1);
+                if (builder.beHostPort == null) {
+                    builder.beHostPort = new TNetworkAddress("null", -1);
+                }
+
+                if (builder.brpcHostPort == null) {
+                    builder.brpcHostPort = builder.beHostPort;
                 }
 
                 if (builder.fragmentId == null) {
@@ -257,5 +290,95 @@ public final class QueryStatisticsItem {
                 }
             }
         }
+    }
+
+    public static final class FragmentInstanceStatistics {
+        private final TUniqueId instanceId;
+        private final long scanBytes;
+        private final long scanRows;
+        private final long rowsReturned;
+        private final boolean done;
+
+        public FragmentInstanceStatistics(Builder builder) {
+            this.instanceId = builder.instanceId;
+            this.scanBytes = builder.scanBytes;
+            this.scanRows = builder.scanRows;
+            this.rowsReturned = builder.rowsReturned;
+            this.done = builder.done;
+        }
+
+        public TUniqueId getInstanceId() {
+            return instanceId;
+        }
+
+        public long getScanBytes() {
+            return scanBytes;
+        }
+
+        public long getScanRows() {
+            return scanRows;
+        }
+
+        public long getRowsReturned() {
+            return rowsReturned;
+        }
+
+        public boolean isDone() {
+            return done;
+        }
+
+        public static FragmentInstanceStatistics fromThrift(TFragmentInstanceStatistics statistics) {
+            return new Builder()
+                    .instanceId(statistics.getFragmentInstanceId())
+                    .scanBytes(statistics.getScanBytes())
+                    .scanRows(statistics.getScanRows())
+                    .rowsReturned(statistics.getReturnedRows())
+                    .done(statistics.is_done)
+                    .build();
+        }
+
+        public static final class Builder {
+            private TUniqueId instanceId;
+            private long scanBytes;
+            private long scanRows;
+            private long rowsReturned;
+            private boolean done;
+
+            public Builder instanceId(TUniqueId instanceId) {
+                this.instanceId = instanceId;
+                return this;
+            }
+
+            public Builder scanBytes(long scanBytes) {
+                this.scanBytes = scanBytes;
+                return this;
+            }
+
+            public Builder scanRows(long scanRows) {
+                this.scanRows = scanRows;
+                return this;
+            }
+
+            public Builder rowsReturned(long rowsReturned) {
+                this.rowsReturned = rowsReturned;
+                return this;
+            }
+
+            public Builder done(boolean done) {
+                this.done = done;
+                return this;
+            }
+
+            public FragmentInstanceStatistics build() {
+                if (instanceId == null) {
+                    instanceId = new TUniqueId(-1, -1);
+                }
+                return new FragmentInstanceStatistics(this);
+            }
+        }
+    }
+
+    public static String fragmentInstanceStatisticsKey(TUniqueId instanceId) {
+        return DebugUtil.printId(instanceId);
     }
 }

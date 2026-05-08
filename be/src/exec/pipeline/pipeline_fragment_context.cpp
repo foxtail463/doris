@@ -126,6 +126,7 @@
 #include "runtime/exec_env.h"
 #include "runtime/fragment_mgr.h"
 #include "runtime/result_buffer_mgr.h"
+#include "runtime/runtime_profile_counter_names.h"
 #include "runtime/runtime_state.h"
 #include "runtime/thread_context.h"
 #include "service/backend_options.h"
@@ -1949,6 +1950,7 @@ bool PipelineFragmentContext::_close_fragment_instance() {
 
     if (_query_ctx->enable_profile()) {
         _query_ctx->add_fragment_profile(_fragment_id, collect_realtime_profile(),
+                                         collect_fragment_instance_statistics(),
                                          collect_realtime_load_channel_profile());
     }
 
@@ -2375,9 +2377,22 @@ std::string PipelineFragmentContext::debug_string() {
     return fmt::to_string(debug_string_buffer);
 }
 
-std::vector<std::shared_ptr<TRuntimeProfileTree>>
-PipelineFragmentContext::collect_realtime_profile() const {
-    std::vector<std::shared_ptr<TRuntimeProfileTree>> res;
+namespace {
+
+int64_t sum_profile_counter(RuntimeProfile* profile, const std::string& counter_name) {
+    std::vector<RuntimeProfile::Counter*> counters;
+    profile->get_counters(counter_name, &counters);
+    int64_t value = 0;
+    for (const auto* counter : counters) {
+        value += counter->value();
+    }
+    return value;
+}
+
+}
+
+std::vector<TProfileNodeReport> PipelineFragmentContext::collect_realtime_profile() const {
+    std::vector<TProfileNodeReport> res;
 
     // we do not have mutex to protect pipeline_id_to_profile
     // so we need to make sure this funciton is invoked after fragment context
@@ -2390,18 +2405,52 @@ PipelineFragmentContext::collect_realtime_profile() const {
         return res;
     }
 
-    // Make sure first profile is fragment level profile
-    auto fragment_profile = std::make_shared<TRuntimeProfileTree>();
-    _fragment_level_profile->to_thrift(fragment_profile.get(), _runtime_state->profile_level());
-    res.push_back(fragment_profile);
+    TProfileNodeReport fragment_report;
+    TRuntimeProfileTree fragment_profile;
+    _fragment_level_profile->to_thrift(&fragment_profile, _runtime_state->profile_level());
+    fragment_report.__isset.profile = true;
+    fragment_report.profile = std::move(fragment_profile);
+    fragment_report.__set_profile_node_type(TProfileNodeType::FRAGMENT_LEVEL);
+    res.push_back(std::move(fragment_report));
 
     // pipeline_id_to_profile is initialized in prepare stage
+    int32_t pipeline_id = 0;
     for (auto pipeline_profile : _runtime_state->pipeline_id_to_profile()) {
-        auto profile_ptr = std::make_shared<TRuntimeProfileTree>();
-        pipeline_profile->to_thrift(profile_ptr.get(), _runtime_state->profile_level());
-        res.push_back(profile_ptr);
+        TProfileNodeReport pipeline_report;
+        TRuntimeProfileTree pipeline_profile_tree;
+        pipeline_profile->to_thrift(&pipeline_profile_tree, _runtime_state->profile_level());
+        pipeline_report.__isset.profile = true;
+        pipeline_report.profile = std::move(pipeline_profile_tree);
+        pipeline_report.__set_profile_node_type(TProfileNodeType::PIPELINE_LEVEL);
+        pipeline_report.__set_pipeline_id(pipeline_id);
+        res.push_back(std::move(pipeline_report));
+        pipeline_id++;
     }
 
+    return res;
+}
+
+std::vector<TFragmentInstanceStatistics>
+PipelineFragmentContext::collect_fragment_instance_statistics() const {
+    std::vector<TFragmentInstanceStatistics> res;
+    res.reserve(_tasks.size());
+    for (size_t instance_idx = 0; instance_idx < _tasks.size(); instance_idx++) {
+        TFragmentInstanceStatistics statistics;
+        statistics.__set_fragment_instance_id(_fragment_instance_ids[instance_idx]);
+        int64_t scan_bytes = 0;
+        int64_t scan_rows = 0;
+        int64_t returned_rows = 0;
+        for (const auto& task : _tasks[instance_idx]) {
+            RuntimeProfile* task_profile = task.first->task_profile();
+            scan_bytes += sum_profile_counter(task_profile, "CompressedBytesRead");
+            scan_rows += sum_profile_counter(task_profile, profile::SCAN_ROWS);
+            returned_rows += sum_profile_counter(task_profile, profile::ROWS_PRODUCED);
+        }
+        statistics.__set_scan_bytes(scan_bytes);
+        statistics.__set_scan_rows(scan_rows);
+        statistics.__set_returned_rows(returned_rows);
+        res.push_back(std::move(statistics));
+    }
     return res;
 }
 
